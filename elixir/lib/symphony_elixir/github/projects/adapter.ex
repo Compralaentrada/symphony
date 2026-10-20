@@ -26,6 +26,24 @@ defmodule SymphonyElixir.GitHub.Projects.Adapter do
   @spec block_issue(Issue.t(), String.t()) :: :ok | {:error, term()}
   def block_issue(issue, reason), do: client_module().block_issue(issue, reason)
 
+  @spec set_pipeline_status(Issue.t(), atom(), String.t() | nil) :: :ok | {:error, term()}
+  def set_pipeline_status(issue, status, reason), do: client_module().set_pipeline_status(issue, status, reason)
+
+  @spec validate_pipeline_delivery(Issue.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def validate_pipeline_delivery(issue, branch, sha), do: client_module().validate_pipeline_delivery(issue, branch, sha)
+
+  @spec upsert_pull_request(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
+  def upsert_pull_request(issue, attrs), do: client_module().upsert_pull_request(issue, attrs)
+
+  @spec set_pull_request_stage(Issue.t(), integer(), atom()) :: {:ok, map()} | {:error, term()}
+  def set_pull_request_stage(issue, number, stage), do: client_module().set_pull_request_stage(issue, number, stage)
+
+  @spec pull_request(Issue.t()) :: {:ok, map() | nil} | {:error, term()}
+  def pull_request(issue), do: client_module().pull_request(issue)
+
+  @spec publish_phase_report(Issue.t(), String.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def publish_phase_report(issue, marker, body, phase), do: client_module().publish_phase_report(issue, marker, body, phase)
+
   @spec agent_tool_specs() :: [map()]
   def agent_tool_specs, do: AgentTool.tool_specs()
 

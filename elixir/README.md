@@ -15,11 +15,11 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues,
    GitHub Projects v2, Jira Cloud, Asana, and GitLab)
-2. Creates a workspace per issue
-3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
-   workspace
-4. Sends a workflow prompt to Codex
-5. Keeps Codex working on the issue until the work is done
+2. Creates a workspace per issue and launches Codex in
+   [App Server mode](https://developers.openai.com/codex/app-server/)
+3. Uses separate Build, QA, and autonomous Review sessions when GitHub Projects v2 has the pipeline
+   statuses configured; other tracker configurations keep the existing single-run behavior
+4. Creates a draft PR after Build, marks it ready after QA and Review, then waits for a human decision
 
 Local runs discover repo-local Codex skills from `.agents/skills` in the workspace checkout. Symphony checks the selected skills before launching Codex and reports a missing `SKILL.md` path; pinned sources and fingerprints are listed in the repository's `.agents/skills/SOURCES.md`.
 
@@ -36,7 +36,11 @@ items in Done or Blocked keep their workspace so moving them back to Ready can r
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. The GitHub
 Projects adapter also updates the Project status and comments on the linked issue with the reason.
-Runtime blocked entries are in memory only; restarting the orchestrator clears that map.
+For the durable Projects pipeline, phase checkpoints and pending external writes are stored in SQLite
+at `~/.symphony/pipeline.sqlite3`; a restart resumes from the last confirmed phase. QA requires every
+configured repository check to include a pass result and evidence. A merge into the configured base
+branch is required before Symphony sets Done. Moving a Human Review item back to Ready requests
+corrections on the same branch and PR.
 
 ## How to use it
 
@@ -160,7 +164,10 @@ Notes:
   case and surrounding whitespace. A blank configured label matches no issue.
 - GitHub Projects v2 uses Project status for routing and rejects `required_labels`. Its repository
   profiles define the exact repositories Symphony may work in, the base branch, and a preparation
-  command for new workspaces.
+  command for new workspaces. To enable the durable Build → QA → Review pipeline, configure the
+  `qa`, `review`, `human_review`, and `dropped` status values, include the active phase statuses in
+  `tracker.active_states`, include `Dropped` in `tracker.terminal_states`, and set nonempty
+  `required_checks` for each repository profile.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`

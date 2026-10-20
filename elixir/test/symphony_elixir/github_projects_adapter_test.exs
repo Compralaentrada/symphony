@@ -75,6 +75,9 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     assert :ok = Tracker.block_issue(issue, "operator input required")
     assert_receive {:projects_block, ^issue, "operator input required"}
+
+    assert :ok = Tracker.set_pipeline_status(issue, :done)
+    assert_receive {:projects_pipeline_status, ^issue, :done, nil}
   end
 
   test "Projects configuration reports missing owner without exposing a token" do
@@ -123,6 +126,49 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert issue.dispatchable
     assert issue.requeueable
     assert issue.labels == ["bug"]
+  end
+
+  test "pipeline Projects polling returns QA, Review, and Human Review items as dispatchable" do
+    statuses = %{
+      "ready" => "Ready",
+      "building" => "Building",
+      "qa" => "QA",
+      "review" => "Review",
+      "human_review" => "Human Review",
+      "blocked" => "Blocked",
+      "dropped" => "Dropped",
+      "done" => "Done"
+    }
+
+    settings =
+      tracker_settings(%{
+        "status_values" => statuses,
+        "repositories" => [
+          %{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["mix test"]}
+        ]
+      })
+      |> Map.merge(%{active_states: ["Ready", "Building", "QA", "Review", "Human Review"], terminal_states: ["closed", "Dropped"]})
+
+    response =
+      project_response([
+        issue_item("octo/app", 1, "Ready"),
+        issue_item("octo/app", 2, "QA"),
+        issue_item("octo/app", 3, "Human Review"),
+        issue_item("octo/app", 4, "Dropped")
+      ])
+
+    response =
+      update_in(response, ["data", "organization", "projectV2", "fields", "nodes", Access.at(0), "options"], fn _ ->
+        Enum.map(statuses, fn {_key, name} -> %{"id" => "option-#{name}", "name" => name} end)
+      end)
+
+    assert {:ok, issues} =
+             Client.fetch_issues_by_states_for_test(Map.values(statuses) -- ["Blocked", "Dropped", "Done"], settings, fn
+               _query, _variables, _settings -> {:ok, %{status: 200, body: response}}
+             end)
+
+    assert Enum.map(issues, & &1.state) == ["Ready", "QA", "Human Review"]
+    assert Enum.all?(issues, & &1.dispatchable)
   end
 
   test "accepts an organization Project when the user lookup returns not found" do
@@ -524,6 +570,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest.FakeGitHubProjectsClient do
   def claim_issue(issue), do: notify({:projects_claim, issue})
   def complete_issue(issue), do: notify({:projects_complete, issue})
   def block_issue(issue, reason), do: notify({:projects_block, issue, reason})
+  def set_pipeline_status(issue, status, reason), do: notify({:projects_pipeline_status, issue, status, reason})
 
   defp notify(message) do
     send(Application.fetch_env!(:symphony_elixir, :projects_lifecycle_test_owner), message)

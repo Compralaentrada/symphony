@@ -29,6 +29,9 @@ defmodule SymphonyElixir.AgentRunner do
       :ok ->
         :ok
 
+      {:phase_result, result} ->
+        result
+
       {:error, reason} ->
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
         raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
@@ -98,12 +101,94 @@ defmodule SymphonyElixir.AgentRunner do
     opts = Keyword.put(opts, :selected_repo_skills, if(is_nil(worker_host), do: Skills.select(issue)))
 
     with :ok <- ensure_skills_available(workspace, issue, worker_host),
-         {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+         {:ok, session} <-
+           AppServer.start_session(
+             workspace,
+             worker_host: worker_host,
+             disable_tracker_tools: Keyword.has_key?(opts, :phase)
+           ) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        if Keyword.has_key?(opts, :phase) do
+          run_pipeline_phase(session, issue, codex_update_recipient, opts)
+        else
+          do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        end
       after
         AppServer.stop_session(session)
       end
+    end
+  end
+
+  defp run_pipeline_phase(session, issue, recipient, opts) do
+    phase = Keyword.fetch!(opts, :phase)
+    message_key = {__MODULE__, make_ref()}
+
+    on_message = fn message ->
+      send_codex_update(recipient, issue, message)
+
+      case phase_delta(message) do
+        nil -> :ok
+        delta -> Process.put(message_key, [delta | Process.get(message_key, [])])
+      end
+    end
+
+    prompt =
+      issue
+      |> PromptBuilder.build_prompt(opts)
+      |> append_selected_skills(Keyword.get(opts, :selected_repo_skills), 1)
+      |> Kernel.<>("\n\n" <> pipeline_phase_instructions(phase, opts))
+
+    try do
+      with {:ok, _turn} <- AppServer.run_turn(session, prompt, issue, on_message: on_message),
+           {:ok, report} <- decode_phase_report(Process.get(message_key, []) |> Enum.reverse() |> Enum.join()) do
+        {:phase_result, report}
+      end
+    after
+      Process.delete(message_key)
+    end
+  end
+
+  defp pipeline_phase_instructions(:build, opts) do
+    """
+    Pipeline phase: Build.
+    Implement the issue, preserve the configured branch #{Keyword.get(opts, :branch)}, and push your work to origin.
+    Do not create or update a pull request, change Project status, or comment on the issue; Symphony owns those writes.
+    Finish with exactly one JSON object containing outcome (ready, no_changes, or blocked), summary, criteria, changes, checks, risks, next_step, reason when blocked or no_changes, and sha after pushing.
+    Use sha null only for no_changes or blocked.
+    """
+  end
+
+  defp pipeline_phase_instructions(:qa, opts) do
+    """
+    Pipeline phase: independent QA. Review and test the accepted commit #{Keyword.get(opts, :sha)} on branch #{Keyword.get(opts, :branch)}.
+    Required checks: #{Enum.join(Keyword.get(opts, :required_checks, []), ", ")}.
+    Run every required check and report each by exact name, status, and concrete evidence. An omitted or unavailable check is not a pass. Give each defect an id, reproduction steps, and the violated criterion.
+    Do not modify files or write to GitHub. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
+    """
+  end
+
+  defp pipeline_phase_instructions(:review, opts) do
+    """
+    Pipeline phase: autonomous code review. Inspect the diff and accepted commit #{Keyword.get(opts, :sha)} on branch #{Keyword.get(opts, :branch)}.
+    Do not modify files or write to GitHub. Give each defect an id, reproduction steps, and the violated criterion. Resolve prior finding ids explicitly.
+    Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
+    """
+  end
+
+  defp phase_delta(%{payload: %{"method" => "item/agentMessage/delta", "params" => %{"delta" => delta}}}) when is_binary(delta), do: delta
+  defp phase_delta(%{payload: %{"method" => "item/agentMessage/delta", "params" => %{"msg" => %{"delta" => delta}}}}) when is_binary(delta), do: delta
+  defp phase_delta(_message), do: nil
+
+  defp decode_phase_report(text) do
+    json =
+      text
+      |> String.trim()
+      |> String.replace(~r/^```(?:json)?\s*/i, "")
+      |> String.replace(~r/\s*```$/, "")
+
+    case Jason.decode(json) do
+      {:ok, report} when is_map(report) -> {:ok, report}
+      _ -> {:error, {:invalid_phase_report, String.slice(text, -500, 500)}}
     end
   end
 

@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, Pipeline, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -34,6 +34,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_timer_ref,
       :tick_token,
       task_supervisor: SymphonyElixir.TaskSupervisor,
+      agent_runner: SymphonyElixir.AgentRunner,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -65,6 +66,7 @@ defmodule SymphonyElixir.Orchestrator do
           tick_timer_ref: nil,
           tick_token: nil,
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
+          agent_runner: Keyword.get(opts, :agent_runner, AgentRunner),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
         }
@@ -176,6 +178,23 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info(
+        {:pipeline_phase_result, issue_id, generation, phase, attempt, result},
+        %{running: running} = state
+      ) do
+    case Map.get(running, issue_id) do
+      %{
+        pipeline_task: %{"generation" => ^generation},
+        pipeline_phase: ^phase,
+        pipeline_attempt: ^attempt
+      } = entry ->
+        {:noreply, %{state | running: Map.put(running, issue_id, Map.put(entry, :completion, result))}}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(
         {:codex_worker_update, issue_id, %{event: _, timestamp: _} = update},
         %{running: running} = state
       ) do
@@ -216,7 +235,15 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
-  defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
+  defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
+    if Map.has_key?(running_entry, :pipeline_phase) do
+      handle_pipeline_agent_down(reason, state, issue_id, running_entry, session_id)
+    else
+      handle_legacy_agent_down(reason, state, issue_id, running_entry, session_id)
+    end
+  end
+
+  defp handle_legacy_agent_down(:normal, state, issue_id, running_entry, session_id) do
     cond do
       input_required_blocker?(running_entry) ->
         block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
@@ -242,10 +269,52 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
+  defp handle_legacy_agent_down(reason, state, issue_id, running_entry, session_id) do
     if input_required_blocker?(running_entry) do
       block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
     else
+      retry_agent_down(state, issue_id, running_entry, session_id, reason)
+    end
+  end
+
+  defp handle_pipeline_agent_down(:normal, state, issue_id, running_entry, session_id) do
+    case Pipeline.finish_phase(
+           running_entry.issue,
+           running_entry.pipeline_task,
+           running_entry.pipeline_phase,
+           running_entry.pipeline_attempt,
+           Map.get(running_entry, :completion)
+         ) do
+      :ok ->
+        release_issue_claim(state, issue_id)
+
+      {:error, reason} ->
+        retry_agent_down(state, issue_id, running_entry, session_id, reason)
+    end
+  end
+
+  defp handle_pipeline_agent_down(reason, state, issue_id, running_entry, session_id) do
+    if input_required_blocker?(running_entry) do
+      blocker = blocker_error(running_entry, "Codex requires operator input")
+
+      case Pipeline.block_phase(
+             running_entry.issue,
+             running_entry.pipeline_task,
+             running_entry.pipeline_phase,
+             running_entry.pipeline_attempt,
+             blocker
+           ) do
+        :ok -> release_issue_claim(state, issue_id)
+        {:error, error} -> retry_agent_down(state, issue_id, running_entry, session_id, error)
+      end
+    else
+      Pipeline.Store.interrupt_phase(
+        issue_id,
+        running_entry.pipeline_task["generation"],
+        running_entry.pipeline_phase,
+        running_entry.pipeline_attempt
+      )
+
       retry_agent_down(state, issue_id, running_entry, session_id, reason)
     end
   end
@@ -285,6 +354,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
+    if Pipeline.enabled?(), do: Pipeline.reconcile()
+
     state =
       state
       |> reconcile_running_issues()
@@ -694,14 +765,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp last_activity_timestamp(_running_entry), do: nil
 
-  defp input_required_blocker?(running_entry) when is_map(running_entry) do
+  defp input_required_blocker?(running_entry) do
     Map.get(running_entry, :last_codex_event) in [:turn_input_required, :approval_required] or
       not is_nil(input_required_completion_outcome(Map.get(running_entry, :completion))) or
       codex_message_method(Map.get(running_entry, :last_codex_message)) ==
         "mcpServer/elicitation/request"
   end
-
-  defp input_required_blocker?(_running_entry), do: false
 
   defp input_required_completion_outcome(completion) when is_map(completion) do
     outcome = Map.get(completion, :outcome) || Map.get(completion, "outcome")
@@ -725,14 +794,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp normalize_input_required_outcome(_outcome), do: nil
 
-  defp blocker_error(running_entry, fallback) when is_map(running_entry) do
+  defp blocker_error(running_entry, fallback) do
     codex_event_blocker_error(Map.get(running_entry, :last_codex_event)) ||
       completion_blocker_error(Map.get(running_entry, :completion)) ||
       codex_message_blocker_error(Map.get(running_entry, :last_codex_message)) ||
       fallback
   end
-
-  defp blocker_error(_running_entry, fallback), do: fallback
 
   defp codex_event_blocker_error(:turn_input_required), do: "codex turn requires operator input"
   defp codex_event_blocker_error(:approval_required), do: "codex turn requires approval"
@@ -1004,6 +1071,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp claim_and_spawn_issue(state, issue, attempt, worker_host) do
+    if Pipeline.enabled?() do
+      start_pipeline_issue(state, issue, attempt, worker_host)
+    else
+      claim_and_spawn_legacy_issue(state, issue, attempt, worker_host)
+    end
+  end
+
+  defp claim_and_spawn_legacy_issue(state, issue, attempt, worker_host) do
     case Tracker.claim_issue(issue) do
       result when result in [:ok, :ignore] ->
         spawn_issue_on_worker_host(state, issue, attempt, self(), worker_host)
@@ -1019,6 +1094,108 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: worker_host
         })
     end
+  end
+
+  defp start_pipeline_issue(state, issue, retry_attempt, worker_host) do
+    case Pipeline.prepare(issue) do
+      {:ok, task, phase} ->
+        start_prepared_pipeline_issue(state, issue, task, phase, retry_attempt, worker_host)
+
+      :ignore ->
+        state
+
+      {:error, reason} ->
+        schedule_pipeline_retry(state, issue, retry_attempt, worker_host, "Unable to prepare pipeline", reason)
+    end
+  end
+
+  defp start_prepared_pipeline_issue(state, issue, task, phase, retry_attempt, worker_host) do
+    claim_result = if issue.state in ["Ready", "Building"], do: Tracker.claim_issue(issue), else: :ok
+
+    case claim_result do
+      result when result in [:ok, :ignore] ->
+        case Pipeline.begin_phase(issue, task, phase) do
+          {:ok, task, phase_attempt} ->
+            spawn_pipeline_worker(state, issue, task, phase, phase_attempt, retry_attempt, worker_host)
+
+          {:error, reason} ->
+            schedule_pipeline_retry(state, issue, retry_attempt, worker_host, "Unable to start pipeline phase", reason)
+        end
+
+      {:error, reason} ->
+        schedule_pipeline_retry(state, issue, retry_attempt, worker_host, "Unable to claim pipeline item", reason)
+    end
+  end
+
+  defp spawn_pipeline_worker(state, issue, task, phase, phase_attempt, retry_attempt, worker_host) do
+    recipient = self()
+    runner = state.agent_runner
+
+    child = fn ->
+      receive do
+        :run -> run_pipeline_phase(runner, recipient, issue, task, phase, phase_attempt, retry_attempt, worker_host)
+      end
+    end
+
+    case Task.Supervisor.start_child(state.task_supervisor, child) do
+      {:ok, pid} ->
+        ref = Process.monitor(pid)
+        send(pid, :run)
+        entry = pipeline_running_entry(issue, task, phase, phase_attempt, retry_attempt, worker_host, pid, ref)
+
+        %{
+          state
+          | running: Map.put(state.running, issue.id, entry),
+            claimed: MapSet.put(state.claimed, issue.id),
+            retry_attempts: Map.delete(state.retry_attempts, issue.id)
+        }
+
+      {:error, reason} ->
+        schedule_pipeline_retry(state, issue, retry_attempt, worker_host, "Failed to start pipeline worker", reason)
+    end
+  end
+
+  defp run_pipeline_phase(runner, recipient, issue, task, phase, phase_attempt, retry_attempt, worker_host) do
+    result =
+      runner.run(issue, recipient,
+        attempt: retry_attempt,
+        worker_host: worker_host,
+        phase: String.to_existing_atom(phase),
+        branch: task["branch"],
+        base_branch: task["base_branch"],
+        sha: task["current_sha"],
+        required_checks: task["required_checks"]
+      )
+
+    send(recipient, {:pipeline_phase_result, issue.id, task["generation"], phase, phase_attempt, result})
+  end
+
+  defp pipeline_running_entry(issue, task, phase, phase_attempt, retry_attempt, worker_host, pid, ref) do
+    %{
+      pid: pid,
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: worker_host,
+      workspace_path: nil,
+      session_id: nil,
+      pipeline_task: task,
+      pipeline_phase: phase,
+      pipeline_attempt: phase_attempt,
+      retry_attempt: normalize_retry_attempt(retry_attempt),
+      started_at: DateTime.utc_now()
+    }
+  end
+
+  defp schedule_pipeline_retry(state, issue, retry_attempt, worker_host, message, reason) do
+    Logger.warning("#{message} for #{issue_context(issue)}: #{inspect(reason)}; scheduling retry")
+
+    schedule_issue_retry(state, issue.id, retry_attempt || 1, %{
+      identifier: issue.identifier,
+      issue_url: issue.url,
+      error: inspect(reason),
+      worker_host: worker_host
+    })
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
