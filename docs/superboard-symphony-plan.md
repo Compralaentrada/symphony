@@ -1,15 +1,15 @@
 # Plan de implementación de Super Board sobre Symphony
 
 **Proyecto:** [Compralaentrada/symphony](https://github.com/Compralaentrada/symphony)  
-**Estado:** propuesta de implementación para revisión  
+**Estado:** decisiones de producto validadas para el piloto; diseño técnico pendiente
 **Fecha:** 20 de octubre de 2026  
-**Base inspeccionada:** `be10a1b79df723d6d7612b5651c8522704dafb2e`
+**Base inspeccionada:** `15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d` de `Compralaentrada/symphony`
 
 El fork convertirá Symphony en un servicio capaz de tomar tareas de un tablero compartido, ejecutarlas en el repositorio adecuado y conducirlas por Build, QA y Review hasta una entrega verificable. El objetivo operativo es que las tareas terminen o comuniquen un bloqueo concreto, conservando el trabajo cuando falle una dependencia o se reinicie el servicio.
 
 La implementación parte del motor Elixir y Codex de Symphony. La capa de producto, la integración con el tablero y el pipeline se construirán en el fork. Super Board será la referencia funcional para las skills y sus criterios de calidad. El manager anterior queda fuera de la implementación y de sus dependencias.
 
-GitHub Projects es la opción propuesta para el tablero común. Los seis repositorios actuales formarán parte del mismo sistema; cada uno tendrá un perfil de entorno, skills, comprobaciones y política de entrega.
+Cada instalación puede elegir el tracker GitHub Issues existente o GitHub Projects v2. Projects v2 permite coordinar en un tablero común los repositorios registrados por esa instalación; el software no fija los seis repositorios actuales ni una organización. El piloto de esta fase usa Projects v2 con una issue del propio repo de Symphony, conservando el contrato del tracker GitHub Issues.
 
 ## 1 Objetivo y criterios de éxito
 
@@ -32,16 +32,16 @@ La primera demostración útil será una tarea real que complete el recorrido ha
 | Asunto | Dirección propuesta | Alcance |
 | --- | --- | --- |
 | Base | Fork existente de Symphony y referencia Elixir | Mantener transporte Codex, supervisión OTP, workspaces y observabilidad que sigan siendo válidos. |
-| Tablero | Un GitHub Project de la organización | Una issue en el repo correspondiente; vistas compartidas y filtradas. |
+| Tracker | GitHub Issues actual o GitHub Projects v2, seleccionable por instalación | Se conserva el contrato de GitHub Issues; Projects v2 añade el tablero multi-repo con campos y opciones configurables, sin fijar una organización. |
 | Ejecución | Un servicio Symphony con registro de repositorios | Un scheduler propietario de las tareas y procesos de agente por fase. |
-| Pipeline | Build → QA → Review | Los resultados validados gobiernan el avance y los rebotes. |
+| Pipeline | Build → QA → Review autónoma → Human Review | QA y Review usan sesiones nuevas; los resultados validados gobiernan el avance y los rebotes. |
 | Skills | Catálogo versionado de Super Board y skills específicas de cada repo | Cargar las necesarias por fase y capacidades, con su procedencia. |
-| Persistencia | Almacén transaccional local para la primera versión | SQLite es la propuesta para un servicio en un host; concretar librería y copias antes de implementar. |
-| Entrega inicial | PR en borrador y decisión humana de merge | La revisión automática forma parte del pipeline. |
+| Persistencia | SQLite en un host | Persistir fases, checkpoints, evidencias e intenciones de efectos externos en almacenamiento durable. |
+| Entrega inicial | PR draft después de Build; lista para revisión tras QA y Review; merge humano | `Done` exige confirmar el merge; la espera de una persona usa `Human Review`. |
 | Paralelismo inicial | Un agente global | La arquitectura admite varios repos; aumentar el paralelismo tras validar la recuperación. |
 | Idioma | Español para títulos, explicaciones e informes | Mantener código, identificadores, comandos y nombres técnicos cuando corresponda. |
 
-La elección de almacenamiento, el Project concreto, el host y el modo de merge definitivo requieren concreción. Los valores anteriores permiten diseñar una primera implementación sin convertir cada detalle en un bloqueo.
+El primer piloto usa una issue de Symphony en un Project de prueba elegido en la configuración local. La arquitectura sigue siendo válida para cualquier instalación, organización y conjunto de repositorios. El merge automático y el procesamiento coordinado en varios hosts quedan fuera del piloto.
 
 ## 3 Base disponible y extensiones necesarias
 
@@ -49,7 +49,7 @@ Symphony ya incorpora sondeo y reconciliación de tareas, límites por proceso, 
 
 El fork necesita añadir:
 
-1. Un adaptador Projects que resuelva el item, la issue, el repositorio y el estado del tablero.
+1. Un adaptador Projects que resuelva el item, la issue, el repositorio y el estado del tablero, conservando el adaptador GitHub Issues y su contrato actual.
 2. Un registro de perfiles de repositorio y una configuración efectiva inmutable por intento.
 3. Un pipeline explícito con contratos de resultado entre Build, QA y Review.
 4. Persistencia de ejecuciones, esperas, evidencias y operaciones externas pendientes.
@@ -83,25 +83,27 @@ El orquestador existente conserva el control del trabajo. La lógica del pipelin
 
 Cada ejecución captura el perfil del repo, las versiones de skills y herramientas, la rama base y sus SHA. Build, QA y Review reciben ese contexto explícito. Las lecturas globales de configuración que existen hoy deben revisarse en `AgentRunner`, `PromptBuilder`, `Workspace` y `Codex.AppServer`: cambiar una variable global antes de arrancar un agente no ofrece aislamiento entre repositorios concurrentes. [SY4], [SY5], [SY6], [SY7]
 
-Se empezará con un host y un almacén de escritura. Los workers remotos y varias máquinas coordinadoras se habilitarán cuando el protocolo de propiedad de ejecución esté probado. El soporte SSH upstream no implica que la afinidad por repo y plataforma esté resuelta.
+Se empezará con un host y un almacén de escritura. Los workers remotos y varias máquinas coordinadoras se habilitarán cuando el protocolo de propiedad de ejecución esté probado. El soporte SSH existente no implica que la afinidad por repo y plataforma esté resuelta.
 
 ## 5 Tablero común y modelo de tarea
 
 ### Estados visibles
 
-Se conserva el tablero de siete columnas de Super Board: **Backlog, Ready, Building, QA, Review, Blocked y Done**. [SB1]
+Al seleccionar Projects v2, el campo de estado y sus valores se configuran por instalación. Los nombres conceptuales del ciclo inicial son **Backlog, Ready, Building, QA, Review, Human Review, Blocked, Done y Dropped**. `Review` siempre significa revisión autónoma; la espera de decisión humana usa `Human Review`. El tracker GitHub Issues mantiene su contrato actual de issues abiertas y cerradas; esta entrega piloto del pipeline usa Projects v2.
 
 | Columna | Significado | Condición para actuar |
 | --- | --- | --- |
 | Backlog | Trabajo recogido que aún no está admitido | No ejecuta agentes. |
 | Ready | Petición de ejecución o reanudación | Exige repo registrado, criterios y perfil válidos. |
 | Building | Implementación en curso | Debe existir un intento propietario y contexto de código. |
-| QA | Verificación o análisis de huecos de pruebas | Usa el SHA de la entrega de Build. |
-| Review | Revisión automática o espera de decisión humana | El subestado persistido distingue ambas situaciones. |
+| QA | Verificación o análisis de huecos de pruebas | Usa el SHA de la entrega vigente. |
+| Review | Revisión autónoma | Usa una sesión nueva y el SHA validado por QA. |
+| Human Review | Espera de decisión humana sobre una PR lista para revisión | QA y Review pasaron; la persona puede aprobar/mergear o pedir cambios. |
 | Blocked | Falta información, acceso o una decisión | Debe mostrar motivo y acción para desbloquear. |
-| Done | Entrega confirmada o resolución explícita sin entrega | Requiere comprobar la condición de cierre. |
+| Done | PR fusionada y merge confirmado | Cualquier otra resolución queda fuera de `Done`. |
+| Dropped | Trabajo terminado sin merge | Requiere un motivo explícito en la issue; si falta, espera intervención en `Blocked`. Una conclusión de “sin cambios” requiere confirmación humana. |
 
-**Review no será por sí sola una orden para lanzar otro reviewer.** El registro de ejecución distinguirá `reviewing` y `awaiting_human_review`. La espera humana libera el slot y persiste tras reiniciar. El dashboard y un campo de resultado del tablero harán visible esta diferencia.
+Cada fase usa una sesión nueva. La espera en `Human Review` libera el slot y persiste tras reiniciar. Cada finalización de fase y cada motivo de bloqueo o descarte se refleja mediante un comentario de Symphony en la issue vinculada.
 
 ### Identidad y campos
 
@@ -115,7 +117,9 @@ Las ideas sin issue pueden permanecer en Backlog. Para pasar a ejecución deben 
 
 El tablero expresa el estado de trabajo y la intención humana. El almacén de ejecuciones es la autoridad de los intentos, las fases y los efectos confirmados. Un estado visible no sustituye la evidencia que exige su transición.
 
-Mover a Ready solicita una nueva generación de trabajo; no invalida por sí solo una PR ni autoriza repetir efectos ya realizados. Mover una tarea activa a Blocked o Backlog solicita parar: el host cancela el proceso, conserva el trabajo y confirma la parada. Mover manualmente a Done durante una ejecución requiere reconciliar o detener el intento; no permite asumir que la PR se fusionó.
+Mover a `Ready` inicia o reanuda según el estado anterior. Si una persona pide cambios desde `Human Review`, Symphony devuelve la misma PR a draft y conserva su rama; tras rehacer Build y repetir QA y Review, la marca lista para revisión antes de volver a `Human Review`. Desde `Blocked`, se conserva la rama y PR si existen y se reanuda desde el último checkpoint confirmado. Una issue cerrada en `Done` no se reactiva al mover el item del Project a `Ready`; el trabajo posterior requiere una issue nueva. Mover una tarea activa a `Blocked` o `Backlog` solicita parar: Symphony cancela el proceso, conserva el trabajo y confirma la parada. Un cambio manual a `Done` no acredita un merge.
+
+El agente publica la rama y devuelve el SHA. Symphony verifica ese resultado y es responsable de crear o actualizar la PR draft, cambiar el estado del Project y publicar los informes de fase. La creación de una PR, un comentario o una transición de estado se reconcilia antes de repetirla tras una respuesta incierta.
 
 Una indisponibilidad de GitHub mantiene el estado conocido y limita los efectos nuevos. Las lecturas paginadas incompletas, permisos insuficientes o respuestas GraphQL con errores no equivalen a un tablero vacío.
 
@@ -137,14 +141,14 @@ docs/superboard-symphony-plan.md     especificación de producto
 
 El archivo de bloqueo registra SHA y huella de contenido; no instala skills por similitud de nombre. Las credenciales y los datos de ejecución se guardan fuera del repositorio.
 
-Ejemplo conceptual de perfil; este esquema no existe todavía en upstream:
+Ejemplo conceptual de perfil; este esquema no existe todavía en el fork:
 
 ```yaml
 schema_version: 1
-repository: Compralaentrada/vue.teatros-clubs
+repository: owner/example-repo
 base_branch: master
 workspace_strategy: isolated_clone
-runtime_profile: vue-node22
+runtime_profile: example-runtime
 phases:
   build: { skill: super-build }
   qa: { skill: super-qa }
@@ -177,15 +181,19 @@ La tarea conserva un formato común: problema, contexto, cambio esperado, criter
 
 ### Build
 
-El Builder recibe la tarea y sus criterios, instrucciones del repo, skills resueltas y contexto del intento. Implementa en su workspace, añade las pruebas pertinentes y usa herramientas del host para registrar checks y publicar una PR en borrador cuando exista una entrega útil.
+El Builder recibe la tarea y sus criterios, instrucciones del repo, skills resueltas y contexto del intento. Implementa en su workspace, añade las pruebas pertinentes, publica su rama y entrega el SHA. Cuando exista una entrega útil, Symphony comprueba el SHA y crea o actualiza la PR en borrador.
 
-Su salida incluye resumen, criterios cubiertos, SHA de código, archivos cambiados, pruebas propuestas o ejecutadas, riesgos y bloqueos. El host verifica branch y SHA y confirma la publicación. Un mensaje del modelo que diga «PR creada» no acredita ese efecto.
+Su salida incluye resumen, criterios cubiertos, SHA de código, archivos cambiados, pruebas propuestas o ejecutadas, riesgos y bloqueos. Symphony valida que la rama y el SHA correspondan al repo e intento correctos. Un mensaje del modelo que diga «PR creada» no acredita ese efecto.
 
-Si no hacen falta cambios, se exige una explicación con evidencias. Una persona confirma la resolución cuando no haya una condición determinista configurada. No se fabrica una PR vacía.
+Al terminar Build, Symphony publica un comentario en la issue con el resumen del trabajo, criterios cubiertos, cambios, pruebas, riesgos, SHA y siguiente paso.
+
+Si no hacen falta cambios, el agente deja una explicación con evidencias y Symphony pide confirmación humana. Solo después de esa confirmación se puede cerrar como `Dropped` con el motivo; no se fabrica una PR vacía.
 
 ### QA
 
 QA comienza en una sesión nueva y recibe el código identificado por SHA, los criterios y los artefactos de Build. Reproduce los checks aplicables, revisa huecos de pruebas y recoge evidencia de UI cuando la tarea la requiera.
+
+Al terminar, Symphony publica un comentario en la issue con el resultado de QA, el resumen de las comprobaciones y cambios realizados, la evidencia relevante, el SHA y el siguiente paso.
 
 El perfil distingue fallos, resultados inestables, pruebas omitidas justificadas y comprobaciones no disponibles. Una comprobación obligatoria no ejecutada no pasa a verde. La deuda previa se separa de regresiones relacionadas con el cambio mediante evidencia reproducible; no basta atribuir un fallo a que «ya estaba».
 
@@ -197,6 +205,8 @@ El análisis de huecos relaciona criterios con aserciones concretas y rutas de p
 
 El Reviewer usa otra sesión y comienza por criterios y diff para formular sus hipótesis. Después contrasta los informes previos, revisa los hallazgos abiertos y comprueba si las correcciones están presentes.
 
+Al terminar, Symphony publica del mismo modo el resultado de Review, sus hallazgos y el siguiente paso. Si QA o Review solicitan cambios, el estado vuelve a `Building` y el ciclo continúa sobre la misma rama y PR; la nueva entrega invalida evidencias del SHA anterior que hayan quedado afectadas.
+
 Los hallazgos conservan identidad, severidad, ruta o líneas y evidencia. Cada pasada declara cuáles se resolvieron, siguen pendientes o dejaron de aplicar. No se sobrescriben hallazgos sin conservar su resolución.
 
 El pase adversarial de Super Board se conserva para tareas de mayor riesgo o reglas definidas por perfil. Varias pasadas del mismo modelo no se presentan como garantía de independencia. La separación de sesiones reduce el arrastre de contexto y no sustituye los checks del host.
@@ -205,11 +215,13 @@ Las categorías de hallazgo incluyen bug, criterio sin cubrir, verificación omi
 
 ### Entrega y cierre
 
-Con QA y Review aceptados, el sistema guarda una entrega revisable vinculada a `head_sha`, `base_sha`, configuración y versiones de skills. El modo inicial deja la PR en borrador y la tarea en Review con subestado de espera humana.
+Con QA y Review aceptados, el sistema guarda una entrega revisable vinculada a `head_sha`, `base_sha`, configuración y versiones de skills. Symphony marca la PR como lista para revisión y mueve la tarea a `Human Review`. Así la persona puede revisar, aprobar y fusionar. Symphony publica un informe con el resultado de cada fase en la issue.
 
-Si se habilita merge automático posteriormente, una política explícita decide su admisión por repo y riesgo. El host vuelve a comprobar evidencia, aprobación cuando corresponda, HEAD remoto, checks requeridos y base antes del merge. Cualquier cambio relevante invalida la aprobación y los resultados afectados.
+La PR se crea como draft tras Build. GitHub permite cambiarla a lista para revisión o devolverla a draft; mientras siga como draft no se puede fusionar. [GH3]
 
-Done exige confirmar el merge y su presencia en la rama destino. Los descartes se cierran con una resolución distinta de entrega completada; se puede conservar Done como columna final mostrando `dropped`, tal como contempla Super Board. [SB1]
+Una persona puede fusionar la PR o pedir cambios. Si pide cambios, mueve la tarea a `Ready`; Symphony conserva la rama y PR, la devuelve a draft y vuelve a ejecutar Build, QA y Review según corresponda. Si pasan de nuevo, Symphony la marca lista para revisión. El merge automático queda fuera de esta entrega.
+
+`Done` exige confirmar el merge y su presencia en la rama destino. Cerrar una issue sin merge termina el trabajo como `Dropped` con motivo. Si el agente no encuentra cambios necesarios, `Dropped` requiere confirmación humana. Una issue que ya está cerrada y fusionada no se reabre moviendo el item del Project a `Ready`; para trabajo posterior se crea una issue nueva.
 
 ### Tabla de transiciones
 
@@ -217,14 +229,19 @@ Done exige confirmar el merge y su presencia en la rama destino. Los descartes s
 | --- | --- | --- | --- |
 | Ready | Admisión y claim confirmados | Building o QA para tipo `qa` | Orquestador |
 | Building | Entrega y contexto de código válidos | QA | Host y pipeline |
-| QA | Checks y criterios aceptados | Review con subestado `reviewing` | Pipeline |
+| QA | Checks y criterios aceptados | Review autónoma | Pipeline |
 | QA o Review | Defecto de implementación | Building con hallazgos abiertos | Pipeline |
-| Review | Revisión aceptada | Review con subestado `awaiting_human_review` | Pipeline |
 | Cualquier fase activa | Falta información o acceso | Blocked con motivo persistido | Host y pipeline |
-| Blocked | Respuesta o reparación confirmada | Fase pendiente del mismo intento o nueva generación | Orquestador |
-| Review | Merge confirmado o resolución de cierre aceptada | Done | Host |
+| Human Review | La persona pide cambios | Ready; misma rama y PR, PR a draft, después Building | Persona y orquestador |
+| Review | QA y Review aceptadas; PR lista para revisión | Human Review | Symphony |
+| Human Review | Merge confirmado en la rama destino | Done | Host |
+| Fase activa | El proceso ya no puede continuar sin intervención | Blocked; conserva el checkpoint | Host y pipeline |
+| Blocked | La persona resuelve el bloqueo y mueve a Ready | Reanudar desde el último checkpoint, conservando rama/PR | Orquestador |
+| Issue cerrada sin merge | Motivo de cierre registrado | Dropped; si falta motivo, Blocked hasta recibirlo | Persona y host |
+| Build | No hacen falta cambios y una persona confirma la resolución | Dropped con motivo | Persona y host |
+| Done | El item del Project se mueve a Ready, pero la issue está cerrada | Sin efecto; hace falta una issue nueva | Orquestador |
 
-Las fases se implementarán en código con transiciones admitidas. No deben depender de que una skill recuerde cambiar una columna ni del exit code del proceso Codex.
+Los fallos transitorios conservan los reintentos existentes. `Blocked` se usa cuando hace falta intervención. Las fases se implementarán en código con transiciones admitidas; no dependerán de que una skill recuerde cambiar una columna ni del exit code del proceso Codex.
 
 ### Resultado estructurado de fase
 
@@ -248,11 +265,11 @@ Cada rol entrega un resultado que el host valida contra un esquema versionado. E
 }
 ```
 
-Resultados admitidos: `passed`, `changes_requested`, `needs_input` y `blocked`. Una respuesta malformada es un error de contrato, con corrección acotada; no una aprobación. Los checks e IDs de evidencia deben provenir del host, y un resultado aprobado debe cubrir los requisitos del rol. Las preguntas, los hallazgos y el resumen tienen límites de tamaño. Ningún resultado permite al modelo autoconcederse permisos o marcar Done directamente.
+Resultados admitidos: `passed`, `changes_requested`, `needs_input` y `blocked`. Una respuesta malformada es un error de contrato, con corrección acotada; no una aprobación. Los checks e IDs de evidencia deben provenir del host, y un resultado aprobado debe cubrir los requisitos del rol. Las preguntas, los hallazgos y el resumen tienen límites de tamaño. Ningún resultado permite al modelo autoconcederse permisos o marcar `Done` o `Dropped` directamente.
 
 ## 8 Skills y herramientas de Super Board
 
-El catálogo upstream inspeccionado contiene ocho skills: cinco de uso directo y tres de pipeline. El fork debe conservar su cobertura funcional con una adaptación explícita al host Symphony. [SB2]
+El catálogo de Super Board inspeccionado contiene ocho skills: cinco de uso directo y tres de pipeline. El fork debe conservar su cobertura funcional con una adaptación explícita al host Symphony. [SB2]
 
 | Skill | Función en el fork | Adaptación |
 | --- | --- | --- |
@@ -269,7 +286,7 @@ Las skills externas se resuelven por capacidad: framework, pruebas, frontend, di
 
 Las instrucciones del repo se descubren en cada checkout. Una actualización de skills se prueba con tareas representativas y se aplica a nuevos intentos. QA y Review pueden reproducir una ejecución con las mismas versiones de la entrega original.
 
-La resolución distingue skills obligatorias, condicionales, opcionales e interactivas. Un worker desatendido no carga una skill que exige diálogo interactivo para completarse. Readiness debe comprobar la skill efectiva y su contrato; el resolver upstream comprueba disponibilidad, pero el pin de revisiones es una extensión del fork. [SB10]
+La resolución distingue skills obligatorias, condicionales, opcionales e interactivas. Un worker desatendido no carga una skill que exige diálogo interactivo para completarse. Readiness debe comprobar la skill efectiva y su contrato; el resolver existente comprueba disponibilidad, pero el pin de revisiones es una extensión del fork. [SB10]
 
 Los comandos de Super Board son referencia de experiencia de uso, no una obligación de conservar su implementación shell. El fork debe cubrir onboarding, ejecución, estado, parada, clasificación, calibración y limpieza, además de las operaciones directas de las skills. La matriz de paridad del apartado 16 mantiene visibles las capacidades pendientes.
 
@@ -284,7 +301,7 @@ Los comandos de Super Board son referencia de experiencia de uso, no una obligac
 | `super-collect` con fuentes y `--since` | Intake acotado por origen y periodo, con previsualización antes de publicación. |
 | `visual recap`, `plan` y `map` | Artefactos de explicación y exploración vinculados a la tarea. |
 
-`ui-refine-loop` no se dispara automáticamente desde las fases del board en upstream; su incorporación conserva la activación explícita. `git-sync` es una utilidad optativa y no el cierre automático de cualquier tarea. [SB6], [SB11], [SB12], [SB13]
+`ui-refine-loop` no se dispara automáticamente desde las fases del board en Super Board; su incorporación conserva la activación explícita. `git-sync` es una utilidad optativa y no el cierre automático de cualquier tarea. [SB6], [SB11], [SB12], [SB13]
 
 ### Formato de los entregables
 
@@ -300,14 +317,15 @@ Las siguientes operaciones son contratos propuestos, no APIs existentes de Symph
 | --- | --- | --- |
 | Preparar workspace | Repo autorizado, branch, ruta canónica y entorno | Identidad del workspace y SHA base. |
 | Ejecutar check | Comando permitido, timeout, entorno y captura de salida | Inicio, fin, exit code, resultado y archivos de evidencia. |
-| Publicar entrega | Branch del intento, cambios y remoto correcto | Commit y confirmación de push. |
+| Validar entrega del agente | Repo, branch, SHA, intento y remoto correctos | Commit y SHA remoto consultados. |
 | Crear o actualizar PR | Repo, branch, base y marcador del intento | ID y URL consultados en GitHub. |
+| Cambiar estado de PR | Contexto de revisión y estado del pipeline | PR draft o lista para revisión, verificada en GitHub. |
 | Solicitar transición | Resultado de fase y estado esperado | Transición aceptada o razón de rechazo. |
+| Publicar informe de fase | Resultado validado, identidad del intento y comentario idempotente | Comentario consultado en la issue, sin duplicados ni alterar comentarios humanos. |
 | Pedir aclaración | Pregunta concreta y relación con la tarea | Espera persistida y punto de reanudación. |
 | Registrar revisión | SHA revisado y hallazgos estructurados | Informe y revisión verificables. |
-| Fusionar | Política, aprobación y contexto de código | Merge confirmado y rama destino comprobada. |
 
-El agente puede proponer una acción; el host valida el contexto y ejecuta sus efectos. Un wrapper no constituye una barrera si el agente mantiene shell y credenciales con las que puede saltárselo. El perfil de aislamiento debe hacer efectivas las restricciones que se prometen.
+El agente sube su rama y propone un SHA; Symphony valida la entrega y ejecuta las escrituras de PR, estado e informes. El merge de esta entrega lo realiza una persona. Un wrapper no constituye una barrera si el agente mantiene shell y credenciales con las que puede saltárselo. El perfil de aislamiento debe hacer efectivas las restricciones que se prometen.
 
 Las herramientas base incluyen Git, Codex `app-server`, acceso API GitHub y runtimes del repo. GitHub CLI puede servir para diagnóstico o como transporte inicial encapsulado; las mutaciones del producto no se reparten entre scripts independientes sin contratos comunes.
 
@@ -324,10 +342,10 @@ El crawler de QA, la exploración de recorridos de varias pantallas, el verifica
 | Tarea | Identidad global, repo, última intención del tablero y generación admitida. |
 | Ejecución | Fase, estado, contexto de código, propietario, límites, configuración y motivo de espera. |
 | Intento de fase | Sesión, inicio y fin, resultado, error y consumo. |
-| Evidencia | Entrega y SHA asociados, check, revisión y ubicación de artefactos. |
-| Operación externa | Intención, clave estable, estado de confirmación y referencia remota. |
+| Evidencia | Entrega y SHA asociados, check, revisión, informe de fase y ubicación de artefactos. |
+| Operación externa | Intención, clave estable, estado de confirmación y referencia remota para PR, estado o comentario de issue. |
 
-El primer almacén debe ofrecer transacciones y restricciones de unicidad. Puede implementarse con SQLite en el host único; sus ficheros y artefactos requieren volumen persistente, copia y restauración. No se incluye un bus de eventos ni una cola distribuida como requisito inicial.
+El primer almacén será SQLite en un host y ofrecerá transacciones y restricciones de unicidad. Sus ficheros y artefactos requieren volumen persistente, copia y restauración. No se incluye un bus de eventos ni una cola distribuida como requisito inicial.
 
 ### Propiedad de ejecución
 
@@ -335,13 +353,13 @@ Debe existir como máximo un intento activo por tarea y generación. Un token de
 
 Al reiniciar, el servicio reconcilia procesos vivos, registros, workspaces, branches y efectos remotos. No supone que un proceso desaparecido falló antes de hacer cambios, ni que un proceso que terminó correctamente completó la tarea.
 
-Una sesión de Codex puede continuar si el protocolo y sus datos lo permiten. Si no, se abre una nueva sesión desde el último checkpoint confirmado, con la conversación resumida y las evidencias. La garantía del fork será recuperar el trabajo, no prometer restauración exacta de toda conversación sin haberla implementado. Los bloqueos upstream se guardan en memoria y necesitan persistencia adicional. [SY2], [SY8]
+Una sesión de Codex puede continuar si el protocolo y sus datos lo permiten. Si no, se abre una nueva sesión desde el último checkpoint confirmado, con la conversación resumida y las evidencias. La garantía del fork será recuperar el trabajo, no prometer restauración exacta de toda conversación sin haberla implementado. El código actual guarda los bloqueos en memoria y necesita persistencia adicional. [SY2], [SY8]
 
 ### Operaciones externas e idempotencia
 
-Antes de crear una PR o cambiar un estado externo se registra una intención durable. Cada operación usa una clave que incluya tarea, generación, fase y tipo de efecto. Si una respuesta se pierde, el reconciliador consulta el estado remoto antes de decidir si la operación se realizó.
+Antes de crear o actualizar una PR, cambiar un estado externo o publicar un informe se registra una intención durable. Cada operación usa una clave que incluya tarea, generación, fase, intento y tipo de efecto. Si una respuesta se pierde, el reconciliador consulta GitHub antes de decidir si la operación se realizó.
 
-No se promete atomicidad entre GitHub y la base local. Una PR se reconoce por repo, branch y marcador del intento; una publicación se reconoce por su SHA remoto. Las actualizaciones de informes usan bloques propios para evitar duplicados y conservar comentarios humanos.
+No se promete atomicidad entre GitHub y la base local. Una PR se reconoce por repo, branch y marcador del intento; una publicación se reconoce por su SHA remoto; un informe se reconoce por su marcador de tarea, fase e intento. Los informes se agregan como comentarios de Symphony, conservan los informes anteriores y no modifican comentarios humanos.
 
 Las operaciones confirmadas no se repiten al reanudar. Un worker que perdió su token de propiedad no puede aprobar una transición ni publicar mediante herramientas del host.
 
@@ -358,7 +376,7 @@ Las operaciones confirmadas no se repiten al reanudar. Un worker que perdió su 
 | Falta de avance o agotamiento de límites | Parar con resumen, último checkpoint y opciones de continuación. |
 | Cambio de HEAD durante QA o Review | Invalidar evidencia afectada y revisar la nueva entrega. |
 
-Los límites acumulados incluirán intentos de fase, rebotes, tiempo total y tokens. Si no hay precio verificado para un modelo, se controla consumo por tokens; no se publica un coste monetario inventado. Los límites de turnos de una sesión upstream no bastan como presupuesto de toda la tarea. [SY8], [SY9]
+Los límites acumulados incluirán intentos de fase, rebotes, tiempo total y tokens. Si no hay precio verificado para un modelo, se controla consumo por tokens; no se publica un coste monetario inventado. Los límites de turnos de una sesión de Codex no bastan como presupuesto de toda la tarea. [SY8], [SY9]
 
 El esquema debe exigir límites finitos o aplicar defaults explícitos y finitos. El contador no vuelve a cero al reiniciar el servicio ni al cambiar de modelo. La política distinguirá reintentos de infraestructura y ciclos de corrección del producto para que un fallo externo no consuma indefinidamente turnos de Build.
 
@@ -372,9 +390,11 @@ Los servicios de prueba pertenecen al entorno de ejecución. Bases de datos, pue
 
 La limpieza ocurre después de confirmar los efectos y guardar evidencias. Las tareas bloqueadas o interrumpidas conservan trabajo; la retención posterior tiene plazo y comando de recuperación. Un fallo de limpieza se muestra como fallo operativo distinto del resultado del producto.
 
-Los hooks upstream `after_run` y `before_remove` ignoran sus errores tras registrarlos: los checks que deciden aceptación deben ejecutarse como pasos obligatorios del pipeline. [SY6]
+Los hooks existentes `after_run` y `before_remove` ignoran sus errores tras registrarlos: los checks que deciden aceptación deben ejecutarse como pasos obligatorios del pipeline. [SY6]
 
-## 12 Adaptación a los seis proyectos
+## 12 Perfiles de ejemplo para el despliegue de Compralaentrada
+
+La tabla siguiente ilustra perfiles que Compralaentrada podría registrar para su instalación. No es una lista permitida en el producto ni parte del código; una instalación externa configura sus propios repositorios. La primera entrega piloto solo ejecuta una issue de Symphony.
 
 | Repo | Perfil y comprobaciones a concretar | Particularidades |
 | --- | --- | --- |
@@ -391,7 +411,7 @@ Una tarea que afecte a API, administración y kiosco se divide en subtareas por 
 
 ## 13 Aislamiento y controles de entrega
 
-Los permisos se separan entre servicio y ejecución: el host conserva las credenciales de Projects y publicación; los agentes reciben solo las capacidades necesarias para trabajar y verificar. El entorno de los procesos hijo se construye expresamente. Eliminar las variables conocidas de tracker, como hace upstream, no garantiza por sí solo que otras credenciales del host sean inaccesibles. [SY7]
+Los permisos se separan entre servicio y ejecución: Symphony conserva las credenciales para escribir PRs, informes y estados de Projects; el agente recibe únicamente acceso Git acotado al repo y la rama de su intento para subir su trabajo. El agente no recibe permisos de escritura sobre Projects ni para crear o actualizar PRs. El entorno de los procesos hijo se construye expresamente. Eliminar variables conocidas de tracker no garantiza por sí solo que otras credenciales del host sean inaccesibles. [SY7]
 
 Los límites efectivos deben cubrir rutas canónicas y symlinks, `.git`, ramas autorizadas, acceso a servicios de prueba y red requerida. Las ramas protegidas no reciben pushes directos. Los hooks shell se ejecutan con permisos del host: su contenido debe proceder de configuración revisada y no de la tarea.
 
@@ -401,7 +421,7 @@ El modo de merge se declara por repo. En modo humano, el sistema ofrece el resul
 
 Las protecciones y checks de GitHub completan el control de integración. Un mutex local y un pin del HEAD no impiden por sí solos que otro actor mueva la base remota; la estrategia de merge debe incluir validación actualizada o cola de merge. [SB3], [SB4]
 
-La aprobación también identifica el alcance de operaciones autorizado. Una etiqueta del tablero no equivale a una aprobación de merge. El fallo del mecanismo que valida permisos o evidencia impide ejecutar la mutación protegida. Los filtros de hooks upstream que continúan ante errores propios no proporcionan ese contrato. [SB4], [SB14]
+La aprobación también identifica el alcance de operaciones autorizado. Una etiqueta del tablero no equivale a una aprobación de merge. El fallo del mecanismo que valida permisos o evidencia impide ejecutar la mutación protegida. Los filtros de los hooks del catálogo original que continúan ante errores propios no proporcionan ese contrato. [SB4], [SB14]
 
 ## 14 Operación y observabilidad
 
@@ -438,7 +458,7 @@ La implementación mantendrá módulos acotados alrededor de las fronteras exist
 
 Los nombres concretos de módulos nuevos se decidirán al dividir el trabajo. No hace falta introducir un framework de plugins, múltiples bases de datos ni una infraestructura de colas para completar el primer ciclo.
 
-Mantener `origin` para el fork y `upstream` para OpenAI, registrar la revisión base y actualizar de forma deliberada. Cada cambio de contrato debe actualizar documentación y, cuando proceda, la SPEC del fork. Las modificaciones del orquestador exigen considerar arranque, reload, reinicio y recuperación conjuntamente. [SY11]
+Usar `origin` como fuente y destino del trabajo del fork, y registrar la revisión local inspeccionada. Cada cambio de contrato debe actualizar documentación y, cuando proceda, la SPEC del fork. Las modificaciones del orquestador exigen considerar arranque, reload, reinicio y recuperación conjuntamente. [SY11]
 
 Conservar Apache 2.0 y NOTICE de Symphony; conservar MIT y atribuciones del código copiado de Super Board. Registrar individualmente las licencias de skills y dependencias externas. [SY12], [SB5]
 
@@ -446,10 +466,10 @@ Conservar Apache 2.0 y NOTICE de Symphony; conservar MIT y atribuciones del cód
 
 | Capacidad de Super Board | Entrega prevista | Condición de aceptación |
 | --- | --- | --- |
-| Tablero y pipeline de siete columnas | Núcleo inicial | Una tarea recorre fases sin acciones manuales de reparación. |
+| Tablero y pipeline con estados configurables | Núcleo inicial | Una tarea recorre fases sin acciones manuales de reparación. |
 | Builder, QA y Reviewer | Núcleo inicial | Sesiones distintas y resultados asociados al código. |
 | Readiness y skills por tarea | Núcleo inicial | Dependencia ausente produce diagnóstico y conserva estado. |
-| PR en borrador e informes | Núcleo inicial | Publicación comprobada y sin duplicados al reintentar. |
+| PR draft tras Build, lista para revisión tras QA/Review e informes en la issue | Núcleo inicial | Cambios de estado de PR, estados del Project e informes se confirman y reconcilian sin duplicados. |
 | Rebotes y memoria de hallazgos | Robustez del pipeline | Review identifica qué hallazgos se resolvieron en cada entrega. |
 | Tipo `qa` sin Build | Robustez del pipeline | Verifica producto existente sin fingir implementación. |
 | Dependencias, prioridades y tandas | Extensión de planificación | Tareas de repos distintos se ordenan sin colisión de identidad. |
@@ -467,11 +487,11 @@ Conservar Apache 2.0 y NOTICE de Symphony; conservar MIT y atribuciones del cód
 
 ### Entrega uno Tarea completa en un repositorio
 
-Implementar perfil, adaptador Projects mínimo, persistencia mínima, Build, QA, Review y PR en borrador. Empezar con una tarea real pequeña y un host. Criterio: evidencia de checks, revisión y PR confirmadas; una nueva encuesta del tablero no reinicia el trabajo ya entregado.
+Sobre el tracker Projects v2 y los perfiles configurables de la fase anterior, implementar persistencia SQLite mínima y el pipeline Build → QA → Review autónoma → Human Review para una issue del repo Symphony en un host. El agente sube la rama; Symphony crea la PR draft después de Build, la marca lista para revisión tras QA y Review aceptadas, cambia estados y deja un informe en la issue al finalizar cada fase. Se conserva el contrato del tracker GitHub Issues existente. Una persona pide cambios o fusiona; `Done` solo se marca después de verificar el merge. `Dropped` requiere motivo y, si no hacen falta cambios, confirmación humana. `Blocked → Ready` reanuda desde el checkpoint conservando la rama y PR. Una issue fusionada y cerrada no se reactiva: el trabajo posterior usa una issue nueva. Criterio: un recorrido real deja evidencia de Build, QA, Review, PR y estados correctos, y se recupera del reinicio sin duplicar efectos externos.
 
 ### Entrega dos Recuperación y dos repositorios
 
-Añadir reanudación, aclaraciones, cancelación, reconciliación de operaciones, límites y segundo perfil. Provocar fallos entre una publicación remota y su confirmación local. Criterio: dos tareas `#42` de repos diferentes mantienen ramas, evidencias y resultados separados, y un reinicio no duplica PRs.
+Ampliar reconciliación y operación a dos repositorios, añadir aclaraciones, cancelación, límites y un segundo perfil. Provocar fallos entre una publicación remota y su confirmación local. Criterio: dos tareas `#42` de repos diferentes mantienen ramas, evidencias e informes separados, y un reinicio no duplica PRs, estados ni comentarios.
 
 ### Entrega tres Paridad del pipeline
 
@@ -497,9 +517,20 @@ El documento define las comprobaciones que habrá que construir y ejecutar al im
 | Reinicio durante Build | Recuperación del workspace y del último checkpoint confirmado. |
 | Reinicio esperando respuesta humana | La tarea sigue esperando, sin lanzar otro agente. |
 | PR creada y respuesta perdida | Se reconoce la PR existente y no se duplica. |
+| Informe de fase escrito y respuesta perdida | El comentario existente se reconoce y no se duplica ni se sobrescribe. |
 | Proceso viejo entrega resultado | Se rechaza si perdió su token de propiedad. |
 | QA falla por un defecto del producto | Devuelve un hallazgo reproducible a Build. |
 | QA falla por entorno o acceso | Diagnóstico operativo sin bucle de cambios de producto. |
+| La persona pide cambios en Human Review | Vuelve a Ready y Build conserva rama/PR; QA y Review validan la nueva entrega. |
+| Tras Build | PR queda en draft hasta que QA y Review acepten el mismo SHA. |
+| QA y Review aceptan | Symphony marca la PR lista para revisión y la tarea pasa a Human Review. |
+| Se piden cambios tras Human Review | La misma PR vuelve a draft y conserva rama; al volver a pasar QA y Review queda lista de nuevo. |
+| Tracker GitHub Issues seleccionado | Conserva el contrato actual de issues abiertas y cerradas. |
+| Merge confirmado | Pasa a Done solo después de comprobar el merge en la rama destino. |
+| Cierre de issue sin merge | Pasa a Dropped con motivo registrado en la issue. |
+| Build concluye que no hacen falta cambios | No pasa a Dropped hasta que una persona confirme la resolución. |
+| Blocked vuelve a Ready | Reanuda desde el último checkpoint y conserva rama/PR si existen. |
+| Issue cerrada y fusionada movida a Ready | No se reactiva; se requiere una issue nueva. |
 | HEAD cambia tras QA o Review | Evidencia afectada inválida y nueva validación. |
 | Cambio de base antes de merge | Se aplica la política de integración y se revalida cuando sea necesario. |
 | Cancelación o parada | El proceso se detiene, libera capacidad y conserva artefactos. |
@@ -514,40 +545,37 @@ Para el código Elixir se usarán checks específicos durante cada cambio y los 
 
 | Decisión | Propuesta inicial | Cuándo cerrarla |
 | --- | --- | --- |
-| Project de organización | Uno compartido con scope de ensayo inicial | Antes de conectar escrituras. |
-| Host y persistencia | Un servicio local o servidor dedicado con volumen durable | Antes del primer despliegue. |
+| Project y opciones de estado | Configurar identidad, campo y valores por instalación; validarlos antes de escribir | Durante el onboarding de la instalación piloto. |
+| Host y volumen SQLite | Un solo host con volumen durable | Antes del primer despliegue del piloto. |
 | SQLite y acceso desde Elixir | Elegir dependencia y mecanismo de migraciones compatibles con el fork | Al diseñar el almacén mínimo. |
-| Primer repo | Vue o Laravel con tarea pequeña y entorno reproducible | Antes de la primera demostración. |
-| Modelos por fase | Configurables; sesiones separadas | Antes del primer turno real. |
 | Checks de cada repo | Perfiles derivados de sus reglas y entornos | Antes de admitir tareas de ese repo. |
-| Merge y aprobación | Humano inicialmente; automatización por política posterior | Antes de habilitar cada modo. |
 | Acceso al dashboard | Local inicialmente; autenticado antes de acceso compartido | Antes de habilitar acciones remotas. |
-| Destino de artefactos y retención | Volumen persistente y enlaces desde la ejecución | Con la primera entrega de evidencias. |
+| Destino de artefactos y retención | Volumen persistente y referencias desde la ejecución | Con la primera entrega de evidencias. |
 | Prioridad de conectores adicionales | Después del pipeline fiable | Tras el piloto. |
 
-La estimación detallada debe realizarse al convertir estas entregas en tareas con alcance y aceptación. La cifra preliminar de viabilidad no sustituye un plan de implementación de persistencia, herramientas y recuperación.
+Las decisiones de producto para la Entrega uno ya están cerradas; las filas anteriores son elecciones técnicas o de despliegue que se concretan al implementar sin fijar ninguna organización o repositorio en el código.
 
 ## 19 Fuentes y referencias
 
-Las referencias a Symphony fijan el commit base del fork. Las de Super Board fijan el código inspeccionado, posterior a su release v3.1.2. Las secciones de arquitectura y contratos anteriores describen el comportamiento que se propone implementar.
+Las referencias de código de Symphony apuntan al fork `Compralaentrada/symphony` en el commit base inspeccionado. Las de Super Board fijan el código inspeccionado, posterior a su release v3.1.2. Las secciones de arquitectura y contratos anteriores describen el comportamiento que se propone implementar.
 
 - [Symphony SPEC][SY1], [guía de implementación][SY2], [tracker GitHub][SY3] y [modelo de tarea][SY13].
 - [Super Board pipeline][SB1], [catálogo de skills][SB2], [gate de merge][SB3] y [aprobación][SB4].
-- [GitHub Projects API][GH1] y [tableros de organización][GH2].
+- [GitHub Projects API][GH1], [tableros de organización][GH2] y [cambios entre draft y lista para revisión en una PR][GH3].
 
-[SY1]: https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/SPEC.md
-[SY2]: https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/README.md
-[SY3]: https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/github/adapter.ex
-[SY4]: https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/agent_runner.ex
-[SY5]: https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/prompt_builder.ex
-[SY6]: https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/workspace.ex
-[SY7]: https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/codex/app_server.ex
-[SY8]: https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/orchestrator.ex
-[SY9]: https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/config/schema.ex
-[SY10]: https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir_web/router.ex
-[SY11]: https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/AGENTS.md
-[SY12]: https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/LICENSE
-[SY13]: https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/tracker/issue.ex
+[SY1]: https://github.com/Compralaentrada/symphony/blob/15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d/SPEC.md
+[SY2]: https://github.com/Compralaentrada/symphony/blob/15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d/elixir/README.md
+[SY3]: https://github.com/Compralaentrada/symphony/blob/15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d/elixir/lib/symphony_elixir/github/adapter.ex
+[SY4]: https://github.com/Compralaentrada/symphony/blob/15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d/elixir/lib/symphony_elixir/agent_runner.ex
+[SY5]: https://github.com/Compralaentrada/symphony/blob/15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d/elixir/lib/symphony_elixir/prompt_builder.ex
+[SY6]: https://github.com/Compralaentrada/symphony/blob/15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d/elixir/lib/symphony_elixir/workspace.ex
+[SY7]: https://github.com/Compralaentrada/symphony/blob/15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d/elixir/lib/symphony_elixir/codex/app_server.ex
+[SY8]: https://github.com/Compralaentrada/symphony/blob/15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d/elixir/lib/symphony_elixir/orchestrator.ex
+[SY9]: https://github.com/Compralaentrada/symphony/blob/15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d/elixir/lib/symphony_elixir/config/schema.ex
+[SY10]: https://github.com/Compralaentrada/symphony/blob/15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d/elixir/lib/symphony_elixir_web/router.ex
+[SY11]: https://github.com/Compralaentrada/symphony/blob/15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d/elixir/AGENTS.md
+[SY12]: https://github.com/Compralaentrada/symphony/blob/15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d/LICENSE
+[SY13]: https://github.com/Compralaentrada/symphony/blob/15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d/elixir/lib/symphony_elixir/tracker/issue.ex
 [SB1]: https://github.com/EricTechPro/super-board/blob/f014cfa8aa0ef4e807c132f502a520f1e4864a31/skills/super-board/references/run.md
 [SB2]: https://github.com/EricTechPro/super-board/blob/f014cfa8aa0ef4e807c132f502a520f1e4864a31/skills/families.json
 [SB3]: https://github.com/EricTechPro/super-board/blob/f014cfa8aa0ef4e807c132f502a520f1e4864a31/scripts/super-board-merge-gate.sh
@@ -565,3 +593,4 @@ Las referencias a Symphony fijan el commit base del fork. Las de Super Board fij
 [SB15]: https://github.com/EricTechPro/super-board/blob/f014cfa8aa0ef4e807c132f502a520f1e4864a31/skills/super-collect/SKILL.md
 [GH1]: https://docs.github.com/en/issues/planning-and-tracking-with-projects/automating-your-project/using-the-api-to-manage-projects
 [GH2]: https://docs.github.com/en/issues/planning-and-tracking-with-projects/creating-projects/creating-a-project
+[GH3]: https://docs.github.com/en/pull-requests/how-tos/create-pull-requests/changing-the-stage-of-a-pull-request
