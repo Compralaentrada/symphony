@@ -1,6 +1,68 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
+  test "Projects completion and intervention blockers update the tracker while transient errors retry" do
+    previous_client = Application.get_env(:symphony_elixir, :github_projects_client_module)
+    previous_owner = Application.get_env(:symphony_elixir, :projects_lifecycle_test_owner)
+
+    Application.put_env(
+      :symphony_elixir,
+      :github_projects_client_module,
+      SymphonyElixir.OrchestratorStatusTest.ProjectsLifecycleClient
+    )
+
+    Application.put_env(:symphony_elixir, :projects_lifecycle_test_owner, self())
+    write_projects_workflow!()
+
+    on_exit(fn ->
+      restore_application_env(:github_projects_client_module, previous_client)
+      restore_application_env(:projects_lifecycle_test_owner, previous_owner)
+    end)
+
+    orchestrator_name = Module.concat(__MODULE__, :ProjectsLifecycleOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    done = lifecycle_issue("repo/app#1")
+    blocked = lifecycle_issue("repo/app#2")
+    transient = lifecycle_issue("repo/app#3")
+
+    blocked_worker =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    running = %{
+      done.id => lifecycle_running_entry(done, make_ref(), :normal, nil),
+      blocked.id => lifecycle_running_entry(blocked, make_ref(), :turn_input_required, blocked_worker),
+      transient.id => lifecycle_running_entry(transient, make_ref(), nil, nil)
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{state | running: running, claimed: MapSet.new(Map.keys(running))}
+    end)
+
+    for {issue, reason} <- [{done, :normal}, {blocked, :normal}, {transient, {:worker_exit, :econnreset}}] do
+      entry = running[issue.id]
+      send(pid, {:DOWN, entry.ref, :process, entry.pid || self(), reason})
+    end
+
+    state = :sys.get_state(pid)
+    assert MapSet.member?(state.completed, done.id)
+    refute MapSet.member?(state.claimed, done.id)
+    assert Map.has_key?(state.blocked, blocked.id)
+    assert Map.has_key?(state.retry_attempts, transient.id)
+
+    assert_receive {:projects_complete, ^done}
+    assert_receive {:projects_block, ^blocked, "codex turn requires operator input"}
+    refute_receive {:projects_block, ^transient, _reason}
+  end
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
@@ -1799,5 +1861,75 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       {next_tokens, [{timestamp, next_tokens} | acc]}
     end)
     |> elem(1)
+  end
+
+  defp lifecycle_issue(id) do
+    %Issue{
+      id: id,
+      identifier: id,
+      title: "Lifecycle test",
+      state: "Building",
+      dispatchable: true
+    }
+  end
+
+  defp lifecycle_running_entry(issue, ref, last_codex_event, pid) do
+    %{
+      pid: pid,
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      last_codex_event: last_codex_event,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      retry_attempt: 0,
+      worker_host: nil,
+      workspace_path: nil,
+      started_at: DateTime.utc_now()
+    }
+  end
+
+  defp write_projects_workflow! do
+    File.write!(
+      Workflow.workflow_file_path(),
+      """
+      ---
+      tracker:
+        kind: github_projects
+        active_states: [Ready, Building]
+        terminal_states: [closed]
+        provider:
+          owner: acme
+          project_number: 12
+          status_field: Status
+          status_values: {ready: Ready, building: Building, blocked: Blocked, done: Done}
+          repositories:
+            - repository: repo/app
+              base_branch: main
+              prepare_command: "true"
+          token: test-token
+      ---
+      Work on {{ issue.identifier }}.
+      """
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+  end
+
+  defp restore_application_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
+  defp restore_application_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
+end
+
+defmodule SymphonyElixir.OrchestratorStatusTest.ProjectsLifecycleClient do
+  def fetch_issues_by_states(_states), do: {:ok, []}
+  def fetch_issues_by_ids(_ids), do: {:ok, []}
+  def claim_issue(issue), do: notify({:projects_claim, issue})
+  def complete_issue(issue), do: notify({:projects_complete, issue})
+  def block_issue(issue, reason), do: notify({:projects_block, issue, reason})
+
+  defp notify(message) do
+    send(Application.fetch_env!(:symphony_elixir, :projects_lifecycle_test_owner), message)
+    :ok
   end
 end

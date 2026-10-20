@@ -209,17 +209,28 @@ defmodule SymphonyElixir.Orchestrator do
     if input_required_blocker?(running_entry) do
       block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
     else
-      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+      case Tracker.complete_issue(running_entry.issue) do
+        :ok ->
+          Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; marking tracker item complete")
+          state |> complete_issue(issue_id) |> release_issue_claim(issue_id)
 
-      state
-      |> complete_issue(issue_id)
-      |> schedule_issue_retry(issue_id, 1, %{
-        identifier: running_entry.identifier,
-        issue_url: running_entry.issue.url,
-        delay_type: :continuation,
-        worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path)
-      })
+        {:error, reason} ->
+          Logger.warning("Unable to mark tracker item complete issue_id=#{issue_id}: #{inspect(reason)}; scheduling retry")
+          retry_agent_down(state, issue_id, running_entry, session_id, {:tracker_completion_failed, reason})
+
+        :ignore ->
+          Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+          state
+          |> complete_issue(issue_id)
+          |> schedule_issue_retry(issue_id, 1, %{
+            identifier: running_entry.identifier,
+            issue_url: running_entry.issue.url,
+            delay_type: :continuation,
+            worker_host: Map.get(running_entry, :worker_host),
+            workspace_path: Map.get(running_entry, :workspace_path)
+          })
+      end
     end
   end
 
@@ -755,6 +766,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error) do
+    case Map.get(running_entry, :issue) do
+      %Issue{} = issue ->
+        case Tracker.block_issue(issue, error) do
+          :ok -> :ok
+          :ignore -> :ok
+          {:error, reason} -> Logger.warning("Unable to mark tracker item blocked issue_id=#{issue_id}: #{inspect(reason)}")
+        end
+
+      _ ->
+        :ok
+    end
+
     blocked_entry = %{
       issue_id: issue_id,
       identifier: Map.get(running_entry, :identifier, issue_id),
@@ -938,15 +961,31 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
-    recipient = self()
-
     case select_worker_host(state, preferred_worker_host) do
       :no_worker_capacity ->
         Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        claim_and_spawn_issue(state, issue, attempt, worker_host)
+    end
+  end
+
+  defp claim_and_spawn_issue(state, issue, attempt, worker_host) do
+    case Tracker.claim_issue(issue) do
+      result when result in [:ok, :ignore] ->
+        spawn_issue_on_worker_host(state, issue, attempt, self(), worker_host)
+
+      {:error, reason} ->
+        Logger.warning("Unable to claim tracker item for #{issue_context(issue)}: #{inspect(reason)}; scheduling retry")
+        next_attempt = if is_integer(attempt), do: attempt + 1, else: 1
+
+        schedule_issue_retry(state, issue.id, next_attempt, %{
+          identifier: issue.identifier,
+          issue_url: issue.url,
+          error: "tracker claim failed: #{inspect(reason)}",
+          worker_host: worker_host
+        })
     end
   end
 

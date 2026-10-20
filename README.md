@@ -28,7 +28,8 @@ Tell your favorite coding agent to build Symphony in a programming language of y
 ### Option 2. Use our experimental reference implementation
 
 Check out [elixir/README.md](elixir/README.md) for instructions on how to set up your environment
-and run the Elixir-based Symphony implementation. You can also ask your favorite coding agent to
+and run the Elixir-based Symphony implementation, which includes Linear, GitHub Issues, GitHub
+Projects v2, Jira, Asana, and GitLab tracker adapters. You can also ask your favorite coding agent to
 help with the setup:
 
 > Set up Symphony for my repository based on

@@ -1,0 +1,779 @@
+defmodule SymphonyElixir.GitHub.Projects.Client do
+  @moduledoc """
+  GitHub Projects v2 GraphQL client for issue-backed work items.
+  """
+
+  alias SymphonyElixir.Config
+  alias SymphonyElixir.Tracker.Issue
+
+  @default_graphql_url "https://api.github.com/graphql"
+  @statuses ["ready", "building", "blocked", "done"]
+  @project_query """
+  query SymphonyProject($owner: String!, $number: Int!, $after: String) {
+    user(login: $owner) { projectV2(number: $number) { ...SymphonyProjectFields } }
+    organization(login: $owner) { projectV2(number: $number) { ...SymphonyProjectFields } }
+  }
+
+  fragment SymphonyProjectFields on ProjectV2 {
+    id
+    fields(first: 100) {
+      nodes {
+        __typename
+        ... on ProjectV2SingleSelectField { id name options { id name } }
+      }
+    }
+    items(first: 100, after: $after) {
+      nodes {
+        id
+        content {
+          __typename
+          ... on Issue {
+            id number title body state url createdAt updatedAt
+            repository { nameWithOwner }
+            labels(first: 100) { nodes { name } }
+          }
+        }
+        fieldValues(first: 100) {
+          nodes {
+            __typename
+            ... on ProjectV2ItemFieldSingleSelectValue {
+              name
+              field { ... on ProjectV2SingleSelectField { name } }
+            }
+          }
+        }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+  """
+
+  @status_mutation """
+  mutation SymphonySetProjectStatus(
+    $projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!
+  ) {
+    updateProjectV2ItemFieldValue(input: {
+      projectId: $projectId,
+      itemId: $itemId,
+      fieldId: $fieldId,
+      value: { singleSelectOptionId: $optionId }
+    }) {
+      projectV2Item { id }
+    }
+  }
+  """
+
+  @comment_mutation """
+  mutation SymphonyAddIssueComment($subjectId: ID!, $body: String!) {
+    addComment(input: { subjectId: $subjectId, body: $body }) {
+      commentEdge { node { id } }
+    }
+  }
+  """
+
+  @spec validate_settings(map()) :: :ok | {:error, term()}
+  def validate_settings(tracker_settings) do
+    case settings(tracker_settings) do
+      {:ok, _settings} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @spec secret_environment_names(map()) :: [String.t()]
+  def secret_environment_names(tracker_settings) do
+    provider = provider_settings(tracker_settings)
+
+    (["GITHUB_TOKEN", "GH_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_ENTERPRISE_TOKEN"] ++
+       env_reference_names(provider["token"]))
+    |> Enum.uniq()
+  end
+
+  @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states(states) when is_list(states) do
+    fetch_issues_by_states(states, Config.settings!().tracker, &perform_request/3)
+  end
+
+  @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids(ids) when is_list(ids) do
+    fetch_issues_by_ids(ids, Config.settings!().tracker, &perform_request/3)
+  end
+
+  @doc false
+  @spec fetch_issues_by_states_for_test([String.t()], map(), function()) ::
+          {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states_for_test(states, tracker_settings, request_fun)
+      when is_list(states) and is_map(tracker_settings) and is_function(request_fun, 3) do
+    fetch_issues_by_states(states, tracker_settings, request_fun)
+  end
+
+  @doc false
+  @spec fetch_issues_by_ids_for_test([String.t()], map(), function()) ::
+          {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids_for_test(ids, tracker_settings, request_fun)
+      when is_list(ids) and is_map(tracker_settings) and is_function(request_fun, 3) do
+    fetch_issues_by_ids(ids, tracker_settings, request_fun)
+  end
+
+  @doc false
+  @spec update_issue_status_for_test(Issue.t(), String.t(), String.t(), map(), function()) ::
+          :ok | {:error, term()}
+  def update_issue_status_for_test(issue, status, reason, tracker_settings, request_fun)
+      when is_struct(issue, Issue) and is_binary(status) and is_binary(reason) and
+             is_map(tracker_settings) and is_function(request_fun, 3) do
+    with {:ok, settings} <- settings(tracker_settings),
+         :ok <- set_item_status(issue.native_ref, status, settings, request_fun) do
+      if normalize_state(status) == "blocked" do
+        add_issue_comment(issue.native_ref, reason, settings, request_fun)
+      else
+        :ok
+      end
+    end
+  end
+
+  @spec claim_issue(Issue.t()) :: :ok | {:error, term()}
+  def claim_issue(issue) do
+    update_issue_status(issue, :building, nil, Config.settings!().tracker, &perform_request/3)
+  end
+
+  @spec complete_issue(Issue.t()) :: :ok | {:error, term()}
+  def complete_issue(issue) do
+    update_issue_status(issue, :done, nil, Config.settings!().tracker, &perform_request/3)
+  end
+
+  @spec block_issue(Issue.t(), String.t()) :: :ok | {:error, term()}
+  def block_issue(issue, reason) when is_binary(reason) do
+    update_issue_status(issue, :blocked, reason, Config.settings!().tracker, &perform_request/3)
+  end
+
+  defp fetch_issues_by_states(states, tracker_settings, request_fun) do
+    requested = MapSet.new(states, &normalize_state/1)
+
+    with {:ok, settings} <- settings(tracker_settings),
+         {:ok, metadata, items} <- project_items(settings, request_fun),
+         {:ok, issues} <- normalize_items(items, metadata, settings, request_fun) do
+      # Building items are reconciled by ID; only Ready items enter the dispatch poll.
+      dispatch_ready? = MapSet.member?(requested, normalize_state(settings.statuses.ready))
+
+      issues
+      |> Enum.filter(&requested_state?(&1, requested, dispatch_ready?, settings))
+      |> then(&{:ok, &1})
+    end
+  end
+
+  defp requested_state?(issue, requested, dispatch_ready?, settings) do
+    normalized = normalize_state(issue.state)
+
+    cond do
+      normalized == "closed" ->
+        MapSet.member?(requested, "closed") or
+          MapSet.member?(requested, normalize_state(Map.get(issue.native_ref, :project_status)))
+
+      dispatch_ready? ->
+        normalized == normalize_state(settings.statuses.ready)
+
+      true ->
+        MapSet.member?(requested, normalized)
+    end
+  end
+
+  defp fetch_issues_by_ids(ids, tracker_settings, request_fun) do
+    requested_ids = MapSet.new(ids)
+
+    if MapSet.size(requested_ids) == 0 do
+      {:ok, []}
+    else
+      with {:ok, settings} <- settings(tracker_settings),
+           {:ok, metadata, items} <- project_items(settings, request_fun),
+           {:ok, issues} <- normalize_items(items, metadata, settings, request_fun) do
+        {:ok, Enum.filter(issues, &MapSet.member?(requested_ids, &1.id))}
+      end
+    end
+  end
+
+  defp project_items(settings, request_fun) do
+    with {:ok, project} <- fetch_project(settings, request_fun, nil),
+         {:ok, metadata} <- project_metadata(project, settings),
+         {:ok, items} <- fetch_remaining_items(project, settings, request_fun, metadata, []) do
+      {:ok, metadata, items}
+    end
+  end
+
+  defp fetch_project(settings, request_fun, cursor) do
+    variables = %{
+      "owner" => settings.owner,
+      "number" => settings.project_number,
+      "after" => cursor
+    }
+
+    with {:ok, data} <- graphql(request_fun, @project_query, variables, settings),
+         project when is_map(project) <- project_from_data(data) do
+      {:ok, project}
+    else
+      nil ->
+        {:error, {:github_projects_permission_error, "Project not found or inaccessible. Confirm the owner, project number, and token access."}}
+
+      {:error, _reason} = error ->
+        error
+
+      _other ->
+        {:error, {:github_projects_api_error, "GitHub returned an invalid Project response."}}
+    end
+  end
+
+  defp fetch_remaining_items(project, settings, request_fun, metadata, acc) do
+    connection = project["items"] || %{}
+    nodes = connection["nodes"] || []
+    acc = acc ++ nodes
+    page_info = connection["pageInfo"] || %{}
+
+    if page_info["hasNextPage"] do
+      with {:ok, next_project} <- fetch_project(settings, request_fun, page_info["endCursor"]) do
+        fetch_remaining_items(next_project, settings, request_fun, metadata, acc)
+      end
+    else
+      {:ok, acc}
+    end
+  end
+
+  defp project_from_data(data) do
+    get_in(data, ["user", "projectV2"]) || get_in(data, ["organization", "projectV2"])
+  end
+
+  defp project_metadata(project, settings) do
+    fields = get_in(project, ["fields", "nodes"]) || []
+
+    case Enum.find(fields, fn field -> field["__typename"] == "ProjectV2SingleSelectField" and field["name"] == settings.status_field end) do
+      nil ->
+        {:error, {:github_projects_configuration_error, "Project status field #{inspect(settings.status_field)} was not found or is not single-select."}}
+
+      field ->
+        options = field["options"] || []
+        option_ids = Map.new(options, fn option -> {option["name"], option["id"]} end)
+        missing = Enum.reject(Map.values(settings.statuses), &Map.has_key?(option_ids, &1))
+
+        if missing == [] do
+          {:ok,
+           %{
+             project_id: project["id"],
+             status_field_id: field["id"],
+             status_option_ids: option_ids
+           }}
+        else
+          {:error, {:github_projects_configuration_error, "Project status field #{inspect(settings.status_field)} is missing configured options: #{Enum.join(missing, ", ")}."}}
+        end
+    end
+  end
+
+  defp normalize_items(items, metadata, settings, request_fun) do
+    Enum.reduce_while(items, {:ok, []}, fn item, {:ok, issues} ->
+      case normalize_item(item, metadata, settings, request_fun) do
+        {:ok, nil} -> {:cont, {:ok, issues}}
+        {:ok, %Issue{} = issue} -> {:cont, {:ok, [issue | issues]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, issues} -> {:ok, Enum.reverse(issues)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp normalize_item(item, metadata, settings, request_fun) do
+    case item["content"] do
+      %{"__typename" => "Issue"} ->
+        normalize_linked_issue(item, metadata, settings, request_fun)
+
+      _ ->
+        {:ok, nil}
+    end
+  end
+
+  defp normalize_linked_issue(item, metadata, settings, request_fun) do
+    content = item["content"]
+    status = item_status(item, settings.status_field)
+    repository = get_in(content, ["repository", "nameWithOwner"])
+    profile = Map.get(settings.repositories, normalize_repository(repository))
+
+    cond do
+      is_nil(status) ->
+        {:ok, nil}
+
+      normalize_state(content["state"]) == "closed" ->
+        with :ok <- maybe_mark_closed(item, status, settings, metadata, request_fun) do
+          {:ok, normalize_issue(item, metadata, settings, profile, "closed", status)}
+        end
+
+      is_nil(profile) and status_in?(status, [settings.statuses.ready, settings.statuses.building]) ->
+        with :ok <- maybe_block_unconfigured(item, status, settings, metadata, request_fun) do
+          {:ok, nil}
+        end
+
+      true ->
+        {:ok, normalize_issue(item, metadata, settings, profile, status, status)}
+    end
+  end
+
+  defp normalize_issue(item, metadata, settings, profile, state, project_status) do
+    content = item["content"]
+    repository = get_in(content, ["repository", "nameWithOwner"])
+    number = content["number"]
+    id = "#{repository}##{number}"
+    dispatch_status? = status_in?(project_status, [settings.statuses.ready, settings.statuses.building])
+
+    native_ref = %{
+      project_item_id: item["id"],
+      project_id: metadata.project_id,
+      status_field_id: metadata.status_field_id,
+      status_option_ids: metadata.status_option_ids,
+      project_status: project_status,
+      issue_node_id: content["id"],
+      issue_state: content["state"],
+      repository: repository,
+      base_branch: profile && profile.base_branch,
+      prepare_command: profile && profile.prepare_command
+    }
+
+    %Issue{
+      id: id,
+      native_ref: native_ref,
+      identifier: id,
+      title: content["title"],
+      description: content["body"],
+      branch_name: work_branch(repository, number),
+      state: state,
+      url: content["url"],
+      labels: extract_labels(content),
+      dispatchable: not is_nil(profile) and dispatch_status? and state != "closed",
+      blocked_by: [],
+      created_at: parse_datetime(content["createdAt"]),
+      updated_at: parse_datetime(content["updatedAt"])
+    }
+  end
+
+  defp maybe_mark_closed(item, status, settings, metadata, request_fun) do
+    if normalize_state(status) == normalize_state(settings.statuses.done) do
+      :ok
+    else
+      item
+      |> item_ref(metadata, status)
+      |> set_item_status(settings.statuses.done, settings, request_fun)
+    end
+  end
+
+  defp maybe_block_unconfigured(item, status, settings, metadata, request_fun) do
+    if normalize_state(status) == normalize_state(settings.statuses.blocked) do
+      :ok
+    else
+      ref = item_ref(item, metadata, status)
+      repository = get_in(item, ["content", "repository", "nameWithOwner"])
+      reason = "No repository profile is configured for #{repository}. Add an exact owner/repository profile to tracker.provider.repositories."
+
+      with :ok <- set_item_status(ref, settings.statuses.blocked, settings, request_fun) do
+        add_issue_comment(ref, reason, settings, request_fun)
+      end
+    end
+  end
+
+  defp item_ref(item, metadata, status) do
+    %{
+      project_item_id: item["id"],
+      project_id: metadata.project_id,
+      status_field_id: metadata.status_field_id,
+      status_option_ids: metadata.status_option_ids,
+      project_status: status,
+      issue_node_id: get_in(item, ["content", "id"])
+    }
+  end
+
+  defp item_status(item, status_field) do
+    item
+    |> get_in(["fieldValues", "nodes"])
+    |> case do
+      values when is_list(values) ->
+        Enum.find_value(values, &status_value(&1, status_field))
+
+      _ ->
+        nil
+    end
+  end
+
+  defp status_value(value, status_field) do
+    case get_in(value, ["field", "name"]) do
+      ^status_field -> value["name"]
+      _ -> nil
+    end
+  end
+
+  defp update_issue_status(issue, status_key, reason, tracker_settings, request_fun) do
+    with {:ok, settings} <- settings(tracker_settings),
+         ref when is_map(ref) <- issue.native_ref,
+         :ok <- ensure_claimable(issue, status_key, settings),
+         :ok <- set_item_status(ref, Map.fetch!(settings.statuses, status_key), settings, request_fun),
+         :ok <- maybe_add_block_reason(ref, status_key, reason, settings, request_fun) do
+      :ok
+    else
+      nil -> {:error, {:github_projects_api_error, "Project item reference is missing."}}
+      {:error, _reason} = error -> error
+      _other -> {:error, {:github_projects_api_error, "Unable to update the Project item status."}}
+    end
+  end
+
+  defp ensure_claimable(issue, :building, settings) do
+    issue_state = normalize_state(issue.state)
+    project_status = normalize_state(ref_value(issue.native_ref, :project_status))
+
+    cond do
+      issue_state == normalize_state(settings.statuses.ready) and
+          project_status == normalize_state(settings.statuses.ready) ->
+        :ok
+
+      issue_state == normalize_state(settings.statuses.building) and
+          project_status == normalize_state(settings.statuses.building) ->
+        :ok
+
+      true ->
+        {:error, {:github_projects_item_not_ready, issue.id}}
+    end
+  end
+
+  defp ensure_claimable(_issue, _status_key, _settings), do: :ok
+
+  defp maybe_add_block_reason(_ref, _status_key, nil, _settings, _request_fun), do: :ok
+
+  defp maybe_add_block_reason(ref, :blocked, reason, settings, request_fun),
+    do: add_issue_comment(ref, reason, settings, request_fun)
+
+  defp maybe_add_block_reason(_ref, _status_key, _reason, _settings, _request_fun), do: :ok
+
+  defp set_item_status(ref, status, settings, request_fun) do
+    option_id = Map.get(ref, :status_option_ids, Map.get(ref, "status_option_ids", %{}))[status]
+
+    with id when is_binary(id) <- option_id,
+         project_id when is_binary(project_id) <- ref_value(ref, :project_id),
+         item_id when is_binary(item_id) <- ref_value(ref, :project_item_id),
+         field_id when is_binary(field_id) <- ref_value(ref, :status_field_id),
+         {:ok, _data} <-
+           graphql(
+             request_fun,
+             @status_mutation,
+             %{
+               "projectId" => project_id,
+               "itemId" => item_id,
+               "fieldId" => field_id,
+               "optionId" => id
+             },
+             settings
+           ) do
+      :ok
+    else
+      {:error, _reason} = error -> error
+      _other -> {:error, {:github_projects_configuration_error, "Unable to resolve the configured Project status option."}}
+    end
+  end
+
+  defp add_issue_comment(ref, reason, settings, request_fun) do
+    subject_id = ref_value(ref, :issue_node_id)
+
+    if is_binary(subject_id) do
+      body = "Symphony moved this Project item to Blocked: " <> String.slice(reason, 0, 2_000)
+
+      with {:ok, _data} <-
+             graphql(
+               request_fun,
+               @comment_mutation,
+               %{"subjectId" => subject_id, "body" => body},
+               settings
+             ) do
+        :ok
+      end
+    else
+      {:error, {:github_projects_api_error, "Linked GitHub Issue has no node ID for the Blocked reason comment."}}
+    end
+  end
+
+  defp graphql(request_fun, query, variables, settings) do
+    case request_fun.(query, variables, settings) do
+      {:ok, %{status: status, body: body}} when status in 200..299 ->
+        graphql_body(body)
+
+      {:ok, %{status: status}} when status in [401, 403] ->
+        {:error, {:github_projects_permission_error, "GitHub denied Projects access (HTTP #{status}). Grant the token Project read/write access and issue read/write access."}}
+
+      {:ok, %{status: status}} ->
+        {:error, {:github_projects_api_error, "GitHub Projects GraphQL request failed (HTTP #{status})."}}
+
+      {:error, _reason} ->
+        {:error, {:github_projects_api_error, "GitHub Projects GraphQL request failed before receiving a response."}}
+
+      _other ->
+        {:error, {:github_projects_api_error, "GitHub Projects GraphQL returned an invalid response."}}
+    end
+  end
+
+  defp graphql_body(%{"errors" => errors}) when is_list(errors) and errors != [] do
+    message = Enum.map_join(errors, "; ", &Map.get(&1, "message", "unknown GraphQL error"))
+    lower = String.downcase(message)
+
+    if String.contains?(
+         lower,
+         ["permission", "not accessible", "resource not found", "must have access", "could not resolve"]
+       ) do
+      {:error, {:github_projects_permission_error, "GitHub denied Project or issue access. Confirm token Project read/write and linked issue read/write permissions."}}
+    else
+      {:error, {:github_projects_api_error, message}}
+    end
+  end
+
+  defp graphql_body(%{"data" => data}) when is_map(data), do: {:ok, data}
+  defp graphql_body(_body), do: {:error, {:github_projects_api_error, "GitHub Projects GraphQL returned no data."}}
+
+  defp perform_request(query, variables, settings) do
+    request_opts = [
+      method: :post,
+      url: settings.graphql_url,
+      headers: [
+        {"authorization", "Bearer #{settings.token}"},
+        {"accept", "application/vnd.github+json"},
+        {"content-type", "application/json"},
+        {"user-agent", "symphony"}
+      ],
+      json: %{"query" => query, "variables" => variables},
+      connect_options: [timeout: 30_000]
+    ]
+
+    case Req.request(request_opts) do
+      {:ok, response} -> {:ok, %{status: response.status, body: response.body}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp settings(tracker_settings) when is_map(tracker_settings) do
+    provider = provider_settings(tracker_settings)
+
+    with {:ok, project} <- project_settings(provider),
+         {:ok, statuses} <- status_settings(provider),
+         {:ok, profiles} <- repository_settings(provider),
+         {:ok, graphql_url} <- graphql_url_setting(provider),
+         {:ok, token} <- token_setting(provider),
+         :ok <- validate_routing_settings(tracker_settings, statuses) do
+      {:ok,
+       Map.merge(project, %{
+         statuses: statuses,
+         repositories: profiles,
+         graphql_url: String.trim_trailing(graphql_url, "/"),
+         token: token
+       })}
+    end
+  end
+
+  defp settings(_tracker_settings), do: invalid_settings(:invalid_tracker_settings)
+
+  defp project_settings(provider) do
+    owner = normalize_string(provider["owner"])
+    project_number = provider["project_number"]
+    status_field = normalize_string(provider["status_field"])
+
+    cond do
+      is_nil(owner) -> invalid_settings(:missing_owner)
+      not is_integer(project_number) or project_number <= 0 -> invalid_settings(:invalid_project_number)
+      is_nil(status_field) -> invalid_settings(:missing_status_field)
+      true -> {:ok, %{owner: owner, project_number: project_number, status_field: status_field}}
+    end
+  end
+
+  defp status_settings(provider) do
+    case status_values(provider["status_values"]) do
+      nil -> invalid_settings(:invalid_status_values)
+      statuses -> {:ok, statuses}
+    end
+  end
+
+  defp repository_settings(provider) do
+    case repository_profiles(provider["repositories"]) do
+      nil -> invalid_settings(:invalid_repository_profiles)
+      profiles -> {:ok, profiles}
+    end
+  end
+
+  defp graphql_url_setting(provider) do
+    graphql_url = provider["graphql_url"] || @default_graphql_url
+
+    if valid_graphql_url?(graphql_url),
+      do: {:ok, graphql_url},
+      else: invalid_settings(:invalid_graphql_url)
+  end
+
+  defp token_setting(provider) do
+    token = resolve_setting(provider["token"], System.get_env("GITHUB_TOKEN"))
+
+    if present_string?(token),
+      do: {:ok, token},
+      else: invalid_settings(:missing_token)
+  end
+
+  defp validate_routing_settings(tracker_settings, statuses) do
+    cond do
+      Map.get(tracker_settings, :required_labels, []) not in [nil, []] ->
+        invalid_settings(:required_labels_not_supported)
+
+      not valid_active_states(Map.get(tracker_settings, :active_states), statuses) ->
+        invalid_settings(:active_states_must_include_ready_and_building)
+
+      not valid_terminal_states(Map.get(tracker_settings, :terminal_states), statuses) ->
+        invalid_settings(:terminal_states_must_preserve_requeue_and_include_closed)
+
+      true ->
+        :ok
+    end
+  end
+
+  defp status_values(values) when is_map(values) do
+    result = Map.new(values, fn {key, value} -> {to_string(key), normalize_string(value)} end)
+
+    if Enum.all?(@statuses, &present_string?(Map.get(result, &1))) and
+         length(Enum.uniq(Map.take(result, @statuses) |> Map.values())) == length(@statuses) do
+      Map.new(@statuses, fn key -> {String.to_existing_atom(key), result[key]} end)
+    end
+  end
+
+  defp status_values(_values), do: nil
+
+  defp repository_profiles(profiles) when is_list(profiles) and profiles != [] do
+    Enum.reduce_while(profiles, %{}, fn profile, acc ->
+      repository = normalize_string(profile_value(profile, "repository"))
+      base_branch = normalize_string(profile_value(profile, "base_branch"))
+      prepare_command = normalize_string(profile_value(profile, "prepare_command"))
+      key = normalize_repository(repository)
+
+      if valid_repository?(repository) and present_string?(base_branch) and
+           present_string?(prepare_command) and not Map.has_key?(acc, key) do
+        normalized = %{
+          repository: repository,
+          base_branch: base_branch,
+          prepare_command: prepare_command
+        }
+
+        {:cont, Map.put(acc, key, normalized)}
+      else
+        {:halt, nil}
+      end
+    end)
+  end
+
+  defp repository_profiles(_profiles), do: nil
+
+  defp valid_active_states(states, statuses) when is_list(states) do
+    normalized = MapSet.new(states, &normalize_state/1)
+
+    Enum.all?([statuses.ready, statuses.building], &MapSet.member?(normalized, normalize_state(&1))) and
+      Enum.all?([statuses.blocked, statuses.done], &(not MapSet.member?(normalized, normalize_state(&1))))
+  end
+
+  defp valid_active_states(_states, _statuses), do: false
+
+  defp valid_terminal_states(states, statuses) when is_list(states) do
+    normalized = MapSet.new(states, &normalize_state/1)
+
+    MapSet.member?(normalized, "closed") and
+      Enum.all?([statuses.done, statuses.blocked], &(not MapSet.member?(normalized, normalize_state(&1))))
+  end
+
+  defp valid_terminal_states(_states, _statuses), do: false
+
+  defp invalid_settings(reason),
+    do: {:error, {:invalid_github_projects_settings, reason}}
+
+  defp provider_settings(%{provider: provider}) when is_map(provider), do: provider
+  defp provider_settings(%{"provider" => provider}) when is_map(provider), do: provider
+  defp provider_settings(_tracker_settings), do: %{}
+
+  defp profile_value(profile, key) when is_map(profile), do: Map.get(profile, key) || Map.get(profile, String.to_atom(key))
+  defp profile_value(_profile, _key), do: nil
+
+  defp ref_value(ref, key), do: Map.get(ref, key) || Map.get(ref, Atom.to_string(key))
+
+  defp extract_labels(content) do
+    get_in(content, ["labels", "nodes"])
+    |> case do
+      labels when is_list(labels) ->
+        labels
+        |> Enum.map(&label_name/1)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.uniq()
+
+      _ ->
+        []
+    end
+  end
+
+  defp label_name(%{"name" => name}) when is_binary(name), do: String.downcase(name)
+  defp label_name(_label), do: nil
+
+  defp parse_datetime(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> datetime
+      _ -> nil
+    end
+  end
+
+  defp parse_datetime(_value), do: nil
+
+  defp work_branch(repository, number) do
+    slug = String.replace(String.downcase(repository), ~r/[^a-z0-9-]/, "-")
+    "symphony/#{slug}-#{number}"
+  end
+
+  defp status_in?(status, values) do
+    normalized = normalize_state(status)
+    Enum.any?(values, &(normalize_state(&1) == normalized))
+  end
+
+  defp normalize_repository(repository) when is_binary(repository), do: String.downcase(String.trim(repository))
+  defp normalize_repository(_repository), do: ""
+
+  defp valid_repository?(repository) when is_binary(repository),
+    do: String.match?(repository, ~r/^[^\/\s]+\/[^\/\s]+$/)
+
+  defp valid_repository?(_repository), do: false
+
+  defp valid_graphql_url?(url) when is_binary(url) do
+    case URI.parse(url) do
+      %URI{scheme: "https", host: host} when is_binary(host) -> true
+      _ -> false
+    end
+  end
+
+  defp valid_graphql_url?(_url), do: false
+
+  defp resolve_setting(nil, fallback), do: normalize_string(fallback)
+
+  defp resolve_setting("$" <> env_name, fallback) do
+    if valid_env_name?(env_name), do: normalize_string(System.get_env(env_name) || fallback), else: nil
+  end
+
+  defp resolve_setting(value, _fallback), do: normalize_string(value)
+
+  defp normalize_string(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_string(_value), do: nil
+
+  defp normalize_state(value) when is_binary(value), do: value |> String.trim() |> String.downcase()
+  defp normalize_state(_value), do: ""
+
+  defp present_string?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present_string?(_value), do: false
+
+  @spec valid_env_name?(String.t()) :: boolean()
+  defp valid_env_name?(value), do: String.match?(value, ~r/^[A-Za-z_][A-Za-z0-9_]*$/)
+
+  defp env_reference_names("$" <> env_name) do
+    if valid_env_name?(env_name), do: [env_name], else: []
+  end
+
+  defp env_reference_names(_value), do: []
+end

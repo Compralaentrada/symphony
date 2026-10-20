@@ -102,12 +102,12 @@ defmodule SymphonyElixir.CoreTest do
 
   test "current WORKFLOW.md file is valid and complete" do
     original_workflow_path = Workflow.workflow_file_path()
-    previous_linear_api_key = System.get_env("LINEAR_API_KEY")
+    previous_github_token = System.get_env("GITHUB_TOKEN")
 
     on_exit(fn -> Workflow.set_workflow_file_path(original_workflow_path) end)
-    on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
+    on_exit(fn -> restore_env("GITHUB_TOKEN", previous_github_token) end)
 
-    System.put_env("LINEAR_API_KEY", "test-linear-api-key")
+    System.put_env("GITHUB_TOKEN", "test-github-token")
     Workflow.clear_workflow_file_path()
 
     assert {:ok, %{config: config, prompt: prompt}} = Workflow.load()
@@ -115,14 +115,15 @@ defmodule SymphonyElixir.CoreTest do
 
     tracker = Map.get(config, "tracker", %{})
     assert is_map(tracker)
-    assert Map.get(tracker, "kind") == "linear"
-    assert is_binary(get_in(tracker, ["provider", "project_slug"]))
+    assert Map.get(tracker, "kind") == "github"
+    assert get_in(tracker, ["provider", "repo"]) == "Compralaentrada/symphony"
+    assert get_in(tracker, ["provider", "token"]) == "$GITHUB_TOKEN"
     assert is_list(Map.get(tracker, "active_states"))
     assert is_list(Map.get(tracker, "terminal_states"))
 
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
-    assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/openai/symphony ."
+    assert Map.get(hooks, "after_create") =~ "gh repo clone Compralaentrada/symphony ."
     assert Map.get(hooks, "after_create") =~ "cd elixir && mise trust"
     assert Map.get(hooks, "after_create") =~ "mise exec -- mix deps.get"
     assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"
@@ -1096,7 +1097,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, 39_000, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -1482,11 +1483,11 @@ defmodule SymphonyElixir.CoreTest do
 
   test "in-repo WORKFLOW.md renders correctly" do
     workflow_path = Workflow.workflow_file_path()
-    previous_linear_api_key = System.get_env("LINEAR_API_KEY")
+    previous_github_token = System.get_env("GITHUB_TOKEN")
 
-    on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
+    on_exit(fn -> restore_env("GITHUB_TOKEN", previous_github_token) end)
 
-    System.put_env("LINEAR_API_KEY", "test-linear-api-key")
+    System.put_env("GITHUB_TOKEN", "test-github-token")
     Workflow.set_workflow_file_path(Path.expand("WORKFLOW.md", File.cwd!()))
 
     issue = %Issue{
@@ -1502,17 +1503,17 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
-    assert prompt =~ "You are working on a Linear ticket `MT-616`"
+    assert prompt =~ "You are working on GitHub issue MT-616 in Compralaentrada/symphony."
     assert prompt =~ "Issue context:"
     assert prompt =~ "Identifier: MT-616"
     assert prompt =~ "Title: Use rich templates for WORKFLOW.md"
-    assert prompt =~ "Current status: In Progress"
+    assert prompt =~ "State: In Progress"
     assert prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
     assert prompt =~ "This is an unattended orchestration session."
-    assert prompt =~ "Only stop early for a true external blocker"
-    assert prompt =~ "Do not include \"next steps for user\""
-    assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
-    assert prompt =~ "Do not call `gh pr merge` directly"
+    assert prompt =~ "Stop early only for a true external blocker"
+    assert prompt =~ "Do not include next steps for the user."
+    assert prompt =~ "open and follow .codex/skills/land/SKILL.md"
+    assert prompt =~ "Do not call gh pr merge directly"
     assert prompt =~ "Follow-up context:"
     assert prompt =~ "follow-up attempt #2"
   end

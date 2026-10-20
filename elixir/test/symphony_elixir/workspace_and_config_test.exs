@@ -40,6 +40,72 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "Projects workspace checks out its configured base branch and retains requeued work" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-project-workspace-#{System.unique_integer([:positive])}")
+    source_repo = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+
+    try do
+      File.mkdir_p!(source_repo)
+      git!(source_repo, ["init", "-b", "main"])
+      git!(source_repo, ["config", "user.name", "Test User"])
+      git!(source_repo, ["config", "user.email", "test@example.com"])
+      File.write!(Path.join(source_repo, "BASE"), "main")
+      git!(source_repo, ["add", "BASE"])
+      git!(source_repo, ["commit", "-m", "main"])
+      git!(source_repo, ["checkout", "-b", "release"])
+      File.write!(Path.join(source_repo, "BASE"), "release")
+      git!(source_repo, ["commit", "-am", "release"])
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      issue = project_workspace_issue("octo/app#11", source_repo, "release")
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert git!(workspace, ["branch", "--show-current"]) == issue.branch_name
+      assert File.read!(Path.join(workspace, "BASE")) == "release"
+
+      File.write!(Path.join(workspace, "agent-work.txt"), "preserve me")
+      assert {:ok, ^workspace} = Workspace.create_for_issue(issue)
+      assert File.read!(Path.join(workspace, "agent-work.txt")) == "preserve me"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "Projects workspace preparation failures remove the partial workspace" do
+    workspace_root = Path.join(System.tmp_dir!(), "symphony-project-workspace-fail-#{System.unique_integer([:positive])}")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      issue = project_workspace_issue("octo/app#12", "unused", "main", "echo partial && exit 17")
+
+      assert {:error, {:workspace_hook_failed, "after_create", 17, _output}} =
+               Workspace.create_for_issue(issue)
+
+      refute File.exists?(Path.join(workspace_root, Workspace.workspace_key(issue)))
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  defp project_workspace_issue(identifier, source_repo, base_branch, command \\ nil) do
+    %Issue{
+      id: identifier,
+      identifier: identifier,
+      branch_name: "symphony/octo-app-#{identifier |> String.split("#") |> List.last()}",
+      native_ref: %{
+        repository: "octo/app",
+        base_branch: base_branch,
+        prepare_command: command || "git clone --quiet '#{source_repo}' ."
+      }
+    }
+  end
+
+  defp git!(directory, args) do
+    {output, 0} = System.cmd("git", ["-C", directory | args], stderr_to_stdout: true)
+    String.trim(output)
+  end
+
   test "workspace path is deterministic per issue identifier" do
     workspace_root =
       Path.join(
