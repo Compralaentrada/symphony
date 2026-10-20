@@ -172,15 +172,8 @@ defmodule SymphonyElixir.Pipeline do
 
   defp prepare_task(_task, _issue), do: :ignore
 
-  defp finish_valid_phase(issue, task, "build", attempt, %{"outcome" => "no_changes"} = result) do
-    reason = result["reason"] || result["summary"] || "Build concluded that no changes are needed."
-    next = task |> Map.put("phase", "build") |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
-    ops = report_ops(next, "build", attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
-    commit(issue, next, "build", attempt, result, ops)
-  end
-
-  defp finish_valid_phase(issue, task, "build", attempt, %{"outcome" => "blocked"} = result) do
-    reason = result["reason"] || result["summary"] || "Agent requires operator intervention."
+  defp finish_valid_phase(issue, task, "build", attempt, %{"outcome" => outcome, "reason" => reason} = result)
+       when outcome in ["no_changes", "blocked"] do
     next = task |> Map.put("phase", "build") |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
     ops = report_ops(next, "build", attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
     commit(issue, next, "build", attempt, result, ops)
@@ -309,18 +302,17 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp execute_operation(issue, %{kind: "pull_request", payload: payload}) do
-    case Tracker.upsert_pull_request(issue, %{branch: payload["branch"], base: payload["base"], sha: payload["sha"]}) do
-      {:ok, pr} ->
-        with {:ok, task} when is_map(task) <- Store.get_task(issue.id),
-             :ok <- Store.save_task(Map.put(task, "pr_number", pr.number)) do
-          {:ok, pr}
-        end
+    attrs = %{branch: payload["branch"], base: payload["base"], sha: payload["sha"]}
 
-      {:error, _reason} = error ->
-        error
-
-      other ->
-        {:error, {:pull_request_upsert_failed, other}}
+    with :ok <- Tracker.validate_pipeline_delivery(issue, attrs.branch, attrs.sha),
+         {:ok, pr} <- Tracker.upsert_pull_request(issue, attrs),
+         :ok <- ensure_pull_request_sha(pr, attrs.sha),
+         {:ok, task} when is_map(task) <- Store.get_task(issue.id),
+         :ok <- Store.save_task(Map.put(task, "pr_number", pr.number)) do
+      {:ok, pr}
+    else
+      {:error, _reason} = error -> error
+      other -> {:error, {:pull_request_upsert_failed, other}}
     end
   end
 
@@ -349,6 +341,9 @@ defmodule SymphonyElixir.Pipeline do
       other -> other
     end
   end
+
+  defp ensure_pull_request_sha(%{sha: sha}, sha) when is_binary(sha), do: :ok
+  defp ensure_pull_request_sha(_pr, _sha), do: {:error, :pull_request_head_sha_mismatch}
 
   defp persist_status(issue, task, status, salt) do
     with :ok <- Store.save_task_with_operations(task, [status_op(task, status, nil, salt)]) do
@@ -438,8 +433,8 @@ defmodule SymphonyElixir.Pipeline do
     do: is_binary(result["reason"])
 
   defp valid_report?("qa", %{"outcome" => outcome} = result) when outcome in ["passed", "changes_requested", "failed", "defects_found"] do
-    is_binary(result["sha"]) and is_list(result["checks"]) and valid_findings?(result["findings"]) and
-      is_binary(result["next_step"])
+    is_binary(result["sha"]) and is_list(result["criteria"]) and is_list(result["changes"]) and
+      is_list(result["checks"]) and valid_findings?(result["findings"]) and is_binary(result["next_step"])
   end
 
   defp valid_report?("qa", %{"outcome" => "blocked"} = result), do: is_binary(result["reason"])

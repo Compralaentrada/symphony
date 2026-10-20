@@ -113,6 +113,47 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     File.rm_rf!(Path.dirname(path))
   end
 
+  test "PR creation revalidates the pushed SHA after Build commits its outbox" do
+    issue = issue("octo/app#7", 7)
+    table = start_board([issue], %{issue.id => %{build: [build("sha-seven")]}})
+    path = pipeline_database!(table)
+    :ets.insert(table, {:change_sha_after_validation, true})
+
+    orchestrator = start_orchestrator()
+    assert await(fn -> agent_calls(table, issue.id, :build) == 1 end)
+    Process.sleep(50)
+
+    assert project_state(table, issue.id) == "Building"
+    assert pull_request_count(table, issue.id) == 0
+
+    stop_orchestrator(orchestrator)
+    File.rm_rf!(Path.dirname(path))
+  end
+
+  test "QA retries a report missing the changes summary" do
+    issue = issue("octo/app#8", 8)
+    incomplete = qa("sha-eight") |> Map.delete("changes")
+
+    table =
+      start_board([issue], %{
+        issue.id => %{
+          build: [build("sha-eight")],
+          qa: [incomplete, qa("sha-eight")],
+          review: [review("sha-eight")]
+        }
+      })
+
+    path = pipeline_database!(table, retry_backoff_ms: 1)
+    orchestrator = start_orchestrator()
+
+    assert await(fn -> project_state(table, issue.id) == "Human Review" end)
+    assert agent_calls(table, issue.id) == 4
+    assert report_phases(table, issue.id) == [:build, :qa, :review]
+
+    stop_orchestrator(orchestrator)
+    File.rm_rf!(Path.dirname(path))
+  end
+
   defp start_board(issues, agent_results) do
     table = :ets.new(:pipeline_board, [:set, :public])
     Enum.each(issues, &:ets.insert(table, {{:issue, &1.id}, &1}))
@@ -385,6 +426,12 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
   def validate_pipeline_delivery(issue, branch, sha) do
     table = table()
     valid = branch == issue.branch_name and issue.native_ref.repository == "octo/app" and lookup(table, {:remote_sha, issue.id}) == sha
+
+    if valid and lookup(table, :change_sha_after_validation) do
+      :ets.delete(table, :change_sha_after_validation)
+      :ets.insert(table, {{:remote_sha, issue.id}, "changed-after-validation"})
+    end
+
     if valid, do: :ok, else: {:error, :invalid_delivery}
   end
 

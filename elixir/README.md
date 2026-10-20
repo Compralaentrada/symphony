@@ -23,11 +23,13 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 Local runs discover repo-local Codex skills from `.agents/skills` in the workspace checkout. Symphony checks the selected skills before launching Codex and reports a missing `SKILL.md` path; pinned sources and fingerprints are listed in the repository's `.agents/skills/SOURCES.md`.
 
-During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
-Linear serves `linear_graphql`, GitHub Issues and GitHub Projects v2 serve `github_api`, Jira Cloud serves
-`jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
-tools with configured host-side auth and removes declared tracker-token environment variables from
-the Codex child, so the agent does not need a second tracker login.
+During single-run app-server sessions, the selected tracker adapter may advertise provider-native
+tools. Linear serves `linear_graphql`, GitHub Issues and GitHub Projects v2 serve `github_api`, Jira
+Cloud serves `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes
+those tools with configured host-side auth and removes declared tracker-token environment variables
+from the Codex child. Pipeline phase sessions disable tracker tools; Build pushes through the host's
+Git credential helper or SSH, while Symphony owns the API writes for PRs, Project status, and issue
+reports. Configure push access for each repository profile on the Symphony host.
 
 If a claimed issue moves to a configured terminal state, Symphony stops the active agent and cleans
 up its workspace. In GitHub Projects mode, closing the linked GitHub Issue is terminal; Project
@@ -167,7 +169,8 @@ Notes:
   command for new workspaces. To enable the durable Build → QA → Review pipeline, configure the
   `qa`, `review`, `human_review`, and `dropped` status values, include the active phase statuses in
   `tracker.active_states`, include `Dropped` in `tracker.terminal_states`, and set nonempty
-  `required_checks` for each repository profile.
+  `required_checks` for each repository profile. The Symphony host also needs Git push credentials
+  for each profile; pipeline agents do not receive the tracker token.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
