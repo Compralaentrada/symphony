@@ -125,6 +125,26 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert issue.labels == ["bug"]
   end
 
+  test "accepts an organization Project when the user lookup returns not found" do
+    response =
+      project_response([issue_item("octo/app", 7, "Ready")])
+      |> update_in(["data"], &Map.put(&1, "user", nil))
+      |> Map.put("errors", [
+        %{
+          "type" => "NOT_FOUND",
+          "path" => ["user"],
+          "message" => "Could not resolve to a User with the login of 'acme'."
+        }
+      ])
+
+    assert {:ok, [issue]} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn
+               _query, _variables, _settings -> {:ok, %{status: 200, body: response}}
+             end)
+
+    assert issue.id == "octo/app#7"
+  end
+
   test "ID refreshes match the repository-qualified issue identity" do
     settings =
       tracker_settings(%{

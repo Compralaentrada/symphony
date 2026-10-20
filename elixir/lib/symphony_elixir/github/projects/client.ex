@@ -550,7 +550,25 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     end
   end
 
-  defp graphql_body(%{"errors" => errors}) when is_list(errors) and errors != [] do
+  defp graphql_body(%{"errors" => errors, "data" => data})
+       when is_list(errors) and errors != [] and is_map(data) do
+    case {project_from_data(data), errors} do
+      {%{}, [%{"type" => "NOT_FOUND", "path" => [owner]}]}
+      when owner in ["user", "organization"] ->
+        {:ok, data}
+
+      _other ->
+        graphql_errors(errors)
+    end
+  end
+
+  defp graphql_body(%{"errors" => errors}) when is_list(errors) and errors != [],
+    do: graphql_errors(errors)
+
+  defp graphql_body(%{"data" => data}) when is_map(data), do: {:ok, data}
+  defp graphql_body(_body), do: {:error, {:github_projects_api_error, "GitHub Projects GraphQL returned no data."}}
+
+  defp graphql_errors(errors) do
     message = Enum.map_join(errors, "; ", &Map.get(&1, "message", "unknown GraphQL error"))
     lower = String.downcase(message)
 
@@ -563,9 +581,6 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       {:error, {:github_projects_api_error, message}}
     end
   end
-
-  defp graphql_body(%{"data" => data}) when is_map(data), do: {:ok, data}
-  defp graphql_body(_body), do: {:error, {:github_projects_api_error, "GitHub Projects GraphQL returned no data."}}
 
   defp perform_request(query, variables, settings) do
     request_opts = [
