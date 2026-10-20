@@ -130,6 +130,13 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     end
   end
 
+  @doc false
+  @spec complete_issue_for_test(Issue.t(), map(), function()) :: :ok | {:error, term()}
+  def complete_issue_for_test(issue, tracker_settings, request_fun)
+      when is_struct(issue, Issue) and is_map(tracker_settings) and is_function(request_fun, 3) do
+    complete_issue(issue, tracker_settings, request_fun)
+  end
+
   @spec claim_issue(Issue.t()) :: :ok | {:error, term()}
   def claim_issue(issue) do
     update_issue_status(issue, :building, nil, Config.settings!().tracker, &perform_request/3)
@@ -137,7 +144,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   @spec complete_issue(Issue.t()) :: :ok | {:error, term()}
   def complete_issue(issue) do
-    update_issue_status(issue, :done, nil, Config.settings!().tracker, &perform_request/3)
+    complete_issue(issue, Config.settings!().tracker, &perform_request/3)
   end
 
   @spec block_issue(Issue.t(), String.t()) :: :ok | {:error, term()}
@@ -295,13 +302,13 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     profile = Map.get(settings.repositories, normalize_repository(repository))
 
     cond do
-      is_nil(status) ->
-        {:ok, nil}
-
       normalize_state(content["state"]) == "closed" ->
         with :ok <- maybe_mark_closed(item, status, settings, metadata, request_fun) do
           {:ok, normalize_issue(item, metadata, settings, profile, "closed", status)}
         end
+
+      is_nil(status) ->
+        {:ok, nil}
 
       is_nil(profile) and status_in?(status, [settings.statuses.ready, settings.statuses.building]) ->
         with :ok <- maybe_block_unconfigured(item, status, settings, metadata, request_fun) do
@@ -344,6 +351,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       url: content["url"],
       labels: extract_labels(content),
       dispatchable: not is_nil(profile) and dispatch_status? and state != "closed",
+      requeueable: state != "closed" and not is_nil(profile) and status_in?(project_status, [settings.statuses.ready]),
+      tracker_blocked: state != "closed" and status_in?(project_status, [settings.statuses.blocked]),
       blocked_by: [],
       created_at: parse_datetime(content["createdAt"]),
       updated_at: parse_datetime(content["updatedAt"])
@@ -418,6 +427,29 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     end
   end
 
+  defp complete_issue(issue, tracker_settings, request_fun) do
+    with {:ok, settings} <- settings(tracker_settings),
+         {:ok, issues} <- fetch_issues_by_ids([issue.id], tracker_settings, request_fun) do
+      issues
+      |> Enum.find(&(&1.id == issue.id))
+      |> complete_current_issue(settings, tracker_settings, request_fun)
+    end
+  end
+
+  defp complete_current_issue(%Issue{state: "closed"}, _settings, _tracker_settings, _request_fun),
+    do: :ok
+
+  defp complete_current_issue(%Issue{native_ref: ref} = issue, settings, tracker_settings, request_fun)
+       when is_map(ref) do
+    if status_in?(ref_value(ref, :project_status), [settings.statuses.building]) do
+      update_issue_status(issue, :done, nil, tracker_settings, request_fun)
+    else
+      :ok
+    end
+  end
+
+  defp complete_current_issue(_issue, _settings, _tracker_settings, _request_fun), do: :ok
+
   defp ensure_claimable(issue, :building, settings) do
     issue_state = normalize_state(issue.state)
     project_status = normalize_state(ref_value(issue.native_ref, :project_status))
@@ -433,6 +465,14 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
       true ->
         {:error, {:github_projects_item_not_ready, issue.id}}
+    end
+  end
+
+  defp ensure_claimable(issue, :done, settings) do
+    if status_in?(ref_value(issue.native_ref, :project_status), [settings.statuses.building]) do
+      :ok
+    else
+      {:error, {:github_projects_item_not_building, issue.id}}
     end
   end
 

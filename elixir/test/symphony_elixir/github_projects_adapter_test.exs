@@ -121,6 +121,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert issue.state == "Ready"
     assert issue.branch_name == "symphony/octo-app-7"
     assert issue.dispatchable
+    assert issue.requeueable
     assert issue.labels == ["bug"]
   end
 
@@ -144,6 +145,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     assert issue.id == "octo/docs#7"
     assert issue.state == "Building"
+    refute issue.requeueable
   end
 
   test "follows Project item pagination" do
@@ -213,6 +215,48 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
              end)
   end
 
+  test "completion changes a current Building item to Done but preserves a changed status" do
+    settings = tracker_settings()
+
+    {:ok, [stale_issue]} =
+      Client.fetch_issues_by_states_for_test(["Ready"], settings, fn _query, _variables, _settings ->
+        {:ok, %{status: 200, body: project_response([issue_item("octo/app", 7, "Ready")])}}
+      end)
+
+    for {current_status, should_complete?} <- [{"Building", true}, {"Blocked", false}] do
+      calls = Agent.start_link(fn -> [] end) |> elem(1)
+
+      assert :ok =
+               Client.complete_issue_for_test(stale_issue, settings, fn query, variables, _settings ->
+                 if query =~ "updateProjectV2ItemFieldValue" do
+                   assert should_complete?
+                   assert variables["optionId"] == "option-done"
+                   Agent.update(calls, &[variables | &1])
+                   {:ok, %{status: 200, body: %{"data" => %{"updated" => true}}}}
+                 else
+                   {:ok,
+                    %{
+                      status: 200,
+                      body: project_response([issue_item("octo/app", 7, current_status)])
+                    }}
+                 end
+               end)
+
+      assert Agent.get(calls, & &1) != [] == should_complete?
+    end
+  end
+
+  test "configured Blocked status is exposed for blocked-state reconciliation" do
+    assert {:ok, [issue]} =
+             Client.fetch_issues_by_ids_for_test(["octo/app#7"], tracker_settings(), fn _query, _variables, _settings ->
+               {:ok, %{status: 200, body: project_response([issue_item("octo/app", 7, "Blocked")])}}
+             end)
+
+    assert issue.tracker_blocked
+    refute issue.dispatchable
+    refute issue.requeueable
+  end
+
   test "maps inaccessible Projects responses to actionable permission errors" do
     assert {:error, {:github_projects_permission_error, message}} =
              Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn
@@ -238,6 +282,27 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
                    {:ok, %{status: 200, body: %{"data" => %{"updated" => true}}}}
                  else
                    {:ok, %{status: 200, body: project_response([issue_item("octo/app", 7, "Ready", "CLOSED")])}}
+                 end
+             end)
+
+    assert issue.state == "closed"
+    refute issue.dispatchable
+  end
+
+  test "closed linked issues without a Project status still move to Done" do
+    closed_item =
+      "octo/app"
+      |> issue_item(7, "Ready", "CLOSED")
+      |> put_in(["fieldValues", "nodes"], [])
+
+    assert {:ok, [issue]} =
+             Client.fetch_issues_by_states_for_test(["closed"], tracker_settings(), fn
+               query, variables, _settings ->
+                 if query =~ "updateProjectV2ItemFieldValue" do
+                   assert variables["optionId"] == "option-done"
+                   {:ok, %{status: 200, body: %{"data" => %{"updated" => true}}}}
+                 else
+                   {:ok, %{status: 200, body: project_response([closed_item])}}
                  end
              end)
 

@@ -29,6 +29,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     done = lifecycle_issue("repo/app#1")
     blocked = lifecycle_issue("repo/app#2")
     transient = lifecycle_issue("repo/app#3")
+    continued = lifecycle_issue("repo/app#4")
 
     blocked_worker =
       spawn(fn ->
@@ -40,14 +41,22 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     running = %{
       done.id => lifecycle_running_entry(done, make_ref(), :normal, nil),
       blocked.id => lifecycle_running_entry(blocked, make_ref(), :turn_input_required, blocked_worker),
-      transient.id => lifecycle_running_entry(transient, make_ref(), nil, nil)
+      transient.id => lifecycle_running_entry(transient, make_ref(), nil, nil),
+      continued.id => lifecycle_running_entry(continued, make_ref(), :normal, nil)
     }
 
     :sys.replace_state(pid, fn state ->
       %{state | running: running, claimed: MapSet.new(Map.keys(running))}
     end)
 
-    for {issue, reason} <- [{done, :normal}, {blocked, :normal}, {transient, {:worker_exit, :econnreset}}] do
+    send(pid, {:agent_continuation_required, continued.id})
+
+    for {issue, reason} <- [
+          {done, :normal},
+          {blocked, :normal},
+          {transient, {:worker_exit, :econnreset}},
+          {continued, :normal}
+        ] do
       entry = running[issue.id]
       send(pid, {:DOWN, entry.ref, :process, entry.pid || self(), reason})
     end
@@ -60,7 +69,47 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert_receive {:projects_complete, ^done}
     assert_receive {:projects_block, ^blocked, "codex turn requires operator input"}
+    refute_receive {:projects_complete, ^continued}
     refute_receive {:projects_block, ^transient, _reason}
+  end
+
+  test "a blocked Projects item observed Ready is released for requeue" do
+    write_projects_workflow!()
+
+    issue = %{lifecycle_issue("repo/app#5") | state: "Ready", requeueable: true}
+    blocked_issue = %{issue | state: "Blocked", dispatchable: false, requeueable: false}
+
+    state = %Orchestrator.State{
+      blocked: %{issue.id => %{issue: blocked_issue, error: "operator input required"}},
+      claimed: MapSet.new([issue.id]),
+      retry_attempts: %{}
+    }
+
+    updated_state = Orchestrator.reconcile_blocked_issue_states_for_test([issue], state)
+
+    refute Map.has_key?(updated_state.blocked, issue.id)
+    refute MapSet.member?(updated_state.claimed, issue.id)
+  end
+
+  test "a Projects item that remains Blocked stays in the runtime blocked view" do
+    write_projects_workflow!()
+
+    issue =
+      lifecycle_issue("repo/app#6")
+      |> Map.put(:state, "Blocked")
+      |> Map.put(:dispatchable, false)
+      |> Map.put(:tracker_blocked, true)
+
+    state = %Orchestrator.State{
+      blocked: %{issue.id => %{issue: issue, error: "operator input required"}},
+      claimed: MapSet.new([issue.id]),
+      retry_attempts: %{}
+    }
+
+    updated_state = Orchestrator.reconcile_blocked_issue_states_for_test([issue], state)
+
+    assert Map.has_key?(updated_state.blocked, issue.id)
+    assert MapSet.member?(updated_state.claimed, issue.id)
   end
 
   test "snapshot returns :timeout when snapshot server is unresponsive" do

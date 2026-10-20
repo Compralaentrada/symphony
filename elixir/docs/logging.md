@@ -10,10 +10,10 @@ This guide defines logging conventions for Symphony so Codex can diagnose failur
 
 ## Required Context Fields
 
-When logging issue-related work, include both identifiers:
+When logging tracker work, include both identifiers:
 
-- `issue_id`: Linear internal UUID (stable foreign key).
-- `issue_identifier`: human ticket key (for example `MT-620`).
+- `issue_id`: stable identity in the configured tracker scope; it may include the repository, such as `owner/repo#42`.
+- `issue_identifier`: human-readable tracker key when available (for example `MT-620`, `GH-42`, or `owner/repo#42`).
 
 When logging Codex execution lifecycle events, include:
 
@@ -34,7 +34,7 @@ When logging Codex execution lifecycle events, include:
 
 ## Checklist For New Logs
 
-- Is this event tied to a Linear issue? Include `issue_id` and `issue_identifier`.
+- Is this event tied to tracker work? Include `issue_id` and `issue_identifier`.
 - Is this event tied to a Codex session? Include `session_id`.
 - Is the failure reason present and concise?
 - Is the message format consistent with existing lifecycle logs?
