@@ -162,7 +162,7 @@ defmodule SymphonyElixir.AgentRunner do
     """
     Pipeline phase: independent QA. Review and test the accepted commit #{Keyword.get(opts, :sha)} on branch #{Keyword.get(opts, :branch)}.
     Required checks: #{Enum.join(Keyword.get(opts, :required_checks, []), ", ")}.
-    Run every required check and report each by exact name, status, and concrete evidence. An omitted or unavailable check is not a pass. Give each defect an id, reproduction steps, and the violated criterion.
+    Symphony runs these configured checks on the workspace after your review. Do not claim their result or evidence; return an empty checks list. Give each defect an id, reproduction steps, and the violated criterion.
     Do not modify files or write to GitHub. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end

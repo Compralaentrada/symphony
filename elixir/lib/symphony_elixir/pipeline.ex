@@ -6,6 +6,7 @@ defmodule SymphonyElixir.Pipeline do
 
   @phases ~w(build qa review)
   @statuses %{
+    ready: "Ready",
     building: "Building",
     qa: "QA",
     review: "Review",
@@ -121,32 +122,69 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp prepare_task(nil, %Issue{state: state} = issue) when state in ["Ready", "Building"] do
-    profile = issue.native_ref || %{}
+  defp prepare_task(nil, %Issue{} = issue) do
+    if issue.state in [issue_status_value(issue, :ready), issue_status_value(issue, :building)] do
+      profile = issue.native_ref || %{}
 
-    task = %{
-      "issue_id" => issue.id,
-      "repository" => profile_value(profile, :repository),
-      "branch" => issue.branch_name,
-      "base_branch" => profile_value(profile, :base_branch),
-      "required_checks" => profile_value(profile, :required_checks) || [],
-      "generation" => 1,
-      "phase" => "build",
-      "status" => "building",
-      "attempts" => %{},
-      "current_sha" => nil,
-      "pr_number" => nil
-    }
+      task = %{
+        "issue_id" => issue.id,
+        "repository" => profile_value(profile, :repository),
+        "branch" => issue.branch_name,
+        "base_branch" => profile_value(profile, :base_branch),
+        "required_checks" => profile_value(profile, :required_checks) || [],
+        "status_values" => profile_value(profile, :status_values) || %{},
+        "generation" => 1,
+        "phase" => "build",
+        "status" => "building",
+        "attempts" => %{},
+        "current_sha" => nil,
+        "pr_number" => nil
+      }
 
-    with :ok <- Store.save_task(task), do: {:ok, task, "build"}
+      with :ok <- Store.save_task(task), do: {:ok, task, "build"}
+    else
+      :ignore
+    end
   end
 
-  defp prepare_task(%{"status" => "blocked"} = task, %Issue{state: "Ready"}) do
+  defp prepare_task(%{"status" => "blocked", "drop_pending" => true} = task, %Issue{} = issue) do
+    case human_drop_reason(issue) do
+      {:ok, reason} -> drop_task(issue, task, reason)
+      :error -> :ignore
+    end
+  end
+
+  defp prepare_task(%{"status" => "blocked"} = task, %Issue{} = issue) do
+    if issue.state == status_value(task, :ready), do: resume_blocked_task(task), else: :ignore
+  end
+
+  defp prepare_task(%{"status" => "human_review"} = task, %Issue{} = issue) do
+    if issue.state == status_value(task, :ready), do: resume_human_review_task(task), else: :ignore
+  end
+
+  defp prepare_task(%{"status" => "building"} = task, %Issue{} = issue) do
+    if issue.state in [status_value(task, :ready), status_value(task, :building)],
+      do: {:ok, task, task["phase"]},
+      else: :ignore
+  end
+
+  defp prepare_task(%{"status" => status} = task, %Issue{state: issue_state})
+       when status in ["building", "qa", "review"] do
+    phase = task["phase"]
+
+    if issue_state == status_value(task, status_phase(status)) and phase in @phases,
+      do: {:ok, task, phase},
+      else: :ignore
+  end
+
+  defp prepare_task(_task, _issue), do: :ignore
+
+  defp resume_blocked_task(task) do
     task = Map.put(task, "status", "building")
     with :ok <- Store.save_task(task), do: {:ok, task, task["phase"]}
   end
 
-  defp prepare_task(%{"status" => "human_review"} = task, %Issue{state: "Ready"}) do
+  defp resume_human_review_task(task) do
     task =
       task
       |> Map.put("generation", task["generation"] + 1)
@@ -161,16 +199,6 @@ defmodule SymphonyElixir.Pipeline do
       {:ok, task, "build"}
     end
   end
-
-  defp prepare_task(%{"status" => "building"} = task, %Issue{state: "Ready"}), do: {:ok, task, task["phase"]}
-
-  defp prepare_task(%{"status" => status} = task, %Issue{state: issue_state})
-       when status in ["building", "qa", "review"] do
-    phase = task["phase"]
-    if issue_state == @statuses[status_phase(status)] and phase in @phases, do: {:ok, task, phase}, else: :ignore
-  end
-
-  defp prepare_task(_task, _issue), do: :ignore
 
   defp finish_valid_phase(issue, task, "build", attempt, %{"outcome" => outcome, "reason" => reason} = result)
        when outcome in ["no_changes", "blocked"] do
@@ -193,7 +221,12 @@ defmodule SymphonyElixir.Pipeline do
       next = %{task | "phase" => "qa", "status" => "qa", "current_sha" => sha}
 
       ops = [
-        operation(next, "pull_request", %{"branch" => task["branch"], "base" => task["base_branch"], "sha" => sha}),
+        operation(next, "pull_request", %{
+          "branch" => task["branch"],
+          "base" => task["base_branch"],
+          "sha" => sha,
+          "body" => pull_request_body(issue, result)
+        }),
         report_op(next, "build", attempt, result),
         status_op(next, :qa, nil, attempt)
       ]
@@ -268,18 +301,32 @@ defmodule SymphonyElixir.Pipeline do
        when status not in ["done", "dropped"],
        do: reconcile_closed_issue(issue, task)
 
-  defp reconcile_task_issue(%Issue{state: state} = issue, %{"status" => status} = task)
-       when state == @statuses.done and status != "done",
-       do: reconcile_unmerged_done(issue, task, status)
+  defp reconcile_task_issue(issue, %{"status" => status} = task) do
+    cond do
+      issue.state == status_value(task, :done) and status != "done" ->
+        reconcile_unmerged_done(issue, task, status)
 
-  defp reconcile_task_issue(issue, %{"status" => status} = task)
-       when issue.state == @statuses.dropped and status != "dropped",
-       do: drop_task(issue, task, task["blocked_reason"] || "Dropped by human decision.")
+      issue.state == status_value(task, :dropped) and status != "dropped" ->
+        finish_human_drop(issue, task)
 
-  defp reconcile_task_issue(issue, %{"status" => "human_review"} = task),
-    do: reconcile_human_review(issue, task)
+      true ->
+        reconcile_nonterminal_task(issue, task)
+    end
+  end
 
   defp reconcile_task_issue(_issue, _task), do: :ok
+
+  defp reconcile_nonterminal_task(issue, %{"status" => "human_review"} = task),
+    do: reconcile_human_review(issue, task)
+
+  defp reconcile_nonterminal_task(issue, %{"status" => "blocked", "drop_pending" => true} = task) do
+    case human_drop_reason(issue) do
+      {:ok, reason} -> drop_task(issue, task, reason)
+      :error -> :ok
+    end
+  end
+
+  defp reconcile_nonterminal_task(_issue, _task), do: :ok
 
   defp reconcile_unmerged_done(issue, task, status) do
     case expected_status(status) do
@@ -293,8 +340,10 @@ defmodule SymphonyElixir.Pipeline do
       {:ok, %{merged: true, base: base}} ->
         if base == task["base_branch"], do: complete_merged_task(issue, task), else: :ok
 
-      {:ok, _pr} when issue.state not in ["Ready", "Human Review", "closed"] ->
-        persist_status(issue, task, :human_review, "reconcile_human_review")
+      {:ok, _pr} ->
+        if issue.state in [status_value(task, :ready), status_value(task, :human_review), "closed"],
+          do: :ok,
+          else: persist_status(issue, task, :human_review, "reconcile_human_review")
 
       _ ->
         :ok
@@ -302,7 +351,7 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp execute_operation(issue, %{kind: "pull_request", payload: payload}) do
-    attrs = %{branch: payload["branch"], base: payload["base"], sha: payload["sha"]}
+    attrs = %{branch: payload["branch"], base: payload["base"], sha: payload["sha"], body: payload["body"]}
 
     with :ok <- Tracker.validate_pipeline_delivery(issue, attrs.branch, attrs.sha),
          {:ok, pr} <- Tracker.upsert_pull_request(issue, attrs),
@@ -327,7 +376,7 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp execute_operation(issue, %{kind: "project_status", payload: payload}) do
-    status = status_atom(payload["status"])
+    status = status_atom(payload["status_key"] || payload["status"])
 
     case Tracker.set_pipeline_status(issue, status, payload["reason"]) do
       :ok -> {:ok, %{"status" => payload["status"]}}
@@ -344,6 +393,54 @@ defmodule SymphonyElixir.Pipeline do
 
   defp ensure_pull_request_sha(%{sha: sha}, sha) when is_binary(sha), do: :ok
   defp ensure_pull_request_sha(_pr, _sha), do: {:error, :pull_request_head_sha_mismatch}
+
+  defp pull_request_body(issue, result) do
+    """
+    <!-- symphony:delivery -->
+
+    Fixes #{issue.id}
+
+    ## Summary
+
+    #{result["summary"]}
+
+    ## Acceptance criteria
+
+    #{markdown_items(result["criteria"])}
+
+    ## Changes
+
+    #{markdown_items(result["changes"])}
+
+    ## Checks
+
+    #{markdown_items(result["checks"])}
+
+    ## Evidence
+
+    - Build SHA: `#{result["sha"]}`
+
+    ## Risks and limitations
+
+    #{markdown_items(result["risks"])}
+
+    ## Next step
+
+    #{result["next_step"]}
+    """
+    |> String.trim()
+  end
+
+  defp markdown_items(items) when is_list(items) do
+    case items do
+      [] -> "- None reported."
+      items -> Enum.map_join(items, "\n", &("- " <> markdown_item(&1)))
+    end
+  end
+
+  defp markdown_items(_items), do: "- None reported."
+  defp markdown_item(item) when is_binary(item), do: item
+  defp markdown_item(item), do: Jason.encode!(item)
 
   defp persist_status(issue, task, status, salt) do
     with :ok <- Store.save_task_with_operations(task, [status_op(task, status, nil, salt)]) do
@@ -370,7 +467,7 @@ defmodule SymphonyElixir.Pipeline do
         end
 
       {:ok, _pr} ->
-        drop_task(issue, task, "GitHub issue closed before the pull request was merged into the configured base branch.")
+        drop_task(issue, task, close_reason(issue))
 
       _ ->
         :ok
@@ -385,9 +482,51 @@ defmodule SymphonyElixir.Pipeline do
       "next_step" => "Create a new issue if this work should be started again."
     }
 
-    next = %{task | "status" => "dropped", "blocked_reason" => reason}
+    next = task |> Map.put("status", "dropped") |> Map.put("blocked_reason", reason) |> Map.put("drop_pending", false)
     operations = [report_op(next, "dropped", 0, report), status_op(next, :dropped, nil, "drop")]
     commit(issue, next, task["phase"], 0, report, operations)
+  end
+
+  defp finish_human_drop(issue, task) do
+    case human_drop_reason(issue) do
+      {:ok, reason} -> drop_task(issue, task, reason)
+      :error -> require_drop_reason(issue, task)
+    end
+  end
+
+  defp require_drop_reason(issue, task) do
+    reason = "Add a human-authored `Drop reason: <reason>` line to the issue body to confirm this discard."
+
+    result = %{
+      "outcome" => "blocked",
+      "summary" => "A human reason is required before this work can be dropped.",
+      "reason" => reason,
+      "next_step" => "Edit the issue body with the drop reason; Symphony will then mark the task Dropped."
+    }
+
+    next = task |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason) |> Map.put("drop_pending", true)
+    operations = [report_op(next, task["phase"], 0, result), status_op(next, :blocked, reason, "drop_reason_required")]
+    commit(issue, next, task["phase"], 0, result, operations)
+  end
+
+  defp human_drop_reason(%Issue{description: description}) when is_binary(description) do
+    case Regex.run(~r/^[ \t]*Drop reason:[ \t]*(.+?)[ \t]*$/im, description) do
+      [_, reason] -> {:ok, String.trim(reason)}
+      _ -> :error
+    end
+  end
+
+  defp human_drop_reason(_issue), do: :error
+
+  defp close_reason(issue) do
+    case human_drop_reason(issue) do
+      {:ok, reason} ->
+        reason
+
+      :error ->
+        state_reason = profile_value(issue.native_ref || %{}, :issue_state_reason)
+        if is_binary(state_reason) and state_reason != "", do: "GitHub issue closed with reason #{state_reason} before the PR merged.", else: "GitHub issue closed by a human before the PR merged."
+    end
   end
 
   defp expected_status("blocked"), do: :blocked
@@ -407,7 +546,13 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp status_op(task, status, reason, attempt),
-    do: operation(task, "project_status", %{"status" => @statuses[status], "reason" => reason}, attempt)
+    do:
+      operation(
+        task,
+        "project_status",
+        %{"status" => status_value(task, status), "status_key" => Atom.to_string(status), "reason" => reason},
+        attempt
+      )
 
   defp operation(task, kind, payload, salt \\ nil) do
     key = Enum.join([task["issue_id"], task["generation"], task["phase"], kind, :erlang.phash2({payload, salt})], ":")
@@ -478,8 +623,24 @@ defmodule SymphonyElixir.Pipeline do
   defp ensure_current_sha(%{"current_sha" => sha}, sha) when is_binary(sha), do: :ok
   defp ensure_current_sha(_task, _sha), do: {:error, :phase_sha_mismatch}
 
+  defp status_atom("ready"), do: :ready
+  defp status_atom("building"), do: :building
+  defp status_atom("qa"), do: :qa
+  defp status_atom("review"), do: :review
+  defp status_atom("human_review"), do: :human_review
+  defp status_atom("blocked"), do: :blocked
+  defp status_atom("dropped"), do: :dropped
+  defp status_atom("done"), do: :done
+
   defp status_atom(status) do
     Enum.find_value(@statuses, fn {atom, value} -> if value == status, do: atom end)
+  end
+
+  defp status_value(task, status), do: Map.get(task["status_values"] || %{}, Atom.to_string(status)) || @statuses[status]
+
+  defp issue_status_value(issue, status) do
+    statuses = profile_value(issue.native_ref || %{}, :status_values) || %{}
+    Map.get(statuses, Atom.to_string(status)) || @statuses[status]
   end
 
   defp status_phase("building"), do: :building

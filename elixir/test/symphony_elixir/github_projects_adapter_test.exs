@@ -102,6 +102,60 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
              Client.validate_settings(%{settings | terminal_states: ["closed", "Done"]})
   end
 
+  test "created pipeline PR includes the Build report body" do
+    settings = tracker_settings(%{"repositories" => [%{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]}]})
+    issue = %SymphonyElixir.Tracker.Issue{id: "octo/app#7", branch_name: "symphony/octo-app-7", native_ref: %{repository: "octo/app"}}
+    body = "<!-- symphony:delivery -->\n\nFixes octo/app#7\n\n## Summary\nImplemented it."
+    pr = pipeline_pr(issue, body)
+
+    request_fun = fn query, variables, _settings ->
+      cond do
+        query =~ "pullRequests" ->
+          {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => []}}}}}}
+
+        query =~ "SymphonyPipelineRepository" ->
+          {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"id" => "R_octopus"}}}}}
+
+        query =~ "createPullRequest" ->
+          assert variables["input"]["body"] == body
+          {:ok, %{status: 200, body: %{"data" => %{"createPullRequest" => %{"pullRequest" => pr}}}}}
+      end
+    end
+
+    attrs = %{branch: issue.branch_name, base: "main", sha: "sha-seven", body: body}
+    assert {:ok, %{body: ^body}} = Client.upsert_pull_request_for_test(issue, attrs, settings, request_fun)
+  end
+
+  test "refreshes a Symphony-owned PR body and preserves a human-edited body" do
+    settings = tracker_settings(%{"repositories" => [%{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]}]})
+    issue = %SymphonyElixir.Tracker.Issue{id: "octo/app#7", branch_name: "symphony/octo-app-7", native_ref: %{repository: "octo/app"}}
+    body = "<!-- symphony:delivery -->\n\nFixes octo/app#7\n\n## Summary\nUpdated it."
+    attrs = %{branch: issue.branch_name, base: "main", sha: "sha-seven", body: body}
+
+    for {existing_body, should_update?} <- [{"<!-- symphony:delivery -->\n\nOld report", true}, {"Human-edited PR description", false}] do
+      calls = Agent.start_link(fn -> [] end) |> elem(1)
+
+      request_fun = fn query, variables, _settings ->
+        Agent.update(calls, &[{query, variables} | &1])
+
+        if query =~ "pullRequests" do
+          pr = pipeline_pr(issue, existing_body)
+          {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [pr]}}}}}}
+        else
+          assert should_update?
+          assert query =~ "updatePullRequest"
+          assert variables["body"] == body
+          {:ok, %{status: 200, body: %{"data" => %{"updatePullRequest" => %{"pullRequest" => pipeline_pr(issue, body)}}}}}
+        end
+      end
+
+      assert {:ok, result} = Client.upsert_pull_request_for_test(issue, attrs, settings, request_fun)
+
+      assert result.body == if(should_update?, do: body, else: existing_body)
+      assert length(Agent.get(calls, & &1)) == if(should_update?, do: 2, else: 1)
+    end
+  end
+
   test "fetches Ready native issues from the configured Project and qualifies identity by repository" do
     response =
       project_response([
@@ -508,6 +562,21 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
           }
         ]
       }
+    }
+  end
+
+  defp pipeline_pr(issue, body) do
+    %{
+      "id" => "PR_pipeline",
+      "number" => 107,
+      "url" => "https://github.com/octo/app/pull/107",
+      "state" => "OPEN",
+      "isDraft" => true,
+      "mergedAt" => nil,
+      "baseRefName" => "main",
+      "headRefName" => issue.branch_name,
+      "headRefOid" => "sha-seven",
+      "body" => body
     }
   end
 

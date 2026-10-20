@@ -29,7 +29,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
         content {
           __typename
           ... on Issue {
-            id number title body state url createdAt updatedAt
+            id number title body state stateReason url createdAt updatedAt
             repository { nameWithOwner }
             labels(first: 100) { nodes { name } }
           }
@@ -90,7 +90,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   query SymphonyPipelinePullRequest($owner: String!, $name: String!, $branch: String!, $base: String!) {
     repository(owner: $owner, name: $name) {
       pullRequests(first: 100, states: [OPEN, CLOSED], headRefName: $branch, baseRefName: $base) {
-        nodes { id number url state isDraft mergedAt baseRefName headRefName headRefOid }
+        nodes { id number url state isDraft mergedAt baseRefName headRefName headRefOid body }
       }
     }
   }
@@ -98,7 +98,15 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   @create_pull_request_mutation """
   mutation SymphonyCreatePipelinePullRequest($input: CreatePullRequestInput!) {
-    createPullRequest(input: $input) { pullRequest { id number url state isDraft mergedAt baseRefName headRefName headRefOid } }
+    createPullRequest(input: $input) { pullRequest { id number url state isDraft mergedAt baseRefName headRefName headRefOid body } }
+  }
+  """
+
+  @update_pull_request_body_mutation """
+  mutation SymphonyUpdatePipelinePullRequestBody($pullRequestId: ID!, $body: String!) {
+    updatePullRequest(input: { pullRequestId: $pullRequestId, body: $body }) {
+      pullRequest { id number url state isDraft mergedAt baseRefName headRefName headRefOid body }
+    }
   }
   """
 
@@ -236,12 +244,23 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   @spec upsert_pull_request(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
   def upsert_pull_request(issue, attrs) do
-    with {:ok, settings} <- settings(Config.settings!().tracker),
+    upsert_pull_request(issue, attrs, Config.settings!().tracker, &perform_request/3)
+  end
+
+  @doc false
+  @spec upsert_pull_request_for_test(Issue.t(), map(), map(), function()) :: {:ok, map()} | {:error, term()}
+  def upsert_pull_request_for_test(issue, attrs, tracker_settings, request_fun)
+      when is_struct(issue, Issue) and is_map(attrs) and is_map(tracker_settings) and is_function(request_fun, 3) do
+    upsert_pull_request(issue, attrs, tracker_settings, request_fun)
+  end
+
+  defp upsert_pull_request(issue, attrs, tracker_settings, request_fun) do
+    with {:ok, settings} <- settings(tracker_settings),
          {:ok, repository} <- repository_for_issue(issue),
-         {:ok, existing} <- find_pull_request(issue, attrs.branch, attrs.base, settings, &perform_request/3) do
+         {:ok, existing} <- find_pull_request(issue, attrs.branch, attrs.base, settings, request_fun) do
       case existing do
-        %{} = pr -> {:ok, pr}
-        nil -> create_pull_request(issue, repository, attrs, settings, &perform_request/3)
+        %{} = pr -> update_pull_request_body(pr, Map.get(attrs, :body), settings, request_fun)
+        nil -> create_pull_request(issue, repository, attrs, settings, request_fun)
       end
     end
   end
@@ -491,9 +510,11 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       project_id: metadata.project_id,
       status_field_id: metadata.status_field_id,
       status_option_ids: metadata.status_option_ids,
+      status_values: Map.new(settings.statuses, fn {key, value} -> {Atom.to_string(key), value} end),
       project_status: project_status,
       issue_node_id: content["id"],
       issue_state: content["state"],
+      issue_state_reason: content["stateReason"],
       repository: repository,
       base_branch: profile && profile.base_branch,
       prepare_command: profile && profile.prepare_command,
@@ -760,7 +781,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
            "baseRefName" => attrs.base,
            "headRefName" => attrs.branch,
            "title" => issue.title,
-           "body" => "Fixes ##{issue_ref["number"]}\n\nCreated by Symphony after the Build phase.",
+           "body" => attrs[:body] || "Fixes ##{issue_ref["number"]}\n\nCreated by Symphony after the Build phase.",
            "draft" => true
          },
          {:ok, created} <- graphql(request_fun, @create_pull_request_mutation, %{"input" => input}, settings),
@@ -782,8 +803,30 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       merged: is_binary(pr["mergedAt"]),
       base: pr["baseRefName"],
       branch: pr["headRefName"],
-      sha: pr["headRefOid"]
+      sha: pr["headRefOid"],
+      body: pr["body"]
     }
+  end
+
+  defp update_pull_request_body(pr, body, _settings, _request_fun) when not is_binary(body), do: {:ok, pr}
+
+  defp update_pull_request_body(%{body: current} = pr, body, settings, request_fun) do
+    cond do
+      current == body ->
+        {:ok, pr}
+
+      is_binary(current) and String.contains?(current, "<!-- symphony:delivery -->") ->
+        with {:ok, data} <- graphql(request_fun, @update_pull_request_body_mutation, %{"pullRequestId" => pr.id, "body" => body}, settings),
+             %{} = updated <- get_in(data, ["updatePullRequest", "pullRequest"]) do
+          {:ok, normalize_pull_request(updated)}
+        else
+          {:error, _reason} = error -> error
+          _ -> {:error, {:github_projects_api_error, "Unable to update the pipeline pull request body."}}
+        end
+
+      true ->
+        {:ok, pr}
+    end
   end
 
   defp split_repository(repository) when is_binary(repository) do

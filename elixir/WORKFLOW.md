@@ -84,14 +84,14 @@ The configured Project status is the source of dispatch:
 
 - Ready: Symphony starts Build or resumes a human-requested correction on the same branch and PR.
 - Building: the Build phase may continue.
-- QA: Symphony runs independent checks against the current SHA.
+- QA: an independent agent reviews the current SHA, then Symphony runs every `required_checks` command from the repository profile in the task workspace. Missing or failed host checks cannot pass QA.
 - Review: Symphony runs autonomous code review against the QA-accepted SHA.
 - Human Review: the PR is ready for a person; Symphony waits for a merge or a move back to Ready.
 - Blocked: intervention is required. Record the reason in the issue and workpad; after it is resolved, a human moves the issue to Ready.
 - Done: the PR merge into the configured base branch has been confirmed.
 - Closed GitHub issue: terminal; stop.
 - Backlog: not dispatched.
-- Dropped: terminal work without a merge. Human confirmation is required after a `no_changes` conclusion.
+- Dropped: terminal work without a merge. Include a human-authored `Drop reason: <reason>` line in the issue body; after `no_changes`, this confirms the decision to discard the work.
 
 The issue identifier starts with the target repository in the form owner/repository#number. Work only in that repository. Do not assume a specific organization, repository, or default branch. The runtime has selected a repository profile and checked out the task branch from that profile's base branch.
 

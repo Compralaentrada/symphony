@@ -39,10 +39,13 @@ If Codex reports that operator input, approval, or MCP elicitation is required, 
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. The GitHub
 Projects adapter also updates the Project status and comments on the linked issue with the reason.
 For the durable Projects pipeline, phase checkpoints and pending external writes are stored in SQLite
-at `~/.symphony/pipeline.sqlite3`; a restart resumes from the last confirmed phase. QA requires every
-configured repository check to include a pass result and evidence. A merge into the configured base
-branch is required before Symphony sets Done. Moving a Human Review item back to Ready requests
-corrections on the same branch and PR.
+at `~/.symphony/pipeline.sqlite3`; a restart resumes from the last confirmed phase. After the
+independent QA review, Symphony runs every `required_checks` command from the repository profile in
+the task workspace and records host-generated evidence; a missing or failed check cannot pass QA.
+A merge into the configured base branch is required before Symphony sets Done. Moving a Human Review
+item back to Ready requests corrections on the same branch and PR. To move unmerged work to Dropped,
+add a human-authored `Drop reason: <reason>` line to the issue body; after a `no_changes` result,
+this line confirms the decision to discard the work.
 
 ## How to use it
 

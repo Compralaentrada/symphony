@@ -142,7 +142,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
 
-        Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
+        Logger.info("Agent task finished for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id} reason=#{inspect(reason)}")
 
         notify_dashboard()
         {:noreply, state}
@@ -278,12 +278,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_pipeline_agent_down(:normal, state, issue_id, running_entry, session_id) do
+    result = verify_required_pipeline_checks(running_entry, Map.get(running_entry, :completion))
+
     case Pipeline.finish_phase(
            running_entry.issue,
            running_entry.pipeline_task,
            running_entry.pipeline_phase,
            running_entry.pipeline_attempt,
-           Map.get(running_entry, :completion)
+           result
          ) do
       :ok ->
         release_issue_claim(state, issue_id)
@@ -319,6 +321,49 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp verify_required_pipeline_checks(%{pipeline_phase: "qa"} = entry, result) when is_map(result) do
+    task = entry.pipeline_task
+
+    checks =
+      Enum.map(task["required_checks"] || [], fn command ->
+        case Workspace.run_required_check(
+               entry.workspace_path,
+               command,
+               task["current_sha"],
+               entry.issue,
+               entry.worker_host
+             ) do
+          {:ok, evidence} -> %{"name" => command, "status" => "passed", "evidence" => evidence}
+          {:error, {:check_failed, status}} -> %{"name" => command, "status" => "failed", "evidence" => "Symphony ran the configured check at SHA #{task["current_sha"]}; host exit status #{status}."}
+          {:error, :check_unavailable} -> %{"name" => command, "status" => "unavailable", "evidence" => "Symphony could not execute the required check."}
+        end
+      end)
+
+    result = Map.put(result, "checks", checks)
+
+    cond do
+      Enum.any?(checks, &(&1["status"] == "unavailable")) ->
+        Map.merge(result, %{
+          "outcome" => "blocked",
+          "summary" => "A required host check was unavailable.",
+          "reason" => "Symphony could not execute every configured required check.",
+          "next_step" => "Resolve the host check issue before moving the item to Ready."
+        })
+
+      Enum.any?(checks, &(&1["status"] == "failed")) ->
+        Map.merge(result, %{
+          "outcome" => "changes_requested",
+          "summary" => "One or more required host checks failed.",
+          "next_step" => "Fix the failed checks and submit a new Build delivery."
+        })
+
+      true ->
+        result
+    end
+  end
+
+  defp verify_required_pipeline_checks(_entry, result), do: result
+
   defp schedule_active_state_continuation(state, issue_id, running_entry) do
     state
     |> complete_issue(issue_id)
@@ -340,7 +385,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_agent_down(state, issue_id, running_entry, session_id, reason) do
-    Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+    Logger.warning("Agent task exited for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
     next_attempt = next_retry_attempt_from_running(running_entry)
 
@@ -1110,7 +1155,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp start_prepared_pipeline_issue(state, issue, task, phase, retry_attempt, worker_host) do
-    claim_result = if issue.state in ["Ready", "Building"], do: Tracker.claim_issue(issue), else: :ok
+    claim_result = if pipeline_claimable_state?(issue), do: Tracker.claim_issue(issue), else: :ok
 
     case claim_result do
       result when result in [:ok, :ignore] ->
@@ -1127,6 +1172,11 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp pipeline_claimable_state?(issue) do
+    status_values = Map.get(issue.native_ref || %{}, :status_values, %{})
+    issue.state in [Map.get(status_values, "ready", "Ready"), Map.get(status_values, "building", "Building")]
+  end
+
   defp spawn_pipeline_worker(state, issue, task, phase, phase_attempt, retry_attempt, worker_host) do
     recipient = self()
     runner = state.agent_runner
@@ -1139,6 +1189,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     case Task.Supervisor.start_child(state.task_supervisor, child) do
       {:ok, pid} ->
+        Logger.info("Dispatching pipeline issue_id=#{issue.id} issue_identifier=#{issue.identifier} phase=#{phase} attempt=#{phase_attempt}")
         ref = Process.monitor(pid)
         send(pid, :run)
         entry = pipeline_running_entry(issue, task, phase, phase_attempt, retry_attempt, worker_host, pid, ref)
