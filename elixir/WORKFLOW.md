@@ -1,32 +1,38 @@
 ---
-# Alternative Projects v2 mode: use `kind: github_projects`, status-only routing,
-# and provider fields `owner`, `project_number`, `status_field`, `status_values`,
-# `token: $GITHUB_TOKEN`, and `repositories` (repository, base_branch,
-# prepare_command). See README.md's GitHub Projects v2 adapter profile for the
-# full example and workspace preparation contract.
 tracker:
-  kind: github
-  provider:
-    repo: Compralaentrada/symphony
-    token: "$GITHUB_TOKEN"
-  required_labels:
-    - ready-for-agent
+  kind: github_projects
   active_states:
-    - open
+    - Ready
+    - Building
   terminal_states:
     - closed
+  provider:
+    owner: Compralaentrada
+    project_number: 9
+    status_field: Status
+    status_values:
+      ready: Ready
+      building: Building
+      blocked: Blocked
+      done: Done
+    token: "$GITHUB_TOKEN"
+    repositories:
+      - repository: Compralaentrada/symphony
+        base_branch: main
+        prepare_command: |
+          gh repo clone "$SYMPHONY_REPOSITORY" .
+          if command -v mise >/dev/null 2>&1; then
+            cd elixir && mise trust && mise exec -- mix deps.get
+          fi
 polling:
   interval_ms: 5000
 workspace:
   root: ~/code/symphony-workspaces
 hooks:
-  after_create: |
-    gh repo clone Compralaentrada/symphony .
-    if command -v mise >/dev/null 2>&1; then
-      cd elixir && mise trust && mise exec -- mix deps.get
-    fi
   before_remove: |
-    cd elixir && mise exec -- mix workspace.before_remove
+    if [ -f elixir/mix.exs ] && command -v mise >/dev/null 2>&1; then
+      cd elixir && mise exec -- mix workspace.before_remove
+    fi
 agent:
   max_concurrent_agents: 10
   max_turns: 20
@@ -38,23 +44,21 @@ codex:
     type: dangerFullAccess
 ---
 
-You are working on GitHub issue {{ issue.identifier }} in Compralaentrada/symphony.
+You are working on a GitHub issue dispatched from the configured GitHub Projects v2 board.
 
 {% if attempt %}
 Follow-up context:
 
-- This is follow-up attempt #{{ attempt }}. It may be a normal continuation or a retry after a failure.
-- Resume from the current workspace state instead of restarting from scratch.
-- Do not repeat completed investigation or validation unless needed for new code changes.
-- Continue only while the issue is open and has the required ready-for-agent label. When handing work to a human, remove that label so Symphony stops the run.
+- This is follow-up attempt #{{ attempt }}. Resume from the existing workspace, branch, pull request, and workpad.
+- Continue only while the issue is open and its Project status is Building.
+- A human requeues an open issue by moving it to Ready. A closed issue is terminal.
 {% endif %}
 
 Issue context:
-Identifier: {{ issue.identifier }}
-Issue number: {{ issue.id }}
+Identifier (repository#number): {{ issue.identifier }}
 Title: {{ issue.title }}
-State: {{ issue.state }}
-Labels: {{ issue.labels }}
+Project status: {{ issue.state }}
+Labels (context only; they do not control routing): {{ issue.labels }}
 URL: {{ issue.url }}
 
 Description:
@@ -64,176 +68,83 @@ Description:
 No description provided.
 {% endif %}
 
-## GitHub issue routing
+## Project routing
 
-The GitHub tracker state is only open or closed. Workflow phases use labels and pull request review state:
+The configured Project status is the source of dispatch:
 
-- Open with ready-for-agent: Symphony may start or continue work. Keep this label while implementation or merge work is active.
-- Open with ready-for-human and without ready-for-agent: waiting for human review; Symphony must not work on the issue.
-- Open without either routing label: queued or out of scope; do not work on it.
-- Closed: terminal; stop.
-- When a reviewer requests changes, the human removes ready-for-human and re-adds ready-for-agent. Read all issue and PR feedback and continue the existing work.
-- After a PR is approved, the human removes ready-for-human and re-adds ready-for-agent. If checks are green and no actionable feedback remains, follow the land skill.
-- To hand work to a human, remove ready-for-agent and add ready-for-human. The tracker requires ready-for-agent both for dispatch and for continuing an active run, so removing it stops the run.
+- Ready: Symphony may start the issue when its repository has a configured profile.
+- Building: the current run may continue.
+- Blocked: intervention is required. Record the reason in the issue and workpad; after it is resolved, a human moves the issue to Ready.
+- Done: the current integration considers the run complete. An open issue can be moved back to Ready for another attempt.
+- Closed GitHub issue: terminal; stop.
+- Backlog: not dispatched.
+- QA, Review, Human Review, and Dropped are reserved for the pipeline in issue #9. The current integration does not dispatch these states; do not move work into them manually.
 
-Only use GitHub issues in Compralaentrada/symphony. Follow docs/agents/issue-tracker.md and pass --repo Compralaentrada/symphony to GitHub CLI commands.
+The issue identifier starts with the target repository in the form owner/repository#number. Work only in that repository. Do not assume a specific organization, repository, or default branch. The runtime has selected a repository profile and checked out the task branch from that profile's base branch.
+
+Use `gh` with `--repo owner/repository` for GitHub operations. If the CLI cannot authenticate, use the injected `github_api` tool, which executes host-side with the configured token. Never copy tracker tokens into the workpad or command output.
+
+## Skills
+
+Before planning, inspect the relevant skills under `.agents/skills` and `.codex/skills`, then read their `SKILL.md` files. Use only skills that fit this task:
+
+- Apply `ponytail` to code changes.
+- Use `tdd` for behavior changes and `code-review` before handoff when relevant.
+- Use `impeccable` only for frontend work and `humanizer` when editing user-facing prose.
+- Use repository skills such as `commit`, `push`, or `pull` when they fit the current repo and branch.
+- Do not download skills during a run or force an irrelevant skill into the task.
 
 ## Instructions
 
-1. This is an unattended orchestration session. Do not ask a human to perform follow-up actions.
-2. Stop early only for a true external blocker such as missing tools, authentication, permissions, or secrets. If blocked, record it in the workpad and hand off by removing ready-for-agent and adding ready-for-human.
-3. Final message must report completed actions and blockers only. Do not include next steps for the user.
-4. Work only in the provided repository copy. Do not touch any other path.
-5. Keep ready-for-agent on the issue while doing implementation or merge work. Remove it only for a human handoff or when the issue is no longer assigned to Symphony.
-6. For issue reads, comments, labels, and closure, use gh commands with --repo Compralaentrada/symphony as documented in docs/agents/issue-tracker.md. If gh cannot authenticate, use the injected github_api tool, which executes host-side with the session-bound token.
-7. Do not put tracker tokens in WORKFLOW.md or the issue workpad. Symphony reads GITHUB_TOKEN from its host environment and keeps tracker credentials out of the Codex child environment.
+1. This is an unattended orchestration session. Do not ask a human for follow-up actions.
+2. Stop only for a real external blocker such as missing tools, authentication, permissions, or secrets. Record the exact blocker in the workpad and final report.
+3. Work only in the checked-out target repository.
+4. Read the target repository's `AGENTS.md` and relevant domain docs before editing.
+5. Do not change the Project status manually. Symphony owns Building, Done, and Blocked transitions; a human requeues an open item by moving it to Ready.
+6. For meaningful out-of-scope work, create a separate issue in the same target repository and link it to the current issue.
+7. Final response must report completed work, validation, and blockers. Do not include speculative next steps.
 
 ## Default posture
 
-- Read the issue and its labels, then follow the routing rules above.
-- Start each routed task by opening the persistent workpad comment and bringing it up to date before implementation.
-- Spend extra effort up front on planning and verification design.
-- Reproduce first: confirm the current behavior or issue signal before changing code.
-- Keep issue labels, the workpad checklist, acceptance criteria, and PR links current.
-- Treat one persistent GitHub issue comment as the source of truth for progress and handoff notes. Do not post separate completion summaries.
-- Treat any issue-authored Validation, Test Plan, or Testing section as non-negotiable acceptance input. Copy it into the workpad and execute it before considering the task complete.
-- For meaningful out-of-scope improvements, create a separate issue in Compralaentrada/symphony, label it needs-triage, and link it to the current issue as a sub-issue or with a Part of #<number> line. Use native GitHub issue dependencies for blockers when available; otherwise add a Blocked by: #<number> line.
-- Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
-- Do not change issue state to represent intermediate workflow phases. Use the routing labels and PR review state above.
+- Read the issue, its comments, linked PRs, and review feedback before editing.
+- Keep one persistent issue comment marked `## Codex Workpad` as the source of truth for plan, progress, acceptance criteria, validation, and handoff notes. Update it in place; do not post separate progress summaries.
+- Reproduce the issue signal before changing code. Plan the smallest change that fully meets its acceptance criteria.
+- Follow any issue-provided Validation, Test Plan, or Testing section.
+- For user-facing changes, include an end-to-end walkthrough. For application behavior changes, record the launch path, interaction, and expected result.
+- Run checks required by the issue and use targeted validation for the changed behavior.
+- Do not approve or merge pull requests. Human approval and merge remain manual.
 
-## Related skills
+## Step 0: Confirm the work
 
-- commit: produce clean, logical commits during implementation.
-- push: keep the remote branch current and publish updates.
-- pull: merge the latest origin/main before code edits and before handoff as required below.
-- land: after a human approves the PR and re-adds ready-for-agent, open and follow .codex/skills/land/SKILL.md. Do not call gh pr merge directly.
-
-## Step 0: Confirm routing and choose the task flow
-
-1. Fetch the issue by number with gh issue view <number> --repo Compralaentrada/symphony.
-2. If it is closed, stop without changing it.
-3. If ready-for-agent is absent, do not start or continue work. If ready-for-human is present, wait for the human review cycle to re-route the issue.
-4. Check for an existing PR linked to the issue and for review feedback:
-   - If the latest review requests changes, follow the rework flow.
-   - If the PR is approved, checks are green, and no actionable feedback remains, follow the merge flow.
-   - Otherwise continue implementation from the current workpad and workspace.
-5. If an existing PR is closed or merged:
-   - If merged, confirm the issue is closed and stop.
-   - If closed without merge, do not reuse its branch; create a fresh branch from origin/main and restart from reproduction and planning.
-6. For every issue with ready-for-agent, find or create the workpad before implementation. Do not make an intermediate issue-state transition.
-
-## Step 1: Start or continue execution
-
-1. Find or create one persistent issue comment marked ## Codex Workpad:
-   - Search the issue comments for that exact header.
-   - Reuse the existing comment when found; otherwise create one.
-   - Edit the same comment for all progress and handoff notes. Do not create extra status comments.
-2. Reconcile the workpad before new edits:
-   - Check off completed items.
-   - Refine the plan for the current scope.
-   - Ensure Acceptance Criteria and Validation match the issue and its required validation.
-3. Write or update a hierarchical plan in the workpad.
-4. Add a compact environment stamp as a fenced code line:
+1. Parse the repository and issue number from `{{ issue.identifier }}`, then fetch the issue with `gh issue view <number> --repo <owner/repository>`.
+2. If the GitHub issue is closed, stop. If the Project status is not Building, do not edit code or tracker content.
+3. Read the issue body, comments, and any linked PR feedback. Treat actionable review feedback as part of the acceptance criteria.
+4. Find or create the persistent workpad comment before implementation.
+5. Record an environment stamp in the workpad:
    - Format: <host>:<absolute-workspace-path>@<short-sha>
-   - Example: devbox-01:/home/dev-user/code/symphony-workspaces/GH-32@7bdde33bc
-   - Do not repeat issue ID, labels, branch, or PR URL already visible in GitHub.
-5. Add acceptance criteria and TODOs as checklists in the workpad.
-   - For user-facing changes, include an end-to-end UI walkthrough.
-   - For app behavior changes, include the launch path, changed interaction, and expected result.
-   - Copy any issue-provided Validation, Test Plan, or Testing requirements into the workpad as required checkboxes.
-6. Review the plan for missing steps, risks, and verification, then refine it.
-7. Capture a concrete reproduction signal before implementation and record it in Notes.
-8. Run the pull skill to merge origin/main before code edits. Record the merge source, result, and resulting HEAD short SHA in Notes.
-9. Compact context and proceed with the remaining plan.
+   - Do not repeat the issue ID, branch, or PR URL already visible in GitHub.
+6. Record a reproduction signal and a short plan with acceptance and validation checklists.
+7. Verify the checked-out repository, task branch, working tree, and configured base branch. Sync the base branch before edits using the repository's applicable `pull` workflow; do not hard-code `main`.
 
-## PR feedback sweep
+## Step 1: Implement
 
-Before handing a PR to a human or merging it, review every feedback channel:
+1. Follow the workpad plan and update it after meaningful milestones.
+2. Use the repository's existing patterns and keep changes within the issue scope.
+3. Run the issue's required validation before each push. Record exact commands and results in the workpad.
+4. If validation or a required dependency is blocked, record what failed and why; do not claim it passed.
+5. For issue comments, labels, and closure, use `gh` with the target repository or the injected `github_api` tool. Do not use labels for Symphony routing.
 
-1. Identify linked PRs from the issue cross-references and current branch.
-2. Read top-level comments with gh pr view <number> --repo Compralaentrada/symphony --comments.
-3. Read inline review comments with gh api --repo Compralaentrada/symphony repos/Compralaentrada/symphony/pulls/<number>/comments.
-4. Read review summaries with gh pr view <number> --repo Compralaentrada/symphony --json reviews.
-5. Treat every actionable human or bot comment as blocking until addressed in code/tests/docs or answered with justified pushback.
-6. Update the workpad with each feedback item and its resolution.
-7. Re-run validation after feedback changes, push updates, and repeat the sweep until no actionable comments remain.
+## Step 2: Prepare a human handoff
 
-## Blocked-access handling
-
-- Try the configured github_api tool and the authenticated gh CLI before declaring GitHub access blocked.
-- GitHub access is required for issue routing, comments, labels, and PR handoff. If neither path works, record what failed and why it blocks the task in the workpad, remove ready-for-agent, and add ready-for-human.
-- For missing non-GitHub tools or auth, use the same label handoff and include the exact blocker and required human action in the workpad.
-- Keep blocker notes concise and do not post separate top-level comments outside the workpad.
-
-## Step 2: Implement and prepare the PR
-
-1. Confirm the repository, branch, git status, and HEAD. Verify the pull skill sync is recorded in the workpad before code edits.
-2. Keep ready-for-agent on the issue while implementation is active.
-3. Follow the workpad plan. Update it after meaningful milestones and whenever scope, risks, or validation changes.
-4. Run validation required by the issue:
-   - Execute all issue-provided Validation, Test Plan, or Testing requirements.
-   - Prefer targeted proof for the changed behavior.
-   - Temporary local proof edits are allowed when useful, but revert them before commit or push and record the steps in the workpad.
-   - For app changes, run launch-app validation and capture/upload media via github-pr-media before handoff.
-5. Re-check the acceptance criteria and close any gaps.
-6. Before every push, run the required validation and confirm it passes.
-7. Create or update the PR. Include Fixes #<issue-number> in its body so GitHub links it to the issue and closes the issue when the PR merges.
-8. Ensure the PR has the symphony label.
-9. Merge the latest origin/main into the branch, resolve conflicts, and rerun required checks.
-10. Update the workpad with final plan, acceptance, and validation status. Record the PR number and link there.
-11. Before handoff, read the PR Manual QA Plan if present, run the full PR feedback sweep, confirm checks are green, and confirm all issue-provided validation items are complete.
-12. When implementation is ready for human review:
-    - Remove ready-for-agent and add ready-for-human on the issue.
-    - Update the workpad with the handoff summary and validation evidence.
-    - Stop work. Do not keep polling or making changes while waiting for review.
-13. If the issue started with an existing PR, resolve its feedback and push the required updates before handoff.
-
-## Step 3: Human review and merge
-
-An issue waiting for review has ready-for-human and does not have ready-for-agent, so Symphony will not run on it.
-
-- If reviewers request changes, the human removes ready-for-human and re-adds ready-for-agent. Resume from the existing workspace and workpad, address all feedback, validate, then hand off again.
-- If the PR is approved, the human removes ready-for-human and re-adds ready-for-agent. Confirm the latest PR review is approved, checks are green, and no actionable comments remain.
-- After approval, open and follow .codex/skills/land/SKILL.md and run the land loop until the PR is merged. Do not call gh pr merge directly.
-- After merge, confirm GitHub closed the linked issue. If it remains open, close it with gh issue close <number> --repo Compralaentrada/symphony.
-
-## Step 4: Rework handling
-
-When a reviewer requests changes and the issue is re-routed with ready-for-agent:
-
-1. Treat rework as a full approach reset, not incremental patching.
-2. Re-read the full issue body, all human comments, and all PR feedback. Record what will change in the approach.
-3. Close the existing PR tied to the issue.
-4. Delete the existing Codex Workpad issue comment using the GitHub API.
-5. Create a fresh branch from origin/main.
-6. Start a new workpad, plan, and validation checklist, then execute the task end-to-end.
-7. Remove ready-for-agent and add ready-for-human when the updated PR is ready for review.
-
-## Completion bar before human review
-
-- The plan, acceptance criteria, and validation checklist are complete in the workpad.
-- All required issue validation items passed for the latest commit.
-- PR feedback sweep is complete and no actionable comments remain.
-- PR checks are green, branch is pushed, PR is linked to the issue, and the PR has the symphony label.
-- If the change touches the app, runtime validation and required media are complete.
-- The issue has ready-for-human and no ready-for-agent label.
-
-## Guardrails
-
-- If the issue is closed, do nothing and stop.
-- If the issue is open but lacks ready-for-agent, do not modify code or tracker content.
-- Do not edit the issue body for planning or progress tracking.
-- Use exactly one persistent ## Codex Workpad issue comment.
-- Update the workpad comment in place using the authenticated GitHub API or an available update script.
-- Temporary proof edits are allowed only for local verification and must be reverted before commit.
-- For out-of-scope work, create a separate needs-triage issue in this repository and link it to the current issue as a sub-issue or with a Part of #<number> line. Use Blocked by: #<number> if native issue dependencies are unavailable.
-- Do not hand off for review until the completion bar is satisfied, except when missing access blocks required work; document that blocker in the workpad.
-- During human review, do not make changes. The issue must remain without ready-for-agent until the human requests changes or approves the PR.
-- Keep issue and PR text concise, specific, and reviewer-oriented.
+1. Review the diff, acceptance criteria, validation evidence, and all PR feedback.
+2. Create or update a draft PR when the task produces code that needs review. Link it to the issue and include `Fixes #<issue-number>` when merging should close that issue.
+3. Do not merge or approve the PR.
+4. Update the persistent workpad with the final summary, validation evidence, and PR link.
+5. Stop after the handoff. On successful completion, the current tracker moves Building to Done. If a reviewer requests changes, a human moves the open issue back to Ready; Symphony resumes the same workspace and branch.
 
 ## Workpad template
 
-Use this exact structure for the persistent workpad comment and keep it updated in place:
+Use this structure for the persistent issue comment and keep it updated in place:
 
 ~~~~md
 ## Codex Workpad
@@ -256,7 +167,7 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 
 ### Validation
 
-- [ ] Targeted tests: <command>
+- [ ] Targeted checks: <command>
 
 ### Notes
 
