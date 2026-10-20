@@ -21,6 +21,8 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 4. Sends a workflow prompt to Codex
 5. Keeps Codex working on the issue until the work is done
 
+Local runs discover repo-local Codex skills from `.agents/skills` in the workspace checkout. Symphony checks the selected skills before launching Codex and reports a missing `SKILL.md` path; pinned sources and fingerprints are listed in the repository's `.agents/skills/SOURCES.md`.
+
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
 Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
 `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
