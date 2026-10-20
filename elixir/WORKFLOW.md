@@ -1,4 +1,9 @@
 ---
+# Alternative Projects v2 mode: use `kind: github_projects`, status-only routing,
+# and provider fields `owner`, `project_number`, `status_field`, `status_values`,
+# `token: $GITHUB_TOKEN`, and `repositories` (repository, base_branch,
+# prepare_command). See README.md's GitHub Projects v2 adapter profile for the
+# full example and workspace preparation contract.
 tracker:
   kind: github
   provider:

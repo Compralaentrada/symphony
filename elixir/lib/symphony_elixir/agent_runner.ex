@@ -85,6 +85,13 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
+  defp notify_continuation_required(recipient, %Issue{id: issue_id})
+       when is_pid(recipient) and is_binary(issue_id) do
+    send(recipient, {:agent_continuation_required, issue_id})
+  end
+
+  defp notify_continuation_required(_recipient, _issue), do: :ok
+
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
@@ -142,6 +149,7 @@ defmodule SymphonyElixir.AgentRunner do
 
         {:continue, refreshed_issue} ->
           Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+          notify_continuation_required(codex_update_recipient, refreshed_issue)
 
           :ok
 

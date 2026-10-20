@@ -286,21 +286,32 @@ defmodule SymphonyElixir.Workspace do
     |> binary_part(0, 16)
   end
 
-  defp maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
-    hooks = Config.settings!().hooks
+  defp maybe_run_after_create_hook(_workspace, _issue_context, false, _worker_host), do: :ok
 
-    case created? do
-      true ->
-        case hooks.after_create do
-          nil ->
-            :ok
+  defp maybe_run_after_create_hook(workspace, issue_context, true, worker_host) do
+    case Map.get(issue_context, :prepare_command) do
+      command when is_binary(command) and command != "" ->
+        run_project_after_create_hooks(command, workspace, issue_context, worker_host)
 
-          command ->
-            run_hook(command, workspace, issue_context, "after_create", worker_host)
-        end
+      _ ->
+        run_legacy_after_create_hook(workspace, issue_context, worker_host)
+    end
+  end
 
-      false ->
-        :ok
+  defp run_project_after_create_hooks(command, workspace, issue_context, worker_host) do
+    case run_hook(command, workspace, issue_context, "after_create", worker_host) do
+      :ok ->
+        run_hook(project_branch_command(issue_context), workspace, issue_context, "after_create", worker_host)
+
+      error ->
+        error
+    end
+  end
+
+  defp run_legacy_after_create_hook(workspace, issue_context, worker_host) do
+    case Config.settings!().hooks.after_create do
+      nil -> :ok
+      command -> run_hook(command, workspace, issue_context, "after_create", worker_host)
     end
   end
 
@@ -401,7 +412,11 @@ defmodule SymphonyElixir.Workspace do
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd("sh", ["-lc", command],
+          cd: workspace,
+          env: hook_environment(issue_context),
+          stderr_to_stdout: true
+        )
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -422,7 +437,17 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
+    script =
+      [
+        "set -eu",
+        remote_hook_environment(issue_context),
+        "cd #{shell_escape(workspace)}",
+        command
+      ]
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
@@ -568,11 +593,16 @@ defmodule SymphonyElixir.Workspace do
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
 
-  defp issue_context(%{id: issue_id, identifier: identifier}) do
-    %{
+  defp issue_context(%{id: issue_id, identifier: identifier} = issue) do
+    context = %{
       issue_id: issue_id,
       issue_identifier: identifier || "issue"
     }
+
+    case project_workspace_profile(issue) do
+      nil -> context
+      profile -> Map.merge(context, profile)
+    end
   end
 
   defp issue_context(identifier) when is_binary(identifier) do
@@ -588,6 +618,60 @@ defmodule SymphonyElixir.Workspace do
       issue_identifier: "issue"
     }
   end
+
+  defp project_workspace_profile(%{native_ref: native_ref} = issue) when is_map(native_ref) do
+    repository = Map.get(native_ref, :repository) || Map.get(native_ref, "repository")
+    base_branch = Map.get(native_ref, :base_branch) || Map.get(native_ref, "base_branch")
+    prepare_command = Map.get(native_ref, :prepare_command) || Map.get(native_ref, "prepare_command")
+
+    if Enum.all?([repository, base_branch, prepare_command, Map.get(issue, :branch_name)], &present_string?/1) do
+      %{
+        repository: repository,
+        base_branch: base_branch,
+        prepare_command: prepare_command,
+        branch_name: Map.get(issue, :branch_name)
+      }
+    end
+  end
+
+  defp project_workspace_profile(_issue), do: nil
+
+  defp project_branch_command(%{branch_name: branch_name, base_branch: base_branch}) do
+    work_ref = "refs/remotes/origin/#{branch_name}"
+    local_work_ref = "refs/heads/#{branch_name}"
+    base_ref = "refs/remotes/origin/#{base_branch}"
+    local_base_ref = "refs/heads/#{base_branch}"
+
+    [
+      "git fetch --quiet origin",
+      "if git show-ref --verify --quiet #{shell_escape(work_ref)}; then",
+      "  git switch --quiet --track --force-create #{shell_escape(branch_name)} #{shell_escape("origin/" <> branch_name)}",
+      "elif git show-ref --verify --quiet #{shell_escape(local_work_ref)}; then",
+      "  git switch --quiet #{shell_escape(branch_name)}",
+      "elif git show-ref --verify --quiet #{shell_escape(base_ref)}; then",
+      "  git switch --quiet --force-create #{shell_escape(branch_name)} #{shell_escape("origin/" <> base_branch)}",
+      "elif git show-ref --verify --quiet #{shell_escape(local_base_ref)}; then",
+      "  git switch --quiet --force-create #{shell_escape(branch_name)} #{shell_escape(base_branch)}",
+      "else",
+      "  printf '%s\\n' #{shell_escape("Configured base branch not found: " <> base_branch)} >&2",
+      "  exit 1",
+      "fi"
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp hook_environment(issue_context) do
+    issue_context
+    |> Map.take([:repository, :base_branch, :issue_id, :issue_identifier])
+    |> Enum.map(fn {key, value} -> {"SYMPHONY_" <> (key |> Atom.to_string() |> String.upcase()), to_string(value)} end)
+  end
+
+  defp remote_hook_environment(issue_context) do
+    hook_environment(issue_context)
+    |> Enum.map_join("\n", fn {key, value} -> "export #{key}=#{shell_escape(value)}" end)
+  end
+
+  defp present_string?(value), do: is_binary(value) and String.trim(value) != ""
 
   defp issue_log_context(%{issue_id: issue_id, issue_identifier: issue_identifier}) do
     "issue_id=#{issue_id || "n/a"} issue_identifier=#{issue_identifier || "issue"}"

@@ -13,8 +13,8 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 ## How it works
 
-1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues, Jira
-   Cloud, Asana, and GitLab)
+1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues,
+   GitHub Projects v2, Jira Cloud, Asana, and GitLab)
 2. Creates a workspace per issue
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
@@ -24,18 +24,19 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 Local runs discover repo-local Codex skills from `.agents/skills` in the workspace checkout. Symphony checks the selected skills before launching Codex and reports a missing `SKILL.md` path; pinned sources and fingerprints are listed in the repository's `.agents/skills/SOURCES.md`.
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
-Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
+Linear serves `linear_graphql`, GitHub Issues and GitHub Projects v2 serve `github_api`, Jira Cloud serves
 `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
 tools with configured host-side auth and removes declared tracker-token environment variables from
 the Codex child, so the agent does not need a second tracker login.
 
-If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
-Symphony stops the active agent for that issue and cleans up matching workspaces.
+If a claimed issue moves to a configured terminal state, Symphony stops the active agent and cleans
+up its workspace. In GitHub Projects mode, closing the linked GitHub Issue is terminal; Project
+items in Done or Blocked keep their workspace so moving them back to Ready can resume prior work.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
-issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
-entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
-tracker issue can become a dispatch candidate again after restart.
+issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. The GitHub
+Projects adapter also updates the Project status and comments on the linked issue with the reason.
+Runtime blocked entries are in memory only; restarting the orchestrator clears that map.
 
 ## How to use it
 
@@ -157,6 +158,9 @@ Notes:
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
+- GitHub Projects v2 uses Project status for routing and rejects `required_labels`. Its repository
+  profiles define the exact repositories Symphony may work in, the base branch, and a preparation
+  command for new workspaces.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
@@ -177,6 +181,11 @@ Notes:
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
+- In GitHub Projects mode, each profile's `prepare_command` runs in a new empty workspace and must
+  create the repository at `.`. It receives `SYMPHONY_REPOSITORY`, `SYMPHONY_BASE_BRANCH`,
+  `SYMPHONY_ISSUE_ID`, and `SYMPHONY_ISSUE_IDENTIFIER`; Symphony then creates the issue branch from
+  the configured base branch. The profile command replaces `hooks.after_create` for that workspace.
+  Requeues reuse an existing workspace without rerunning either command.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or
@@ -228,6 +237,49 @@ codex:
 - Dispatchability: the adapter marks an issue dispatchable only when optional assignee routing
   matches and a `Todo` issue has no non-terminal blocker. The generic scheduler then applies
   active/terminal states, required labels, claims, retries, and concurrency.
+
+### GitHub Projects v2 adapter profile
+
+```yaml
+tracker:
+  kind: github_projects
+  required_labels: []
+  active_states: [Ready, Building]
+  terminal_states: [closed]
+  provider:
+    owner: your-user-or-organization
+    project_number: 12
+    status_field: Status
+    status_values:
+      ready: Ready
+      building: In Progress
+      blocked: Blocked
+      done: Done
+    token: $GITHUB_TOKEN
+    repositories:
+      - repository: your-org/api
+        base_branch: main
+        prepare_command: |
+          gh repo clone "$SYMPHONY_REPOSITORY" .
+          git fetch origin "refs/heads/$SYMPHONY_BASE_BRANCH:refs/remotes/origin/$SYMPHONY_BASE_BRANCH"
+          git switch --track -c "$SYMPHONY_BASE_BRANCH" "origin/$SYMPHONY_BASE_BRANCH"
+          mise exec -- mix deps.get
+```
+
+- `owner` and `project_number` identify a user or organization Project. `status_field` and the four
+  `status_values` must match a single-select Project field and its options.
+- `token` defaults to `GITHUB_TOKEN` and accepts `$ENV_VAR`; never put a literal token in
+  `WORKFLOW.md`. The token needs access to read and update the Project and linked issues.
+- `active_states` must include the configured Ready and Building values. `terminal_states` must
+  include `closed` and must leave Done and Blocked requeueable.
+- Only Ready Project items linked to native GitHub Issues with an exact repository profile are
+  dispatched. Pull requests, draft issues, and unsupported item types are ignored. An unconfigured
+  repository is moved to Blocked and receives a comment explaining the missing profile.
+- Work identity is `owner/repository#number`. Claiming moves Ready to Building, successful completion
+  moves Building to Done, and intervention-required failures move to Blocked with a comment. Transient
+  failures retry on the existing backoff path.
+- Project items can belong to either a user or organization Project. The optional `graphql_url`
+  setting defaults to `https://api.github.com/graphql`.
 - Tool: the Linear adapter advertises `linear_graphql`, accepting either a raw query string or an
   object with nonblank `query` and optional object `variables`. Symphony executes it host-side
   with the session-bound endpoint/token and strips declared token environment variables from the

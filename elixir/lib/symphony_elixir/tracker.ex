@@ -13,6 +13,7 @@ defmodule SymphonyElixir.Tracker do
   @adapters %{
     "asana" => SymphonyElixir.Asana.Adapter,
     "github" => SymphonyElixir.GitHub.Adapter,
+    "github_projects" => SymphonyElixir.GitHub.Projects.Adapter,
     "gitlab" => SymphonyElixir.GitLab.Adapter,
     "jira" => SymphonyElixir.Jira.Adapter,
     "linear" => SymphonyElixir.Linear.Adapter,
@@ -25,10 +26,16 @@ defmodule SymphonyElixir.Tracker do
   @callback execute_agent_tool(String.t(), term(), keyword()) :: map()
   @callback secret_environment_names(map()) :: [String.t()]
   @callback validate_config(map()) :: :ok | {:error, term()}
+  @callback claim_issue(Issue.t()) :: :ok | {:error, term()}
+  @callback complete_issue(Issue.t()) :: :ok | {:error, term()}
+  @callback block_issue(Issue.t(), String.t()) :: :ok | {:error, term()}
 
   @optional_callbacks agent_tool_specs: 0,
                       execute_agent_tool: 3,
-                      validate_config: 1
+                      validate_config: 1,
+                      claim_issue: 1,
+                      complete_issue: 1,
+                      block_issue: 2
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states) do
@@ -39,6 +46,16 @@ defmodule SymphonyElixir.Tracker do
   def fetch_issues_by_ids(issue_ids) do
     adapter().fetch_issues_by_ids(issue_ids)
   end
+
+  @spec claim_issue(Issue.t()) :: :ok | :ignore | {:error, term()}
+  def claim_issue(%Issue{} = issue), do: issue_lifecycle_callback(:claim_issue, [issue])
+
+  @spec complete_issue(Issue.t()) :: :ok | :ignore | {:error, term()}
+  def complete_issue(%Issue{} = issue), do: issue_lifecycle_callback(:complete_issue, [issue])
+
+  @spec block_issue(Issue.t(), String.t()) :: :ok | :ignore | {:error, term()}
+  def block_issue(%Issue{} = issue, reason) when is_binary(reason),
+    do: issue_lifecycle_callback(:block_issue, [issue, reason])
 
   @doc """
   Captures the selected adapter and effective tracker settings for one
@@ -121,6 +138,16 @@ defmodule SymphonyElixir.Tracker do
 
   defp adapter_secret_environment_names(adapter, tracker_settings) do
     adapter.secret_environment_names(tracker_settings)
+  end
+
+  defp issue_lifecycle_callback(callback, arguments) do
+    adapter = adapter()
+
+    if Code.ensure_loaded?(adapter) and function_exported?(adapter, callback, length(arguments)) do
+      apply(adapter, callback, arguments)
+    else
+      :ignore
+    end
   end
 
   defp unsupported_agent_tool_response(tool) do

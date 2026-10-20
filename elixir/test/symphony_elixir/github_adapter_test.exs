@@ -394,6 +394,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
 
     assert [%{"name" => "github_api"}] = binding.tool_specs
     assert :ok = Config.validate!()
+    assert :ignore = Tracker.claim_issue(%Issue{id: "17", identifier: "GH-17", state: "open"})
   end
 
   defp tracker_settings(provider_overrides \\ %{}) do
