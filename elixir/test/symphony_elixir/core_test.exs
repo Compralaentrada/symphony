@@ -1585,7 +1585,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md && #{required_skill_fixture_hook()}",
         codex_command: "#{codex_binary} app-server"
       )
 
@@ -1670,7 +1670,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md && #{required_skill_fixture_hook()}",
         codex_command: "#{codex_binary} app-server"
       )
 
@@ -1836,9 +1836,10 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md && #{required_skill_fixture_hook()}",
         codex_command: "#{codex_binary} app-server",
-        max_turns: 3
+        max_turns: 3,
+        prompt: "Use the configured prompt without rendering labels."
       )
 
       parent = self()
@@ -1875,7 +1876,7 @@ defmodule SymphonyElixir.CoreTest do
         description: "Still active after first turn",
         state: "In Progress",
         url: "https://example.org/issues/MT-247",
-        labels: []
+        labels: ["ready-for-agent"]
       }
 
       assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
@@ -1899,8 +1900,14 @@ defmodule SymphonyElixir.CoreTest do
         end)
 
       assert length(turn_texts) == 2
-      assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
-      refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
+      assert String.starts_with?(Enum.at(turn_texts, 0), "Use the configured prompt without rendering labels.")
+      assert Enum.at(turn_texts, 0) =~ "Use these repo-local skills when their conditions apply:"
+      assert Enum.at(turn_texts, 0) =~ "ponytail"
+      assert Enum.at(turn_texts, 0) =~ "tdd"
+      assert Enum.at(turn_texts, 0) =~ "code-review"
+      refute Enum.at(turn_texts, 0) =~ "impeccable"
+      refute Enum.at(turn_texts, 0) =~ "humanizer"
+      refute Enum.at(turn_texts, 1) =~ "Use these repo-local skills when their conditions apply:"
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
     after
@@ -1967,7 +1974,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md && #{required_skill_fixture_hook()}",
         codex_command: "#{codex_binary} app-server",
         max_turns: 2
       )

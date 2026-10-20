@@ -22,7 +22,13 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Workspace
 
       import SymphonyElixir.TestSupport,
-        only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
+        only: [
+          write_workflow_file!: 1,
+          write_workflow_file!: 2,
+          required_skill_fixture_hook: 0,
+          restore_env: 2,
+          stop_default_http_server: 0
+        ]
 
       setup do
         workflow_root =
@@ -63,6 +69,11 @@ defmodule SymphonyElixir.TestSupport do
     end
 
     :ok
+  end
+
+  def required_skill_fixture_hook do
+    "mkdir -p .agents/skills/ponytail .agents/skills/tdd .agents/skills/code-review && " <>
+      "touch .agents/skills/ponytail/SKILL.md .agents/skills/tdd/SKILL.md .agents/skills/code-review/SKILL.md"
   end
 
   def restore_env(key, nil), do: System.delete_env(key)
