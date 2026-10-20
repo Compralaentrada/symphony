@@ -88,6 +88,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
+    opts = Keyword.put(opts, :selected_repo_skills, if(is_nil(worker_host), do: Skills.select(issue)))
 
     with :ok <- ensure_skills_available(workspace, issue, worker_host),
          {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
@@ -103,7 +104,16 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp ensure_skills_available(workspace, issue, nil), do: Skills.ensure_available(workspace, issue)
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_codex_turns(
+         app_session,
+         workspace,
+         issue,
+         codex_update_recipient,
+         opts,
+         issue_state_fetcher,
+         turn_number,
+         max_turns
+       ) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
@@ -144,7 +154,11 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_turn_prompt(issue, opts, 1, _max_turns) do
+    issue
+    |> PromptBuilder.build_prompt(opts)
+    |> append_selected_skills(Keyword.get(opts, :selected_repo_skills), 1)
+  end
 
   defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
     """
@@ -157,6 +171,14 @@ defmodule SymphonyElixir.AgentRunner do
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
   end
+
+  defp append_selected_skills(prompt, selected_skills, 1) when is_list(selected_skills) do
+    skills = Enum.map_join(selected_skills, "\n", &"- `#{&1}`")
+
+    prompt <> "\n\nUse these repo-local skills when their conditions apply:\n" <> skills
+  end
+
+  defp append_selected_skills(prompt, _selected_skills, _turn_number), do: prompt
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do

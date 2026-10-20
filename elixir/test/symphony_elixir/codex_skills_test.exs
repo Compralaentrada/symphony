@@ -109,10 +109,21 @@ defmodule SymphonyElixir.Codex.SkillsTest do
     assert Skills.select(%Issue{labels: ["docs"]}) == [
              "ponytail",
              "tdd",
+             "code-review"
+           ]
+
+    assert Skills.select(%Issue{labels: ["user-facing"]}) == [
+             "ponytail",
+             "tdd",
              "code-review",
              "humanizer"
            ]
 
-    assert Skills.select(%Issue{labels: ["writing-only"]}) == ["code-review", "humanizer"]
+    assert Skills.select(%Issue{labels: ["writing-only"]}) == ["code-review"]
+
+    assert Skills.select(%Issue{labels: ["writing-only", "user-facing"]}) == [
+             "code-review",
+             "humanizer"
+           ]
   end
 end

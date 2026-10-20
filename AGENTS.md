@@ -14,4 +14,4 @@ This repo uses the single-context layout. See `docs/agents/domain.md`.
 
 ### Skills for local Codex runs
 
-Codex discovers the pinned skills in `.agents/skills` from the checked-out project. Select them by issue labels: code work uses Ponytail and TDD, and code-review runs before a PR; `frontend`, `front-end`, or `ui` adds Impeccable; `writing`, `copywriting`, `docs`, or `documentation` adds Humanizer for person-directed text. `writing-only` and `text-only` skip the code skills. Before acting, verify each selected `SKILL.md`; if one is missing, stop and report its name and path.
+Codex discovers the pinned skills in `.agents/skills` from the checked-out project. Local code work uses Ponytail and TDD, and code-review runs before a PR. Add Impeccable for `frontend`, `front-end`, or `ui` labels. Use Humanizer only for person-directed writing; `copywriting`, `customer-facing`, `humanizer`, and `user-facing` labels select it. `writing-only` and `text-only` skip Ponytail and TDD. Before acting, verify each selected `SKILL.md`; if one is missing, stop and report its name and path.

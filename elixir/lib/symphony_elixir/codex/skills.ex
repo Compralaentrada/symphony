@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Codex.Skills do
 
   @code_skills ["ponytail", "tdd"]
   @frontend_labels ["frontend", "front-end", "ui"]
-  @writing_labels ["writing", "copywriting", "docs", "documentation", "humanizer", "writing-only", "text-only"]
+  @writing_labels ["copywriting", "customer-facing", "humanizer", "user-facing"]
 
   @spec select(Issue.t()) :: [String.t()]
   def select(%Issue{labels: labels}) when is_list(labels) do
