@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.{AppServer, Skills}
-  alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Pipeline, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -98,7 +98,14 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
-    opts = Keyword.put(opts, :selected_repo_skills, if(is_nil(worker_host), do: Skills.select(issue)))
+
+    selected_repo_skills =
+      if is_nil(worker_host) do
+        skills = Skills.select(issue)
+        if Keyword.has_key?(opts, :phase), do: List.delete(skills, "code-review"), else: skills
+      end
+
+    opts = Keyword.put(opts, :selected_repo_skills, selected_repo_skills)
 
     with :ok <- ensure_skills_available(workspace, issue, worker_host),
          {:ok, session} <-
@@ -151,14 +158,14 @@ defmodule SymphonyElixir.AgentRunner do
       )
 
     try do
-      case run_phase_turn(session, prompt, issue, on_message, message_key) do
+      case run_phase_turn(session, prompt, issue, on_message, message_key, phase) do
         {:ok, report} ->
           {:phase_result, report}
 
-        {:error, {:invalid_phase_report, _text}} ->
+        {:error, {:invalid_phase_report, _details}} ->
           Process.delete(message_key)
 
-          case run_phase_turn(session, phase_report_correction_prompt(), issue, on_message, message_key) do
+          case run_phase_turn(session, phase_report_correction_prompt(), issue, on_message, message_key, phase) do
             {:ok, report} -> {:phase_result, report}
             error -> error
           end
@@ -171,16 +178,21 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp run_phase_turn(session, prompt, issue, on_message, message_key) do
+  defp run_phase_turn(session, prompt, issue, on_message, message_key, phase) do
     case AppServer.run_turn(session, prompt, issue, on_message: on_message) do
-      {:ok, _turn} -> decode_phase_report(phase_report_text(Process.get(message_key)))
-      error -> error
+      {:ok, _turn} ->
+        with {:ok, report} <- decode_phase_report(phase_report_text(Process.get(message_key))) do
+          Pipeline.normalize_phase_result(report, Atom.to_string(phase))
+        end
+
+      error ->
+        error
     end
   end
 
   defp phase_report_correction_prompt do
     """
-    The previous response did not match the pipeline's required phase report. Return exactly one JSON object using the fields and allowed outcome from the preceding phase instructions. Preserve its findings and conclusions; do not repeat the work. The pipeline's JSON report contract overrides any skill's preferred prose format.
+    The previous response did not match the pipeline's required phase report. Return exactly one JSON object using the fields and allowed outcome from the preceding phase instructions, including the exact key names required for each finding. Preserve its findings and conclusions; do not repeat the work. The pipeline's JSON report contract overrides any skill's preferred prose format.
     """
   end
 
@@ -201,7 +213,7 @@ defmodule SymphonyElixir.AgentRunner do
     Pipeline phase: independent QA. Review and test the accepted commit #{Keyword.get(opts, :sha)} on branch #{Keyword.get(opts, :branch)}.
     Prior findings to recheck after Build: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
     Required checks: #{Enum.join(Keyword.get(opts, :required_checks, []), ", ")}.
-    Symphony runs these configured checks on the workspace after your review. Do not claim their result or evidence; return an empty checks list. Give each defect an id, reproduction steps, and the violated criterion.
+    Symphony runs these configured checks on the workspace after your review. Do not claim their result or evidence; return an empty checks list. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings.
     Do not modify files or write to GitHub. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end
@@ -210,7 +222,7 @@ defmodule SymphonyElixir.AgentRunner do
     """
     Pipeline phase: autonomous code review. Inspect the diff and accepted commit #{Keyword.get(opts, :sha)} on branch #{Keyword.get(opts, :branch)}.
     Prior finding IDs to resolve explicitly: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
-    Do not modify files or write to GitHub. Give each defect an id, reproduction steps, and the violated criterion. Resolve prior finding ids explicitly.
+    Do not modify files or write to GitHub. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
     Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end
