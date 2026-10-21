@@ -54,7 +54,6 @@ defmodule SymphonyElixir.MixProject do
       dialyzer: [
         plt_add_apps: [:mix]
       ],
-      escript: escript(),
       releases: releases(),
       aliases: aliases(),
       deps: deps()
@@ -93,17 +92,8 @@ defmodule SymphonyElixir.MixProject do
   defp aliases do
     [
       setup: ["deps.get"],
-      build: ["escript.build"],
+      build: ["compile"],
       lint: ["specs.check", "credo --strict"]
-    ]
-  end
-
-  defp escript do
-    [
-      app: nil,
-      main_module: SymphonyElixir.CLI,
-      name: "symphony",
-      path: "bin/symphony"
     ]
   end
 
