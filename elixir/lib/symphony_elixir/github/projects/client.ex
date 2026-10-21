@@ -1666,6 +1666,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp ensure_pull_request_sha(%{sha: sha}, sha) when is_binary(sha), do: :ok
   defp ensure_pull_request_sha(_pr, _sha), do: {:error, :pull_request_head_sha_mismatch}
 
+  # shortcut: Project status updates lack compare-and-set, upgrade when GitHub supports atomic conditional writes.
   defp set_item_status(ref, status, settings, request_fun) do
     option_id = Map.get(ref, :status_option_ids, Map.get(ref, "status_option_ids", %{}))[status]
 
