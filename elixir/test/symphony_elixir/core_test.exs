@@ -119,6 +119,13 @@ defmodule SymphonyElixir.CoreTest do
     assert get_in(tracker, ["provider", "owner"]) == "Compralaentrada"
     assert get_in(tracker, ["provider", "project_number"]) == 9
     assert get_in(tracker, ["provider", "token"]) == "$GITHUB_TOKEN"
+    assert get_in(tracker, ["active_states"]) == ["Ready", "Building", "QA", "Review", "Human Review"]
+    assert get_in(tracker, ["terminal_states"]) == ["closed", "Dropped"]
+    refute Map.has_key?(tracker["provider"], "status_field")
+    refute Map.has_key?(tracker["provider"], "status_values")
+
+    assert :ok = Config.validate!()
+    assert SymphonyElixir.Pipeline.enabled?()
 
     assert get_in(tracker, ["provider", "repositories"]) == [
              %{

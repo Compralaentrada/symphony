@@ -1233,8 +1233,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp pipeline_claimable_state?(issue) do
-    status_values = Map.get(issue.native_ref || %{}, :status_values, %{})
-    issue.state in [Map.get(status_values, "ready", "Ready"), Map.get(status_values, "building", "Building")]
+    issue.state in ["Ready", "Building"]
   end
 
   defp spawn_pipeline_worker(state, issue, task, phase, phase_attempt, retry_attempt, worker_host) do

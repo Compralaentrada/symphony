@@ -18,6 +18,9 @@ En el pipeline de Projects, el estado visible del Project determina el despacho.
 pueden pasar a `Blocked`. Mover una tarea de `Human Review` a `Ready` solicita correcciones sobre la
 misma rama y PR.
 
+El tablero usa el campo `Status` y las opciones canónicas de Symphony: `Backlog`, `Ready`, `Building`,
+`QA`, `Review`, `Human Review`, `Blocked`, `Done` y `Dropped`.
+
 El runtime también incluye adaptadores para GitHub Issues, Linear, Jira Cloud, Asana y GitLab. El
 pipeline multi-repositorio descrito aquí está centrado en GitHub Projects v2.
 
