@@ -13,16 +13,6 @@ tracker:
   provider:
     owner: Compralaentrada
     project_number: 9
-    status_field: Status
-    status_values:
-      ready: Ready
-      building: Building
-      qa: QA
-      review: Review
-      human_review: Human Review
-      blocked: Blocked
-      dropped: Dropped
-      done: Done
     token: "$GITHUB_TOKEN"
     repositories:
       - repository: Compralaentrada/symphony

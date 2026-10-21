@@ -292,7 +292,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         id: "issue-phase-report",
         identifier: "MT-PHASE-REPORT",
         title: "Return a review report",
-        description: "Review the accepted commit and return the phase report.",
+        description: "Publish readable Markdown in GitHub comments, not raw JSON. Review the accepted commit and return the phase report.",
         state: "Review",
         url: "https://example.org/issues/MT-PHASE-REPORT",
         labels: ["backend"]
@@ -318,7 +318,14 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert length(turn_starts) == 2
       [initial_turn, correction_turn] = turn_starts
       assert get_in(initial_turn, ["params", "input", Access.at(0), "text"]) =~ "Do not invoke the repository's `code-review` skill or its Markdown report format"
+
+      assert get_in(initial_turn, ["params", "input", Access.at(0), "text"]) =~
+               "The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result."
+
       assert get_in(correction_turn, ["params", "input", Access.at(0), "text"]) =~ "Do not include headings, bullets, Markdown, code fences, or text outside the JSON object."
+
+      assert get_in(correction_turn, ["params", "input", Access.at(0), "text"]) =~
+               "The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result."
 
       schema = get_in(initial_turn, ["params", "outputSchema"])
       assert schema["type"] == "object"

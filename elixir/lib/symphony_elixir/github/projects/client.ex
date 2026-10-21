@@ -9,8 +9,18 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   @default_graphql_url "https://api.github.com/graphql"
   @page_size 100
-  @statuses ["ready", "building", "blocked", "done"]
-  @pipeline_statuses ["qa", "review", "human_review", "dropped"]
+  @status_field "Status"
+  @statuses %{
+    backlog: "Backlog",
+    ready: "Ready",
+    building: "Building",
+    qa: "QA",
+    review: "Review",
+    human_review: "Human Review",
+    blocked: "Blocked",
+    done: "Done",
+    dropped: "Dropped"
+  }
   @project_query """
   query SymphonyProject($owner: String!, $number: Int!, $after: String) {
     user(login: $owner) { projectV2(number: $number) { ...SymphonyProjectFields } }
@@ -446,30 +456,20 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     with {:ok, settings} <- settings(tracker_settings),
          {:ok, metadata, items} <- project_items(settings, request_fun),
          {:ok, issues} <- normalize_items(items, metadata, settings, request_fun) do
-      # Building items are reconciled by ID; only Ready items enter the dispatch poll.
-      dispatch_ready? =
-        MapSet.member?(requested, normalize_state(settings.statuses.ready)) and
-          not pipeline_statuses?(settings.statuses)
-
       issues
-      |> Enum.filter(&requested_state?(&1, requested, dispatch_ready?, settings))
+      |> Enum.filter(&requested_state?(&1, requested))
       |> then(&{:ok, &1})
     end
   end
 
-  defp requested_state?(issue, requested, dispatch_ready?, settings) do
+  defp requested_state?(issue, requested) do
     normalized = normalize_state(issue.state)
 
-    cond do
-      normalized == "closed" ->
-        MapSet.member?(requested, "closed") or
-          MapSet.member?(requested, normalize_state(Map.get(issue.native_ref, :project_status)))
-
-      dispatch_ready? ->
-        normalized == normalize_state(settings.statuses.ready)
-
-      true ->
-        MapSet.member?(requested, normalized)
+    if normalized == "closed" do
+      MapSet.member?(requested, "closed") or
+        MapSet.member?(requested, normalize_state(Map.get(issue.native_ref, :project_status)))
+    else
+      MapSet.member?(requested, normalized)
     end
   end
 
@@ -556,7 +556,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
              status_option_ids: option_ids
            }}
         else
-          {:error, {:github_projects_configuration_error, "Project status field #{inspect(settings.status_field)} is missing configured options: #{Enum.join(missing, ", ")}."}}
+          {:error, {:github_projects_configuration_error, "Project status field #{inspect(settings.status_field)} is missing canonical options: #{Enum.join(missing, ", ")}."}}
         end
     end
   end
@@ -621,14 +621,19 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     id = "#{repository}##{number}"
 
     dispatch_status? =
-      status_in?(project_status, [settings.statuses.ready, settings.statuses.building] ++ pipeline_status_values(settings.statuses))
+      status_in?(project_status, [
+        settings.statuses.ready,
+        settings.statuses.building,
+        settings.statuses.qa,
+        settings.statuses.review,
+        settings.statuses.human_review
+      ])
 
     native_ref = %{
       project_item_id: item["id"],
       project_id: metadata.project_id,
       status_field_id: metadata.status_field_id,
       status_option_ids: metadata.status_option_ids,
-      status_values: Map.new(settings.statuses, fn {key, value} -> {Atom.to_string(key), value} end),
       project_status: project_status,
       issue_node_id: content["id"],
       issue_state: content["state"],
@@ -1946,16 +1951,15 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     provider = provider_settings(tracker_settings)
 
     with {:ok, project} <- project_settings(provider),
-         {:ok, statuses} <- status_settings(provider),
          {:ok, profiles} <- repository_settings(provider),
          {:ok, graphql_url} <- graphql_url_setting(provider),
          {:ok, token} <- token_setting(provider),
          :ok <- validate_merge_policy(provider["merge_policy"]),
-         :ok <- validate_pipeline_profiles(statuses, profiles),
-         :ok <- validate_routing_settings(tracker_settings, statuses) do
+         :ok <- validate_pipeline_profiles(profiles),
+         :ok <- validate_routing_settings(tracker_settings) do
       {:ok,
        Map.merge(project, %{
-         statuses: statuses,
+         statuses: @statuses,
          repositories: profiles,
          graphql_url: String.trim_trailing(graphql_url, "/"),
          token: token,
@@ -1969,20 +1973,11 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp project_settings(provider) do
     owner = normalize_string(provider["owner"])
     project_number = provider["project_number"]
-    status_field = normalize_string(provider["status_field"])
 
     cond do
       is_nil(owner) -> invalid_settings(:missing_owner)
       not is_integer(project_number) or project_number <= 0 -> invalid_settings(:invalid_project_number)
-      is_nil(status_field) -> invalid_settings(:missing_status_field)
-      true -> {:ok, %{owner: owner, project_number: project_number, status_field: status_field}}
-    end
-  end
-
-  defp status_settings(provider) do
-    case status_values(provider["status_values"]) do
-      nil -> invalid_settings(:invalid_status_values)
-      statuses -> {:ok, statuses}
+      true -> {:ok, %{owner: owner, project_number: project_number, status_field: @status_field}}
     end
   end
 
@@ -2009,34 +2004,21 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       else: invalid_settings(:missing_token)
   end
 
-  defp validate_routing_settings(tracker_settings, statuses) do
+  defp validate_routing_settings(tracker_settings) do
     cond do
       Map.get(tracker_settings, :required_labels, []) not in [nil, []] ->
         invalid_settings(:required_labels_not_supported)
 
-      not valid_active_states(Map.get(tracker_settings, :active_states), statuses) ->
-        invalid_settings(:active_states_must_include_ready_and_building)
+      not valid_active_states(Map.get(tracker_settings, :active_states)) ->
+        invalid_settings(:active_states_must_include_canonical_active_states)
 
-      not valid_terminal_states(Map.get(tracker_settings, :terminal_states), statuses) ->
-        invalid_settings(:terminal_states_must_preserve_requeue_and_include_closed)
+      not valid_terminal_states(Map.get(tracker_settings, :terminal_states)) ->
+        invalid_settings(:terminal_states_must_include_closed_and_dropped)
 
       true ->
         :ok
     end
   end
-
-  defp status_values(values) when is_map(values) do
-    result = Map.new(values, fn {key, value} -> {to_string(key), normalize_string(value)} end)
-    pipeline_configured? = Enum.any?(@pipeline_statuses, &Map.has_key?(result, &1))
-    keys = if pipeline_configured?, do: @statuses ++ @pipeline_statuses, else: @statuses
-
-    if Enum.all?(keys, &present_string?(Map.get(result, &1))) and
-         length(Enum.uniq(Map.take(result, keys) |> Map.values())) == length(keys) do
-      Map.new(keys, fn key -> {String.to_existing_atom(key), result[key]} end)
-    end
-  end
-
-  defp status_values(_values), do: nil
 
   defp repository_profiles(profiles) when is_list(profiles) and profiles != [] do
     Enum.reduce_while(profiles, %{}, fn profile, acc ->
@@ -2073,41 +2055,38 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp normalize_required_checks(_checks), do: nil
 
-  defp validate_pipeline_profiles(statuses, profiles) do
-    if pipeline_statuses?(statuses) and Enum.any?(profiles, fn {_repo, profile} -> profile.required_checks == [] end) do
+  defp validate_pipeline_profiles(profiles) do
+    if Enum.any?(profiles, fn {_repo, profile} -> profile.required_checks == [] end) do
       invalid_settings(:pipeline_requires_repository_required_checks)
     else
       :ok
     end
   end
 
-  defp pipeline_statuses?(statuses), do: Enum.all?(@pipeline_statuses, &Map.has_key?(statuses, String.to_existing_atom(&1)))
+  defp valid_active_states(states) when is_list(states) do
+    normalized = MapSet.new(states, &normalize_state/1)
 
-  defp pipeline_status_values(statuses) do
-    if pipeline_statuses?(statuses), do: Enum.map([:qa, :review, :human_review], &Map.fetch!(statuses, &1)), else: []
+    Enum.all?(
+      [@statuses.ready, @statuses.building, @statuses.qa, @statuses.review, @statuses.human_review],
+      &MapSet.member?(normalized, normalize_state(&1))
+    ) and
+      Enum.all?(
+        [@statuses.backlog, @statuses.blocked, @statuses.done, @statuses.dropped],
+        &(not MapSet.member?(normalized, normalize_state(&1)))
+      )
   end
 
-  defp valid_active_states(states, statuses) when is_list(states) do
+  defp valid_active_states(_states), do: false
+
+  defp valid_terminal_states(states) when is_list(states) do
     normalized = MapSet.new(states, &normalize_state/1)
-    active_pipeline = Enum.map([:qa, :review, :human_review], &Map.get(statuses, &1)) |> Enum.reject(&is_nil/1)
-
-    Enum.all?([statuses.ready, statuses.building], &MapSet.member?(normalized, normalize_state(&1))) and
-      Enum.all?(active_pipeline, &MapSet.member?(normalized, normalize_state(&1))) and
-      Enum.all?([statuses.blocked, statuses.done, Map.get(statuses, :dropped)], &(is_nil(&1) or not MapSet.member?(normalized, normalize_state(&1))))
-  end
-
-  defp valid_active_states(_states, _statuses), do: false
-
-  defp valid_terminal_states(states, statuses) when is_list(states) do
-    normalized = MapSet.new(states, &normalize_state/1)
-    dropped = Map.get(statuses, :dropped)
 
     MapSet.member?(normalized, "closed") and
-      Enum.all?([statuses.done, statuses.blocked], &(not MapSet.member?(normalized, normalize_state(&1)))) and
-      (is_nil(dropped) or MapSet.member?(normalized, normalize_state(dropped)))
+      Enum.all?([@statuses.done, @statuses.blocked], &(not MapSet.member?(normalized, normalize_state(&1)))) and
+      MapSet.member?(normalized, normalize_state(@statuses.dropped))
   end
 
-  defp valid_terminal_states(_states, _statuses), do: false
+  defp valid_terminal_states(_states), do: false
 
   defp invalid_settings(reason),
     do: {:error, {:invalid_github_projects_settings, reason}}

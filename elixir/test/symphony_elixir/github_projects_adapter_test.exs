@@ -202,8 +202,46 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert {:error, {:invalid_github_projects_settings, :required_labels_not_supported}} =
              Client.validate_settings(%{settings | required_labels: ["ready-for-agent"]})
 
-    assert {:error, {:invalid_github_projects_settings, :terminal_states_must_preserve_requeue_and_include_closed}} =
+    assert {:error, {:invalid_github_projects_settings, :terminal_states_must_include_closed_and_dropped}} =
              Client.validate_settings(%{settings | terminal_states: ["closed", "Done"]})
+  end
+
+  test "legacy Projects status mappings do not affect canonical adaptation" do
+    legacy_statuses = %{
+      "backlog" => "Ideas",
+      "ready" => "Queued",
+      "building" => "Implementing",
+      "qa" => "Verifying",
+      "review" => "Auditing",
+      "human_review" => "Awaiting Human",
+      "blocked" => "Needs Help",
+      "done" => "Integrated",
+      "dropped" => "Discarded"
+    }
+
+    settings =
+      tracker_settings(%{
+        "status_field" => "Workflow",
+        "status_values" => legacy_statuses,
+        "repositories" => [
+          %{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]}
+        ]
+      })
+      |> Map.merge(%{
+        active_states: ["Ready", "Building", "QA", "Review", "Human Review"],
+        terminal_states: ["closed", "Dropped"]
+      })
+
+    response = project_response([issue_item("octo/app", 7, "Ready")])
+
+    assert {:ok, [issue]} =
+             Client.fetch_issues_by_states_for_test(["Ready"], settings, fn _query, _variables, _settings ->
+               {:ok, %{status: 200, body: response}}
+             end)
+
+    assert issue.state == "Ready"
+    assert issue.native_ref.project_status == "Ready"
+    refute Map.has_key?(issue.native_ref, :status_values)
   end
 
   test "created pipeline PR includes the Build report body" do
@@ -312,6 +350,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
   test "pipeline Projects polling returns QA, Review, and Human Review items as dispatchable" do
     statuses = %{
+      "backlog" => "Backlog",
       "ready" => "Ready",
       "building" => "Building",
       "qa" => "QA",
@@ -324,7 +363,6 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     settings =
       tracker_settings(%{
-        "status_values" => statuses,
         "repositories" => [
           %{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["mix test"]}
         ]
@@ -377,8 +415,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     settings =
       tracker_settings(%{
         "repositories" => [
-          %{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true"},
-          %{"repository" => "octo/docs", "base_branch" => "main", "prepare_command" => "true"}
+          %{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]},
+          %{"repository" => "octo/docs", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]}
         ]
       })
 
@@ -575,8 +613,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     settings =
       tracker_settings(%{
         "repositories" => [
-          %{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true"},
-          %{"repository" => "octo/docs", "base_branch" => "main", "prepare_command" => "true"}
+          %{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]},
+          %{"repository" => "octo/docs", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]}
         ]
       })
 
@@ -595,8 +633,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     settings =
       tracker_settings(%{
         "repositories" => [
-          %{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true"},
-          %{"repository" => "octo/docs", "base_branch" => "main", "prepare_command" => "true"}
+          %{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]},
+          %{"repository" => "octo/docs", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]}
         ]
       })
 
@@ -688,25 +726,19 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     %{
       kind: "github_projects",
       required_labels: [],
-      active_states: ["Ready", "Building"],
-      terminal_states: ["closed"],
+      active_states: ["Ready", "Building", "QA", "Review", "Human Review"],
+      terminal_states: ["closed", "Dropped"],
       provider:
         Map.merge(
           %{
             "owner" => "acme",
             "project_number" => 12,
-            "status_field" => "Status",
-            "status_values" => %{
-              "ready" => "Ready",
-              "building" => "Building",
-              "blocked" => "Blocked",
-              "done" => "Done"
-            },
             "repositories" => [
               %{
                 "repository" => "octo/app",
                 "base_branch" => "main",
-                "prepare_command" => "true"
+                "prepare_command" => "true",
+                "required_checks" => ["true"]
               }
             ],
             "token" => "test-token"
@@ -729,10 +761,15 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
                   "id" => "PVTSSF_status",
                   "name" => "Status",
                   "options" => [
+                    %{"id" => "option-backlog", "name" => "Backlog"},
                     %{"id" => "option-ready", "name" => "Ready"},
                     %{"id" => "option-building", "name" => "Building"},
+                    %{"id" => "option-qa", "name" => "QA"},
+                    %{"id" => "option-review", "name" => "Review"},
+                    %{"id" => "option-human-review", "name" => "Human Review"},
                     %{"id" => "option-blocked", "name" => "Blocked"},
-                    %{"id" => "option-done", "name" => "Done"}
+                    %{"id" => "option-done", "name" => "Done"},
+                    %{"id" => "option-dropped", "name" => "Dropped"}
                   ]
                 }
               ]
@@ -836,17 +873,16 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       ---
       tracker:
         kind: github_projects
-        active_states: [Ready, Building]
-        terminal_states: [closed]
+        active_states: [Ready, Building, QA, Review, Human Review]
+        terminal_states: [closed, Dropped]
         provider:
           owner: acme
           project_number: 12
-          status_field: Status
-          status_values: {ready: Ready, building: Building, blocked: Blocked, done: Done}
           repositories:
             - repository: octo/app
               base_branch: main
               prepare_command: "true"
+              required_checks: ["true"]
           token: test-token
       ---
 
