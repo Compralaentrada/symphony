@@ -24,8 +24,9 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         Jason.encode!(%{
           "method" => "turn/completed",
           "params" => %{
+            "threadId" => "failed-phase-thread",
             "turn" => %{
-              "id" => "review-output-turn",
+              "id" => "failed-phase-turn",
               "status" => "failed",
               "error" => %{"message" => "The final output did not satisfy its schema."}
             }
@@ -92,6 +93,159 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
     end
   end
 
+  test "Build waits for its own turn when another thread completes first" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-build-foreign-turn-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-input.trace")
+      File.mkdir_p!(test_root)
+
+      report = %{
+        "outcome" => "ready",
+        "summary" => "Build completed",
+        "criteria" => ["The requested change is implemented."],
+        "changes" => ["Updated the implementation."],
+        "checks" => ["mix test"],
+        "risks" => [],
+        "next_step" => "Continue to QA.",
+        "reason" => nil,
+        "sha" => String.duplicate("b", 40)
+      }
+
+      foreign_delta =
+        Jason.encode!(%{
+          "method" => "item/agentMessage/delta",
+          "params" => %{
+            "threadId" => "review-subagent-thread",
+            "turnId" => "review-subagent-turn",
+            "itemId" => "review-subagent-output",
+            "delta" => "## Spec\n\n- Markdown review finding; this is not a phase report."
+          }
+        })
+
+      foreign_completion =
+        Jason.encode!(%{
+          "method" => "turn/completed",
+          "params" => %{
+            "threadId" => "review-subagent-thread",
+            "turn" => %{"id" => "review-subagent-turn", "status" => "completed", "items" => []}
+          }
+        })
+
+      unidentified_completion = Jason.encode!(%{"method" => "turn/completed"})
+
+      foreign_failure =
+        Jason.encode!(%{
+          "method" => "turn/failed",
+          "params" => %{
+            "threadId" => "review-subagent-thread",
+            "turn" => %{
+              "id" => "review-subagent-turn",
+              "status" => "failed",
+              "error" => %{"message" => "The review subagent failed."}
+            }
+          }
+        })
+
+      foreign_cancellation =
+        Jason.encode!(%{
+          "method" => "turn/cancelled",
+          "params" => %{
+            "threadId" => "review-subagent-thread",
+            "turn" => %{"id" => "review-subagent-turn", "status" => "cancelled"}
+          }
+        })
+
+      report_delta =
+        Jason.encode!(%{
+          "method" => "item/agentMessage/delta",
+          "params" => %{
+            "threadId" => "build-root-thread",
+            "turnId" => "build-root-turn",
+            "itemId" => "build-root-output",
+            "delta" => Jason.encode!(report)
+          }
+        })
+
+      completion =
+        Jason.encode!(%{
+          "method" => "turn/completed",
+          "params" => %{
+            "threadId" => "build-root-thread",
+            "turn" => %{"id" => "build-root-turn", "status" => "completed", "items" => []}
+          }
+        })
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> '#{trace_file}'
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"build-root-thread"}}}' ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"build-root-turn"}}}'
+            printf '%s\\n' '#{foreign_delta}'
+            printf '%s\\n' '#{unidentified_completion}'
+            printf '%s\\n' '#{foreign_failure}'
+            printf '%s\\n' '#{foreign_cancellation}'
+            printf '%s\\n' '#{foreign_completion}'
+            printf '%s\\n' '#{report_delta}'
+            printf '%s\\n' '#{completion}'
+            exit 0
+            ;;
+          *) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: required_skill_fixture_hook(),
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-build-foreign-turn",
+        identifier: "MT-BUILD-FOREIGN-TURN",
+        title: "Return the Build report",
+        description: "Implement the change and return the Build phase report.",
+        state: "Building",
+        url: "https://example.org/issues/MT-BUILD-FOREIGN-TURN",
+        labels: ["backend"]
+      }
+
+      assert %{"outcome" => "ready", "summary" => "Build completed"} =
+               AgentRunner.run(issue, nil,
+                 phase: :build,
+                 branch: "symphony/mt-build-foreign-turn"
+               )
+
+      turn_starts =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.filter(&(&1["method"] == "turn/start"))
+
+      assert length(turn_starts) == 1
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "QA phase corrects schema-invalid findings before returning a report" do
     test_root =
       Path.join(
@@ -135,12 +289,51 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         "sha" => report["sha"]
       }
 
-      report_delta = fn report ->
+      report_delta = fn report, turn_id ->
         Jason.encode!(%{
           "method" => "item/agentMessage/delta",
-          "params" => %{"itemId" => "qa-report", "delta" => Jason.encode!(report)}
+          "params" => %{
+            "threadId" => "qa-report-thread",
+            "turnId" => turn_id,
+            "itemId" => "qa-report",
+            "delta" => Jason.encode!(report)
+          }
         })
       end
+
+      turn_completion = fn turn_id ->
+        Jason.encode!(%{
+          "method" => "turn/completed",
+          "params" => %{
+            "threadId" => "qa-report-thread",
+            "turn" => %{"id" => turn_id, "status" => "completed", "items" => []}
+          }
+        })
+      end
+
+      foreign_review_delta =
+        Jason.encode!(%{
+          "method" => "item/agentMessage/delta",
+          "params" => %{
+            "threadId" => "qa-review-subagent-thread",
+            "turnId" => "qa-review-subagent-turn",
+            "itemId" => "qa-review-subagent-output",
+            "delta" => "## Spec\n\n- This review prose is not the QA phase report."
+          }
+        })
+
+      foreign_review_completion =
+        Jason.encode!(%{
+          "method" => "turn/completed",
+          "params" => %{
+            "threadId" => "qa-review-subagent-thread",
+            "turn" => %{
+              "id" => "qa-review-subagent-turn",
+              "status" => "completed",
+              "items" => []
+            }
+          }
+        })
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -154,13 +347,15 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
           3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"qa-report-thread"}}}' ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"qa-report-turn"}}}'
-            printf '%s\\n' '#{report_delta.(invalid_report)}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '#{report_delta.(invalid_report, "qa-report-turn")}'
+            printf '%s\\n' '#{turn_completion.("qa-report-turn")}'
             ;;
           5)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"qa-report-correction"}}}'
-            printf '%s\\n' '#{report_delta.(report)}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '#{report_delta.(report, "qa-report-correction")}'
+            printf '%s\\n' '#{foreign_review_delta}'
+            printf '%s\\n' '#{foreign_review_completion}'
+            printf '%s\\n' '#{turn_completion.("qa-report-correction")}'
             exit 0
             ;;
           *) ;;
@@ -244,6 +439,8 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         Jason.encode!(%{
           "method" => "item/agentMessage/delta",
           "params" => %{
+            "threadId" => "structured-phase-report-thread",
+            "turnId" => "structured-phase-report-turn",
             "itemId" => "report-item",
             "delta" => "**Potential improvements**\n\nThe review is complete, with one suggestion."
           }
@@ -252,8 +449,23 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       report_delta =
         Jason.encode!(%{
           "method" => "item/agentMessage/delta",
-          "params" => %{"itemId" => "report-item", "delta" => Jason.encode!(report)}
+          "params" => %{
+            "threadId" => "structured-phase-report-thread",
+            "turnId" => "structured-phase-report-retry",
+            "itemId" => "report-item",
+            "delta" => Jason.encode!(report)
+          }
         })
+
+      turn_completion = fn turn_id ->
+        Jason.encode!(%{
+          "method" => "turn/completed",
+          "params" => %{
+            "threadId" => "structured-phase-report-thread",
+            "turn" => %{"id" => turn_id, "status" => "completed", "items" => []}
+          }
+        })
+      end
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -268,12 +480,12 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"structured-phase-report-turn"}}}'
             printf '%s\\n' '#{prose_delta}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '#{turn_completion.("structured-phase-report-turn")}'
             ;;
           5)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"structured-phase-report-retry"}}}'
             printf '%s\\n' '#{report_delta}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '#{turn_completion.("structured-phase-report-retry")}'
             exit 0
             ;;
           *) ;;
