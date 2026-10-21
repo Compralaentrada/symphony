@@ -990,7 +990,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp handoff_pull_request(issue, context, _report, _tracker_settings, settings, request_fun)
-       when context.lane in [:qa, :review, "qa", "review"] do
+       when context.lane in [:qa, :review, :finalize, "qa", "review", "finalize"] do
     return_existing_pull_request(issue, context, settings, request_fun)
   end
 

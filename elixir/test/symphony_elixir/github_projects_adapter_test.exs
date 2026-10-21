@@ -172,6 +172,115 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert Agent.get(remote_status, & &1) == "Ready"
   end
 
+  test "Finalize recovers and verifies the merged PR before closing the issue and moving it to Done" do
+    alias SymphonyElixir.Pipeline.Store
+
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    root = Path.join(System.tmp_dir!(), "symphony-project-finalize-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    number = System.unique_integer([:positive])
+    issue_id = "octo/app##{number}"
+    sha = String.duplicate("a", 40)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: issue_id,
+      branch_name: "symphony/octo-app-#{number}",
+      state: "Human Review",
+      native_ref: %{repository: "octo/app", base_branch: "main", issue_node_id: "I_issue_#{number}"}
+    }
+
+    task = %{"issue_id" => issue_id, "generation" => 1, "phase" => "finalize", "attempts" => %{"finalize" => 1}, "branch" => issue.branch_name, "base_branch" => "main", "current_sha" => sha}
+
+    assert :ok = Store.save_task(task)
+    assert :ok = Store.begin_phase(issue_id, 1, "finalize", 1)
+
+    merged_pr = %{
+      "id" => "PR_pipeline",
+      "number" => 107,
+      "url" => "https://github.com/octo/app/pull/107",
+      "state" => "MERGED",
+      "isDraft" => false,
+      "mergedAt" => "2026-10-21T09:00:00Z",
+      "baseRefName" => "main",
+      "baseRefOid" => "base-sha",
+      "headRefName" => issue.branch_name,
+      "headRefOid" => sha,
+      "reviewDecision" => nil,
+      "body" => "delivery"
+    }
+
+    {:ok, remote} = Agent.start_link(fn -> %{status: "Human Review", issue_state: "OPEN", events: []} end)
+
+    request_fun = fn query, _variables, _settings ->
+      Agent.get_and_update(remote, fn data ->
+        cond do
+          query =~ "SymphonyProject(" ->
+            issue_item = issue_item("octo/app", number, data.status, data.issue_state)
+            {{:ok, %{status: 200, body: project_response([issue_item])}}, data}
+
+          query =~ "SymphonyPipelinePullRequest" ->
+            events = [:pull_request_read | data.events]
+            body = %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [merged_pr]}}}}
+            {{:ok, %{status: 200, body: body}}, %{data | events: events}}
+
+          query =~ "SymphonyPipelineCloseIssue" ->
+            assert Enum.count(data.events, &(&1 == :pull_request_read)) >= 2
+            events = [:issue_closed | data.events]
+            body = %{"data" => %{"closeIssue" => %{"issue" => %{"id" => "I_issue_#{number}", "state" => "CLOSED", "url" => issue.url}}}}
+            {{:ok, %{status: 200, body: body}}, %{data | issue_state: "CLOSED", events: events}}
+
+          query =~ "SymphonyPipelineReportComments" ->
+            comments = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
+            {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}}}, data}
+
+          query =~ "SymphonyAddIssueComment" ->
+            comment = %{"id" => "IC_agent", "url" => "https://github.com/octo/app/issues/#{number}#issuecomment-1"}
+            body = %{"data" => %{"addComment" => %{"commentEdge" => %{"node" => comment}}}}
+            {{:ok, %{status: 200, body: body}}, data}
+
+          query =~ "SymphonySetProjectStatus" ->
+            body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
+            {{:ok, %{status: 200, body: body}}, %{data | status: "Done"}}
+
+          true ->
+            flunk("unexpected GitHub Projects query: #{query}")
+        end
+      end)
+    end
+
+    context = %{issue: issue, lane: :finalize, generation: 1, attempt: 1, task: task}
+
+    assert {:ok, result} =
+             Client.agent_operation(
+               issue,
+               context,
+               "handoff",
+               %{
+                 "outcome" => "merged",
+                 "report" => %{"outcome" => "merged", "summary" => "Merge verified.", "sha" => sha}
+               },
+               tracker_settings: tracker_settings(),
+               projects_request: request_fun
+             )
+
+    assert result["closed_issue"]["state"] == "CLOSED"
+    assert result["pull_request"]["merged"]
+    assert result["pull_request"]["head_sha"] == sha
+    assert result["project_item"]["status"] == "Done"
+    assert Enum.take(Agent.get(remote, &Enum.reverse(&1.events)), 3) == [:pull_request_read, :pull_request_read, :issue_closed]
+  end
+
   test "Review cannot hand off unresolved prior findings to Human Review" do
     finding = %{"id" => "QA-1", "reproduction" => "Run the failing case.", "criterion" => "The acceptance criterion passes."}
     context = %{task: %{"prior_findings" => [finding]}}
