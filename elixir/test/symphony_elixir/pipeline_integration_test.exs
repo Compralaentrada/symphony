@@ -19,11 +19,12 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     orchestrator = start_orchestrator()
 
     assert await(fn -> project_state(table, issue.id) == "Human Review" end)
-    assert %{number: pr_number, branch: branch, sha: "sha-one", draft: false} = pull_request(table, issue.id)
+    first_sha = lookup(table, {:remote_sha, issue.id})
+    assert %{number: pr_number, branch: branch, sha: ^first_sha, draft: false} = pull_request(table, issue.id)
     assert branch == issue.branch_name
     assert pull_request(table, issue.id).body =~ "Fixes octo/app#1"
     assert pull_request(table, issue.id).body =~ "Acceptance criterion completed."
-    assert pull_request(table, issue.id).body =~ "sha-one"
+    assert pull_request(table, issue.id).body =~ first_sha
     assert report_phases(table, issue.id) == [:build, :qa, :review]
 
     set_project_state(table, issue.id, "Done")
@@ -35,8 +36,10 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     orchestrator = start_orchestrator()
 
     assert await(fn -> project_state(table, issue.id) == "Human Review" and agent_calls(table, issue.id) == 6 end)
-    assert %{number: ^pr_number, branch: ^branch, sha: "sha-two", draft: false} = pull_request(table, issue.id)
-    assert pull_request(table, issue.id).body =~ "sha-two"
+    second_sha = lookup(table, {:remote_sha, issue.id})
+    assert second_sha != first_sha
+    assert %{number: ^pr_number, branch: ^branch, sha: ^second_sha, draft: false} = pull_request(table, issue.id)
+    assert pull_request(table, issue.id).body =~ second_sha
     assert report_phases(table, issue.id) == [:build, :qa, :review, :build, :qa, :review]
 
     set_pull_request_merged(table, issue.id, true)
@@ -103,14 +106,21 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
         no_changes.id => %{build: [no_changes()]},
         blocked.id => %{build: [blocked(), build("sha-three")], qa: [qa("sha-three")], review: [review("sha-three")]},
         transient.id => %{build: [{:error, :temporary_failure}, build("sha-four")], qa: [qa("sha-four")], review: [review("sha-four")]},
-        missing_check.id => %{build: [build("sha-six-old"), build("sha-six-fixed")], qa: [qa_missing_check("sha-six-old"), qa("sha-six-fixed")], review: [review("sha-six-fixed")]},
+        missing_check.id => %{
+          build: [build("sha-six-old"), build("sha-six-fixed")],
+          qa: [qa_missing_check("sha-six-old"), qa("sha-six-fixed")],
+          review: [Map.put(review("sha-six-fixed"), "resolutions", ["required-check:sh ./check.sh"])]
+        },
         unavailable_check.id => %{build: [build("sha-ten")], qa: [qa_missing_check("sha-ten")]}
       })
 
     path = pipeline_database!(table, retry_backoff_ms: 1)
-    workspace = Application.fetch_env!(:symphony_elixir, :pipeline_test_workspace)
+    workspace = ensure_test_workspace!(missing_check)
     File.write!(Path.join(workspace, "check.sh"), "if [ -f fail-once ]; then rm fail-once; exit 1; fi\nexit 0\n")
     File.write!(Path.join(workspace, "fail-once"), "fail once")
+    File.write!(Path.join(workspace, ".git/info/exclude"), "fail-once\n", [:append])
+    {_output, 0} = System.cmd("git", ["add", "check.sh"], cd: workspace, stderr_to_stdout: true)
+    {_output, 0} = System.cmd("git", ["commit", "-m", "add check fixture"], cd: workspace, stderr_to_stdout: true)
     missing_check = %{missing_check | native_ref: Map.put(missing_check.native_ref, :required_checks, ["sh ./check.sh"])}
     :ets.insert(table, {{:issue, missing_check.id}, missing_check})
     unavailable_check = %{unavailable_check | native_ref: Map.put(unavailable_check.native_ref, :required_checks, ["command-that-does-not-exist"])}
@@ -222,6 +232,92 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     File.rm_rf!(Path.dirname(path))
   end
 
+  test "QA host checks reject workspace drift after the accepted Build SHA" do
+    issue = issue("octo/app#11", 11)
+
+    table =
+      start_board([issue], %{
+        issue.id => %{
+          build: [build("dirty"), build("clean")],
+          qa: [qa("dirty"), qa("clean")],
+          review: [Map.put(review("clean"), "resolutions", ["workspace-sha-mismatch"])]
+        }
+      })
+
+    path = pipeline_database!(table)
+    :ets.insert(table, {{:dirty_once, issue.id}, true})
+    orchestrator = start_orchestrator()
+
+    assert await(fn -> project_state(table, issue.id) == "Human Review" end)
+    assert agent_calls(table, issue.id) == 5
+    assert report_phases(table, issue.id) == [:build, :qa, :build, :qa, :review]
+    assert lookup(table, {:agent_prior_findings, issue.id, :build, 2}) |> Enum.any?(&(&1["id"] == "workspace-sha-mismatch"))
+
+    assert table
+           |> lookup({:reports, issue.id})
+           |> Map.values()
+           |> Enum.any?(&String.contains?(&1, "workspace"))
+
+    stop_orchestrator(orchestrator)
+    File.rm_rf!(Path.dirname(path))
+  end
+
+  test "a QA report with findings returns to Build and keeps finding context through Review" do
+    issue = issue("octo/app#12", 12)
+    finding = %{"id" => "QA-12-1", "reproduction" => "Run the failing scenario.", "criterion" => "The result matches the acceptance criterion."}
+    qa_with_finding = Map.put(qa("first"), "findings", [finding])
+
+    table =
+      start_board([issue], %{
+        issue.id => %{
+          build: [build("first"), build("fixed"), build("fixed-two")],
+          qa: [qa_with_finding, qa("fixed"), qa("fixed-two")],
+          review: [review("fixed"), Map.put(review("fixed-two"), "resolutions", [finding["id"]])]
+        }
+      })
+
+    path = pipeline_database!(table)
+    orchestrator = start_orchestrator()
+
+    assert await(fn -> project_state(table, issue.id) == "Human Review" end)
+
+    assert agent_calls(table, issue.id) == 8
+    assert report_phases(table, issue.id) == [:build, :qa, :build, :qa, :review, :build, :qa, :review]
+    assert lookup(table, {:agent_prior_findings, issue.id, :build, 2}) == [finding]
+    assert lookup(table, {:agent_prior_findings, issue.id, :build, 3}) == [finding]
+    assert lookup(table, {:agent_prior_findings, issue.id, :review, 1}) == [finding]
+    assert lookup(table, {:agent_prior_findings, issue.id, :review, 2}) == [finding]
+
+    stop_orchestrator(orchestrator)
+    File.rm_rf!(Path.dirname(path))
+  end
+
+  test "a Review report with findings returns to Build instead of Human Review" do
+    issue = issue("octo/app#13", 13)
+    finding = %{"id" => "REV-13-1", "reproduction" => "Run the affected path.", "criterion" => "The implementation preserves the required behavior."}
+    review_with_finding = Map.put(review("first"), "findings", [finding])
+
+    table =
+      start_board([issue], %{
+        issue.id => %{
+          build: [build("first"), build("fixed")],
+          qa: [qa("first"), qa("fixed")],
+          review: [review_with_finding, Map.put(review("fixed"), "resolutions", [finding["id"]])]
+        }
+      })
+
+    path = pipeline_database!(table)
+    orchestrator = start_orchestrator()
+
+    assert await(fn -> project_state(table, issue.id) == "Human Review" end)
+    assert report_phases(table, issue.id) == [:build, :qa, :review, :build, :qa, :review]
+    assert lookup(table, {:agent_prior_findings, issue.id, :build, 2}) == [finding]
+    assert lookup(table, {:agent_prior_findings, issue.id, :review, 2}) == [finding]
+
+    stop_orchestrator(orchestrator)
+    File.rm_rf!(Path.dirname(path))
+  end
+
   defp start_board(issues, agent_results) do
     table = :ets.new(:pipeline_board, [:set, :public])
     Enum.each(issues, &:ets.insert(table, {{:issue, &1.id}, &1}))
@@ -241,7 +337,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     root = Path.join(System.tmp_dir!(), "symphony-pipeline-#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
     path = Path.join(root, "pipeline.sqlite3")
-    workspace = Path.join(root, "workspace")
+    workspace = Path.join(root, "workspaces")
     File.mkdir_p!(workspace)
     Application.put_env(:symphony_elixir, :pipeline_test_board, table)
     Application.put_env(:symphony_elixir, :github_projects_client_module, __MODULE__.FakeClient)
@@ -461,6 +557,26 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     end
   end
 
+  def ensure_test_workspace!(issue) do
+    workspace = workspace_path(issue)
+    File.mkdir_p!(workspace)
+
+    if not File.dir?(Path.join(workspace, ".git")) do
+      {_output, 0} = System.cmd("git", ["init", "-b", "main"], cd: workspace, stderr_to_stdout: true)
+      {_output, 0} = System.cmd("git", ["config", "user.name", "Pipeline Test"], cd: workspace, stderr_to_stdout: true)
+      {_output, 0} = System.cmd("git", ["config", "user.email", "pipeline-test@example.invalid"], cd: workspace, stderr_to_stdout: true)
+      {_output, 0} = System.cmd("git", ["commit", "--allow-empty", "-m", "initial"], cd: workspace, stderr_to_stdout: true)
+      {_output, 0} = System.cmd("git", ["switch", "-c", issue.branch_name], cd: workspace, stderr_to_stdout: true)
+    end
+
+    workspace
+  end
+
+  def workspace_path(issue) do
+    root = Application.fetch_env!(:symphony_elixir, :pipeline_test_workspace)
+    Path.join(root, SymphonyElixir.Workspace.workspace_key(issue))
+  end
+
   defp await(predicate, attempts \\ 400)
   defp await(_predicate, 0), do: false
 
@@ -478,19 +594,40 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
   def run(issue, recipient, opts) do
     phase = Keyword.fetch!(opts, :phase)
     table = Application.fetch_env!(:symphony_elixir, :pipeline_test_board)
+    workspace = SymphonyElixir.PipelineIntegrationTest.ensure_test_workspace!(issue)
 
     if phase == :qa do
-      send(recipient, {:worker_runtime_info, issue.id, %{workspace_path: Application.fetch_env!(:symphony_elixir, :pipeline_test_workspace)}})
+      send(recipient, {:worker_runtime_info, issue.id, %{workspace_path: workspace, worker_host: Keyword.get(opts, :worker_host)}})
     end
 
     count = :ets.update_counter(table, {:agent_calls, issue.id, phase}, {2, 1}, {{:agent_calls, issue.id, phase}, 0})
     result = table |> :ets.lookup({:agent_result, issue.id, phase, count}) |> hd() |> elem(1)
+    :ets.insert(table, {{:agent_prior_findings, issue.id, phase, count}, Keyword.get(opts, :prior_findings, [])})
 
-    if phase == :build and is_map(result) and is_binary(result["sha"]) do
-      :ets.insert(table, {{:remote_sha, issue.id}, result["sha"]})
+    case {phase, result} do
+      {:build, %{"sha" => sha} = result} when is_binary(sha) ->
+        File.rm_rf!(Path.join(workspace, "qa-mutation"))
+        File.write!(Path.join(workspace, "delivery.txt"), sha)
+        {_output, 0} = System.cmd("git", ["add", "delivery.txt"], cd: workspace, stderr_to_stdout: true)
+        {_output, 0} = System.cmd("git", ["commit", "-m", "deliver #{sha}"], cd: workspace, stderr_to_stdout: true)
+        {remote_sha, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: workspace, stderr_to_stdout: true)
+        remote_sha = String.trim(remote_sha)
+        :ets.insert(table, {{:remote_sha, issue.id}, remote_sha})
+        Map.put(result, "sha", remote_sha)
+
+      {phase, %{} = result} when phase in [:qa, :review] ->
+        result = Map.put(result, "sha", :ets.lookup_element(table, {:remote_sha, issue.id}, 2))
+
+        if phase == :qa and :ets.lookup(table, {:dirty_once, issue.id}) != [] do
+          :ets.delete(table, {:dirty_once, issue.id})
+          File.write!(Path.join(workspace, "qa-mutation"), "QA changed the delivered workspace")
+        end
+
+        result
+
+      _ ->
+        result
     end
-
-    result
   end
 end
 

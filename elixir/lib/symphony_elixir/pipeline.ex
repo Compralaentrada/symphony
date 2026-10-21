@@ -137,6 +137,7 @@ defmodule SymphonyElixir.Pipeline do
         "phase" => "build",
         "status" => "building",
         "attempts" => %{},
+        "prior_findings" => [],
         "current_sha" => nil,
         "pr_number" => nil
       }
@@ -253,27 +254,63 @@ defmodule SymphonyElixir.Pipeline do
 
   defp finish_valid_phase(issue, task, "review", attempt, %{"outcome" => "passed", "sha" => sha} = result) do
     with :ok <- ensure_current_sha(task, sha) do
-      next = %{task | "phase" => "review", "status" => "human_review"}
+      case pending_findings(task, result) do
+        [] ->
+          next =
+            task
+            |> Map.put("phase", "review")
+            |> Map.put("status", "human_review")
+            |> Map.put("prior_findings", [])
 
-      ops =
-        report_ops(next, "review", attempt, result) ++
-          [
-            operation(next, "pr_stage", %{"stage" => "ready"}),
-            status_op(next, :human_review, nil, attempt)
-          ]
+          ops =
+            report_ops(next, "review", attempt, result) ++
+              [
+                operation(next, "pr_stage", %{"stage" => "ready"}),
+                status_op(next, :human_review, nil, attempt)
+              ]
 
-      commit(issue, next, "review", attempt, result, ops)
+          commit(issue, next, "review", attempt, result, ops)
+
+        findings ->
+          result =
+            Map.merge(result, %{
+              "outcome" => "changes_requested",
+              "summary" => "Autonomous Review did not resolve all prior findings.",
+              "findings" => findings,
+              "next_step" => "Fix the remaining findings and submit a new Build delivery."
+            })
+
+          rework_phase(issue, task, "review", attempt, result)
+      end
     end
   end
 
   defp finish_valid_phase(issue, task, phase, attempt, %{"outcome" => outcome} = result)
        when phase in ["qa", "review"] and outcome in ["changes_requested", "failed", "defects_found"] do
-    next = %{task | "phase" => "build", "status" => "building"}
-    operations = report_ops(next, phase, attempt, result) ++ [status_op(next, :building, nil, attempt)]
-    commit(issue, next, phase, attempt, result, operations)
+    rework_phase(issue, task, phase, attempt, result)
   end
 
   defp finish_valid_phase(_issue, _task, phase, _attempt, result), do: {:error, {:invalid_phase_result, phase, result["outcome"]}}
+
+  defp rework_phase(issue, task, phase, attempt, result) do
+    next =
+      task
+      |> Map.put("phase", "build")
+      |> Map.put("status", "building")
+      |> Map.put("prior_findings", pending_findings(task, result))
+
+    operations = report_ops(next, phase, attempt, result) ++ [status_op(next, :building, nil, attempt, phase)]
+    commit(issue, next, phase, attempt, result, operations)
+  end
+
+  defp pending_findings(task, result) do
+    resolved_ids = MapSet.new(Map.get(result, "resolutions") || [])
+
+    (Map.get(task, "prior_findings") || [])
+    |> Kernel.++(Map.get(result, "findings") || [])
+    |> Enum.uniq_by(& &1["id"])
+    |> Enum.reject(&MapSet.member?(resolved_ids, &1["id"]))
+  end
 
   defp commit(issue, task, phase, attempt, result, operations) do
     case Store.commit_phase(task, phase, attempt, result, operations) do
@@ -545,13 +582,13 @@ defmodule SymphonyElixir.Pipeline do
     operation(task, "report", %{"marker" => marker, "body" => body, "phase" => phase})
   end
 
-  defp status_op(task, status, reason, attempt),
+  defp status_op(task, status, reason, attempt, source_phase \\ nil),
     do:
       operation(
         task,
         "project_status",
         %{"status" => status_value(task, status), "status_key" => Atom.to_string(status), "reason" => reason},
-        attempt
+        {source_phase || task["phase"], attempt}
       )
 
   defp operation(task, kind, payload, salt \\ nil) do
@@ -561,6 +598,16 @@ defmodule SymphonyElixir.Pipeline do
 
   defp normalize_result(result, phase) when is_map(result) do
     result = Map.new(result, fn {key, value} -> {to_string(key), value} end)
+
+    result =
+      if phase in ["qa", "review"] and result["outcome"] == "passed" and result["findings"] not in [nil, []],
+        do:
+          Map.merge(result, %{
+            "outcome" => "changes_requested",
+            "summary" => "#{String.upcase(phase)} reported findings that need correction.",
+            "next_step" => "Fix the findings and submit a new Build delivery."
+          }),
+        else: result
 
     if is_binary(result["outcome"]) and is_binary(result["summary"]) and valid_report?(phase, result),
       do: {:ok, result},

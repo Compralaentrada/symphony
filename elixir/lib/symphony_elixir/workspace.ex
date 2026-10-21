@@ -247,27 +247,50 @@ defmodule SymphonyElixir.Workspace do
   end
 
   @spec run_required_check(Path.t(), String.t(), String.t(), map() | String.t() | nil, worker_host()) ::
-          {:ok, String.t()} | {:error, :check_unavailable | {:check_failed, non_neg_integer()}}
+          {:ok, String.t()} | {:error, :check_unavailable | :workspace_mismatch | {:check_failed, non_neg_integer()}}
   def run_required_check(workspace, command, sha, issue_or_identifier, worker_host)
       when is_binary(workspace) and is_binary(command) and is_binary(sha) do
+    with :ok <- verify_required_check_workspace(workspace, sha, issue_or_identifier, worker_host),
+         :ok <- run_required_check_command(workspace, command, issue_or_identifier, worker_host),
+         :ok <- verify_required_check_workspace(workspace, sha, issue_or_identifier, worker_host) do
+      {:ok, "Symphony ran the configured check at SHA #{sha}; host exit status 0."}
+    end
+  end
+
+  def run_required_check(_workspace, _command, _sha, _issue_or_identifier, _worker_host),
+    do: {:error, :check_unavailable}
+
+  defp verify_required_check_workspace(workspace, sha, issue_or_identifier, worker_host) do
+    command = """
+    actual_sha=$(git rev-parse --verify HEAD 2>/dev/null) || exit 127
+    [ "$actual_sha" = #{shell_escape(sha)} ] || exit 125
+    status=$(git status --porcelain --untracked-files=all 2>/dev/null) || exit 127
+    [ -z "$status" ] || exit 126
+    """
+
+    case run_hook(command, workspace, issue_context(issue_or_identifier), "required_check", worker_host) do
+      :ok -> :ok
+      {:error, {:workspace_hook_failed, "required_check", 127}} -> {:error, :check_unavailable}
+      {:error, {:workspace_hook_failed, "required_check", _status}} -> {:error, :workspace_mismatch}
+      {:error, _reason} -> {:error, :check_unavailable}
+    end
+  end
+
+  defp run_required_check_command(workspace, command, issue_or_identifier, worker_host) do
     case run_hook(command, workspace, issue_context(issue_or_identifier), "required_check", worker_host) do
       :ok ->
-        {:ok, "Symphony ran the configured check at SHA #{sha}; host exit status 0."}
+        :ok
 
       {:error, {:workspace_hook_failed, "required_check", 127}} ->
         {:error, :check_unavailable}
 
-      {:error, {:workspace_hook_failed, "required_check", status}}
-      when is_integer(status) and status >= 0 ->
+      {:error, {:workspace_hook_failed, "required_check", status}} when is_integer(status) and status >= 0 ->
         {:error, {:check_failed, status}}
 
       {:error, _reason} ->
         {:error, :check_unavailable}
     end
   end
-
-  def run_required_check(_workspace, _command, _sha, _issue_or_identifier, _worker_host),
-    do: {:error, :check_unavailable}
 
   defp workspace_path_for_issue(safe_id, nil) when is_binary(safe_id) do
     Config.local_workspace_root()

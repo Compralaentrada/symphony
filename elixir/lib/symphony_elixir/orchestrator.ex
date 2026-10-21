@@ -325,21 +325,25 @@ defmodule SymphonyElixir.Orchestrator do
     task = entry.pipeline_task
 
     checks =
-      Enum.map(task["required_checks"] || [], fn command ->
-        case Workspace.run_required_check(
-               entry.workspace_path,
-               command,
-               task["current_sha"],
-               entry.issue,
-               entry.worker_host
-             ) do
-          {:ok, evidence} -> %{"name" => command, "status" => "passed", "evidence" => evidence}
-          {:error, {:check_failed, status}} -> %{"name" => command, "status" => "failed", "evidence" => "Symphony ran the configured check at SHA #{task["current_sha"]}; host exit status #{status}."}
-          {:error, :check_unavailable} -> %{"name" => command, "status" => "unavailable", "evidence" => "Symphony could not execute the required check."}
-        end
+      Enum.map(task["required_checks"] || [], &run_pipeline_required_check(entry, task, &1))
+
+    check_findings =
+      checks
+      |> Enum.filter(&(&1["status"] == "failed"))
+      |> Enum.map(fn check ->
+        %{
+          "id" => check["finding_id"] || "required-check:" <> check["name"],
+          "reproduction" => check["evidence"],
+          "criterion" => "All required checks must pass on accepted SHA #{task["current_sha"]}."
+        }
       end)
 
-    result = Map.put(result, "checks", checks)
+    result =
+      result
+      |> Map.put("checks", checks)
+      |> Map.update("findings", check_findings, fn findings ->
+        Enum.uniq_by(findings ++ check_findings, & &1["id"])
+      end)
 
     cond do
       Enum.any?(checks, &(&1["status"] == "unavailable")) ->
@@ -353,8 +357,8 @@ defmodule SymphonyElixir.Orchestrator do
       Enum.any?(checks, &(&1["status"] == "failed")) ->
         Map.merge(result, %{
           "outcome" => "changes_requested",
-          "summary" => "One or more required host checks failed.",
-          "next_step" => "Fix the failed checks and submit a new Build delivery."
+          "summary" => "One or more required host checks failed or the workspace did not match the accepted SHA.",
+          "next_step" => "Fix the findings and submit a new Build delivery."
         })
 
       true ->
@@ -363,6 +367,33 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp verify_required_pipeline_checks(_entry, result), do: result
+
+  defp run_pipeline_required_check(entry, task, command) do
+    case Workspace.run_required_check(
+           entry.workspace_path,
+           command,
+           task["current_sha"],
+           entry.issue,
+           entry.worker_host
+         ) do
+      {:ok, evidence} ->
+        %{"name" => command, "status" => "passed", "evidence" => evidence}
+
+      {:error, {:check_failed, status}} ->
+        %{"name" => command, "status" => "failed", "evidence" => "Symphony ran the configured check at SHA #{task["current_sha"]}; host exit status #{status}."}
+
+      {:error, :workspace_mismatch} ->
+        %{
+          "name" => command,
+          "status" => "failed",
+          "finding_id" => "workspace-sha-mismatch",
+          "evidence" => "Symphony did not run the check because workspace HEAD or files differed from accepted SHA #{task["current_sha"]}."
+        }
+
+      {:error, :check_unavailable} ->
+        %{"name" => command, "status" => "unavailable", "evidence" => "Symphony could not execute the required check."}
+    end
+  end
 
   defp schedule_active_state_continuation(state, issue_id, running_entry) do
     state
@@ -1215,6 +1246,7 @@ defmodule SymphonyElixir.Orchestrator do
         branch: task["branch"],
         base_branch: task["base_branch"],
         sha: task["current_sha"],
+        prior_findings: task["prior_findings"] || [],
         required_checks: task["required_checks"]
       )
 

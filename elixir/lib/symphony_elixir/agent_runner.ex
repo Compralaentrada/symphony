@@ -152,6 +152,7 @@ defmodule SymphonyElixir.AgentRunner do
     """
     Pipeline phase: Build.
     Implement the issue, preserve the configured branch #{Keyword.get(opts, :branch)}, and push your work to origin.
+    Previously reported findings to address: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
     Do not create or update a pull request, change Project status, or comment on the issue; Symphony owns those writes.
     Finish with exactly one JSON object containing outcome (ready, no_changes, or blocked), summary, criteria, changes, checks, risks, next_step, reason when blocked or no_changes, and sha after pushing.
     Use sha null only for no_changes or blocked.
@@ -161,6 +162,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp pipeline_phase_instructions(:qa, opts) do
     """
     Pipeline phase: independent QA. Review and test the accepted commit #{Keyword.get(opts, :sha)} on branch #{Keyword.get(opts, :branch)}.
+    Prior findings to recheck after Build: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
     Required checks: #{Enum.join(Keyword.get(opts, :required_checks, []), ", ")}.
     Symphony runs these configured checks on the workspace after your review. Do not claim their result or evidence; return an empty checks list. Give each defect an id, reproduction steps, and the violated criterion.
     Do not modify files or write to GitHub. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
@@ -170,6 +172,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp pipeline_phase_instructions(:review, opts) do
     """
     Pipeline phase: autonomous code review. Inspect the diff and accepted commit #{Keyword.get(opts, :sha)} on branch #{Keyword.get(opts, :branch)}.
+    Prior finding IDs to resolve explicitly: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
     Do not modify files or write to GitHub. Give each defect an id, reproduction steps, and the violated criterion. Resolve prior finding ids explicitly.
     Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
     """
