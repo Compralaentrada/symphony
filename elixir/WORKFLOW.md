@@ -34,7 +34,7 @@ hooks:
       cd elixir && mise exec -- mix workspace.before_remove
     fi
 agent:
-  max_concurrent_agents: 10
+  max_concurrent_agents: 5
   max_turns: 20
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-6-luna"' --config model_reasoning_effort=max app-server
