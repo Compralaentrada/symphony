@@ -195,7 +195,7 @@ defmodule SymphonyElixir.AgentRunner do
          ) do
       {:ok, _turn} ->
         with {:ok, report} <- decode_phase_report(phase_report_text(Process.get(message_key))) do
-          Pipeline.normalize_phase_result(report, Atom.to_string(phase))
+          Pipeline.normalize_phase_result(report, Atom.to_string(phase), Pipeline.report_locale(issue))
         end
 
       error ->

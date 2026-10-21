@@ -178,6 +178,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert report_phases(table, no_changes.id) == [:build, :build, :dropped]
     dropped_report = lookup(table, {:report, no_changes.id, "dropped"})
     assert dropped_report =~ "<!-- symphony:octo/app#2:1:dropped:0 -->"
+    assert dropped_report =~ "## Informe de Symphony: Descartado (descartado)"
     assert dropped_report =~ "La persona confirmó que no hacen falta cambios."
     assert dropped_report =~ "### Siguiente paso"
     refute dropped_report =~ "\"outcome\""
@@ -344,6 +345,46 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert qa_report =~ "Reproduction: Run the failing scenario."
     assert qa_report =~ "Criterion: The result matches the acceptance criterion."
     refute qa_report =~ "\"reproduction\""
+
+    stop_orchestrator(orchestrator)
+    File.rm_rf!(Path.dirname(path))
+  end
+
+  test "generated QA findings text follows the issue language" do
+    issue = %{issue("octo/app#14", 14) | description: "Implementa los cambios y valida los criterios de aceptación."}
+
+    finding = %{
+      "id" => "QA-14-1",
+      "reproduction" => "Ejecuta el caso que falla.",
+      "criterion" => "El resultado debe cumplir el criterio de aceptación."
+    }
+
+    qa_with_finding = qa_es("first") |> Map.put("findings", [finding])
+
+    table =
+      start_board([issue], %{
+        issue.id => %{
+          build: [build_es("first"), build_es("fixed"), build_es("fixed-two")],
+          qa: [qa_with_finding, qa_es("fixed"), qa_es("fixed-two")],
+          review: [Map.put(review_es("fixed"), "findings", [finding]), Map.put(review_es("fixed-two"), "resolutions", [finding["id"]])]
+        }
+      })
+
+    path = pipeline_database!(table)
+    orchestrator = start_orchestrator()
+
+    assert await(fn -> project_state(table, issue.id) == "Human Review" end)
+
+    report = lookup(table, {:reports, issue.id})["<!-- symphony:octo/app#14:1:qa:1 -->"]
+    assert report =~ "QA encontró hallazgos que requieren corrección."
+    assert report =~ "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
+    refute report =~ "QA reported findings"
+    refute report =~ "\"outcome\""
+
+    review_report = lookup(table, {:reports, issue.id})["<!-- symphony:octo/app#14:1:review:1 -->"]
+    assert review_report =~ "La revisión encontró hallazgos que requieren corrección."
+    assert review_report =~ "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
+    refute review_report =~ "Review reported findings"
 
     stop_orchestrator(orchestrator)
     File.rm_rf!(Path.dirname(path))

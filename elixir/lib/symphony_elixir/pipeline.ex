@@ -63,7 +63,7 @@ defmodule SymphonyElixir.Pipeline do
 
   @spec finish_phase(Issue.t(), map(), String.t(), pos_integer(), term()) :: :ok | {:error, term()}
   def finish_phase(%Issue{} = issue, task, phase, attempt, result) do
-    case normalize_phase_result(result, phase) do
+    case normalize_phase_result(result, phase, report_locale(issue)) do
       {:ok, result} ->
         finish_valid_phase(issue, task, phase, attempt, result)
 
@@ -653,14 +653,15 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp report_header(phase, outcome, :es, labels),
-    do: "## Informe de Symphony: #{phase_title(phase)} (#{Map.get(labels.outcomes, outcome, outcome)})"
+    do: "## Informe de Symphony: #{phase_title(phase, :es)} (#{Map.get(labels.outcomes, outcome, outcome)})"
 
   defp report_header(phase, outcome, _locale, labels),
-    do: "## Symphony #{phase_title(phase)} report (#{Map.get(labels.outcomes, outcome, outcome)})"
+    do: "## Symphony #{phase_title(phase, :en)} report (#{Map.get(labels.outcomes, outcome, outcome)})"
 
-  defp phase_title("qa"), do: "QA"
-  defp phase_title("dropped"), do: "Dropped"
-  defp phase_title(phase), do: String.capitalize(phase)
+  defp phase_title("qa", _locale), do: "QA"
+  defp phase_title("dropped", :es), do: "Descartado"
+  defp phase_title("dropped", _locale), do: "Dropped"
+  defp phase_title(phase, _locale), do: String.capitalize(phase)
 
   defp report_checks_section(label, [], "blocked", locale) do
     report_section(label, report_labels(locale).no_checks)
@@ -877,7 +878,10 @@ defmodule SymphonyElixir.Pipeline do
 
   @doc false
   @spec normalize_phase_result(term(), String.t()) :: {:ok, map()} | {:error, term()}
-  def normalize_phase_result(result, phase) when is_map(result) do
+  def normalize_phase_result(result, phase), do: normalize_phase_result(result, phase, :en)
+
+  @spec normalize_phase_result(term(), String.t(), :en | :es) :: {:ok, map()} | {:error, term()}
+  def normalize_phase_result(result, phase, locale) when is_map(result) do
     result = Map.new(result, fn {key, value} -> {to_string(key), value} end)
 
     result =
@@ -885,8 +889,8 @@ defmodule SymphonyElixir.Pipeline do
         do:
           Map.merge(result, %{
             "outcome" => "changes_requested",
-            "summary" => "#{String.upcase(phase)} reported findings that need correction.",
-            "next_step" => "Fix the findings and submit a new Build delivery."
+            "summary" => findings_summary(locale, phase),
+            "next_step" => findings_next_step(locale)
           }),
         else: result
 
@@ -895,8 +899,16 @@ defmodule SymphonyElixir.Pipeline do
       else: {:error, {:invalid_phase_report, invalid_report_details(phase, result)}}
   end
 
-  def normalize_phase_result(_result, phase),
+  def normalize_phase_result(_result, phase, _locale),
     do: {:error, {:invalid_phase_report, %{phase: phase, report_type: :not_an_object}}}
+
+  defp findings_summary(:es, "qa"), do: "QA encontró hallazgos que requieren corrección."
+  defp findings_summary(:es, _phase), do: "La revisión encontró hallazgos que requieren corrección."
+  defp findings_summary(_locale, "qa"), do: "QA reported findings that need correction."
+  defp findings_summary(_locale, _phase), do: "Review reported findings that need correction."
+
+  defp findings_next_step(:es), do: "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
+  defp findings_next_step(_locale), do: "Fix the findings and submit a new Build delivery."
 
   defp invalid_report_details(phase, result) do
     finding_keys =
