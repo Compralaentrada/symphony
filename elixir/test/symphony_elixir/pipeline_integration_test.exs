@@ -5,7 +5,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
   test "Build, QA and Review resume on the same PR and Done waits for a confirmed merge" do
     issue = issue("octo/app#1", 1)
-    issue = %{issue | description: "Implementa los criterios de aceptación de la issue."}
+    issue = %{issue | description: "Implementar soporte para nuevas salas"}
 
     table =
       start_board([issue], %{

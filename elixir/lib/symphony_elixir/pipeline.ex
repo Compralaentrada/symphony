@@ -29,7 +29,10 @@ defmodule SymphonyElixir.Pipeline do
     description = if is_binary(description), do: String.downcase(description), else: ""
 
     if Regex.match?(~r/[áéíóúñ¿¡]/u, description) or
-         Regex.match?(~r/\b(?:aceptacion|bloqueo|cambios|comprobaciones|criterios|hallazgos|objetivo|pruebas|riesgos|siguiente paso|tarea)\b/u, description),
+         Regex.match?(
+           ~r/\b(?:aceptacion|al|bloqueo|cambios|como|comprobaciones|con|cuando|de|del|desde|donde|el|en|es|esta|este|estos|estas|hasta|hallazgos|la|las|lo|los|objetivo|para|pero|por|pruebas|que|riesgos|se|sin|sobre|siguiente paso|su|sus|tarea|un|una|unas|unos|y)\b/u,
+           description
+         ),
        do: :es,
        else: :en
   end
