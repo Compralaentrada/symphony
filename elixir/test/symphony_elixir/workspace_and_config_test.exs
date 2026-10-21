@@ -1292,6 +1292,22 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
            }
   end
 
+  test "merge policy defaults to human and accepts only documented values" do
+    assert {:ok, default_settings} = Schema.parse(%{})
+    assert default_settings.merge_policy == "human"
+
+    assert {:ok, human_settings} = Schema.parse(%{merge_policy: "human"})
+    assert human_settings.merge_policy == "human"
+
+    assert {:ok, auto_settings} = Schema.parse(%{merge_policy: "auto"})
+    assert auto_settings.merge_policy == "auto"
+
+    assert {:error, {:invalid_workflow_config, message}} =
+             Schema.parse(%{merge_policy: "automatic"})
+
+    assert message =~ "merge_policy"
+  end
+
   test "linear adapter rejects invalid provider values without crashing config parsing" do
     assert {:ok, invalid_secret_settings} =
              Schema.parse(%{

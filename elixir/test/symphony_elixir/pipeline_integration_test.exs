@@ -18,9 +18,11 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     path = pipeline_database!(table)
     orchestrator = start_orchestrator()
 
+    assert Config.settings!().merge_policy == "human"
     assert await(fn -> project_state(table, issue.id) == "Human Review" end)
     first_sha = lookup(table, {:remote_sha, issue.id})
     assert %{number: pr_number, branch: branch, sha: ^first_sha, draft: false} = pull_request(table, issue.id)
+    refute pull_request(table, issue.id).merged
     assert branch == issue.branch_name
     assert pull_request(table, issue.id).body =~ "Fixes octo/app#1"
     assert pull_request(table, issue.id).body =~ "Acceptance criterion completed."
