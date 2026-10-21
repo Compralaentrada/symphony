@@ -1141,7 +1141,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
     }
   end
 
-  defp status_value(key), do: Config.settings!().tracker.provider["status_values"][Atom.to_string(key)]
+  defp status_value(key), do: Map.fetch!(@statuses, key)
 
   defp issues,
     do:
