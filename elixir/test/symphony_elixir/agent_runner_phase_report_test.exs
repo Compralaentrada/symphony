@@ -105,25 +105,28 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
 
       assert %{"outcome" => "passed", "findings" => []} = result
 
-      prompts =
+      turn_starts =
         trace_file
         |> File.read!()
         |> String.split("\n", trim: true)
         |> Enum.map(&String.trim_leading(&1, "JSON:"))
         |> Enum.map(&Jason.decode!/1)
         |> Enum.filter(&(&1["method"] == "turn/start"))
-        |> Enum.map(&get_in(&1, ["params", "input", Access.at(0), "text"]))
+
+      prompts = Enum.map(turn_starts, &get_in(&1, ["params", "input", Access.at(0), "text"]))
 
       assert length(prompts) == 2
       assert hd(prompts) =~ "Each finding must include the exact keys id, reproduction, and criterion as non-empty strings."
       refute hd(prompts) =~ "- `code-review`"
       assert Enum.at(prompts, 1) =~ "The previous response did not match the pipeline's required phase report."
+      assert Enum.all?(turn_starts, &is_map(get_in(&1, ["params", "outputSchema"])))
+      assert get_in(hd(turn_starts), ["params", "outputSchema", "properties", "findings", "items", "required"]) == ["id", "reproduction", "criterion"]
     after
       File.rm_rf(test_root)
     end
   end
 
-  test "recovers from a prose review before returning the final phase report" do
+  test "constrains phase reports with the app-server JSON schema" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -133,68 +136,55 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
     try do
       workspace_root = Path.join(test_root, "workspaces")
       codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-input.trace")
       File.mkdir_p!(test_root)
 
       report = %{
-        "outcome" => "ready",
-        "summary" => "Build complete",
-        "criteria" => ["The issue is implemented."],
-        "changes" => ["Updated the implementation."],
-        "checks" => [],
-        "risks" => "The live smoke was not run.",
-        "next_step" => "Continue to QA.",
+        "outcome" => "passed",
+        "summary" => "Review passed",
+        "findings" => [],
+        "resolutions" => [],
+        "next_step" => "Continue to Human Review.",
         "sha" => String.duplicate("a", 40)
       }
 
-      review_text =
-        """
-        **Potential improvements**
-
-        The separate modules may justify separate maps, but they can drift.
-        - **Stale helper arguments — baseline smell.** In `pipeline.ex`, `status_value(_task, status)` and `issue_status_value(_issue, status)` ignore their first arguments and only look up `@statuses[status]`. Dropping those arguments and simplifying the single-use `issue_status_value` wrapper would make the new fixed mapping clearer.
-
-        The merge commit brings in `origin/main`; I found no merge-resolution-specific standards issue.
-        """
-
-      review =
+      prose_delta =
         Jason.encode!(%{
           "method" => "item/agentMessage/delta",
-          "params" => %{"itemId" => "report-item", "delta" => review_text}
+          "params" => %{
+            "itemId" => "report-item",
+            "delta" => "**Potential improvements**\n\nThe review is complete, with one suggestion."
+          }
         })
 
-      report_json = Jason.encode!(report)
-      {report_first_half, report_second_half} = String.split_at(report_json, div(byte_size(report_json), 2))
-
-      final_report_first_half =
+      report_delta =
         Jason.encode!(%{
           "method" => "item/agentMessage/delta",
-          "params" => %{"itemId" => "report-item", "delta" => report_first_half}
-        })
-
-      final_report_second_half =
-        Jason.encode!(%{
-          "method" => "item/agentMessage/delta",
-          "params" => %{"itemId" => "report-item", "delta" => report_second_half}
+          "params" => %{"itemId" => "report-item", "delta" => Jason.encode!(report)}
         })
 
       File.write!(codex_binary, """
       #!/bin/sh
       count=0
-      while IFS= read -r _line; do
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> '#{trace_file}'
         count=$((count + 1))
         case "$count" in
           1) printf '%s\\n' '{"id":1,"result":{}}' ;;
           2) ;;
-          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"phase-report-thread"}}}' ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"structured-phase-report-thread"}}}' ;;
           4)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"phase-report-turn"}}}'
-            printf '%s\\n' '#{review}'
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"structured-phase-report-turn"}}}'
+            if printf '%s' "$line" | grep -q '"outputSchema"'; then
+              printf '%s\\n' '#{report_delta}'
+            else
+              printf '%s\\n' '#{prose_delta}'
+            fi
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
           5)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"phase-report-retry"}}}'
-            printf '%s\\n' '#{final_report_first_half}'
-            printf '%s\\n' '#{final_report_second_half}'
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"structured-phase-report-retry"}}}'
+            printf '%s\\n' '#{prose_delta}'
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;
@@ -214,17 +204,36 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       issue = %Issue{
         id: "issue-phase-report",
         identifier: "MT-PHASE-REPORT",
-        title: "Return a phase report",
-        description: "Complete the implementation and return the phase report.",
-        state: "Building",
+        title: "Return a review report",
+        description: "Review the accepted commit and return the phase report.",
+        state: "Review",
         url: "https://example.org/issues/MT-PHASE-REPORT",
         labels: ["backend"]
       }
 
-      result = AgentRunner.run(issue, nil, phase: :build, branch: "symphony/mt-phase-report")
+      result =
+        AgentRunner.run(issue, nil,
+          phase: :review,
+          branch: "symphony/mt-phase-report",
+          sha: report["sha"]
+        )
 
-      assert %{"outcome" => "ready", "summary" => "Build complete"} = result
-      assert result["risks"] == ["The live smoke was not run."]
+      assert %{"outcome" => "passed", "summary" => "Review passed"} = result
+
+      turn_params =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.find(&(&1["method"] == "turn/start"))
+        |> Map.fetch!("params")
+
+      schema = Map.fetch!(turn_params, "outputSchema")
+      assert schema["type"] == "object"
+      assert "outcome" in schema["required"]
+      assert "findings" in schema["required"]
+      assert get_in(schema, ["properties", "findings", "items", "required"]) == ["id", "reproduction", "criterion"]
     after
       File.rm_rf(test_root)
     end

@@ -157,15 +157,25 @@ defmodule SymphonyElixir.AgentRunner do
           "\nThe phase report JSON contract overrides any skill's preferred presentation format."
       )
 
+    output_schema = phase_report_schema(phase)
+
     try do
-      case run_phase_turn(session, prompt, issue, on_message, message_key, phase) do
+      case run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema) do
         {:ok, report} ->
           {:phase_result, report}
 
         {:error, {:invalid_phase_report, _details}} ->
           Process.delete(message_key)
 
-          case run_phase_turn(session, phase_report_correction_prompt(), issue, on_message, message_key, phase) do
+          case run_phase_turn(
+                 session,
+                 phase_report_correction_prompt(),
+                 issue,
+                 on_message,
+                 message_key,
+                 phase,
+                 output_schema
+               ) do
             {:ok, report} -> {:phase_result, report}
             error -> error
           end
@@ -178,8 +188,11 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp run_phase_turn(session, prompt, issue, on_message, message_key, phase) do
-    case AppServer.run_turn(session, prompt, issue, on_message: on_message) do
+  defp run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema) do
+    case AppServer.run_turn(session, prompt, issue,
+           on_message: on_message,
+           output_schema: output_schema
+         ) do
       {:ok, _turn} ->
         with {:ok, report} <- decode_phase_report(phase_report_text(Process.get(message_key))) do
           Pipeline.normalize_phase_result(report, Atom.to_string(phase))
@@ -344,6 +357,72 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp append_selected_skills(prompt, _selected_skills, _turn_number), do: prompt
+
+  defp phase_report_schema(:build) do
+    report_schema(%{
+      "outcome" => %{"type" => "string", "enum" => ["ready", "no_changes", "blocked"]},
+      "summary" => %{"type" => "string"},
+      "criteria" => string_array_schema(),
+      "changes" => string_array_schema(),
+      "checks" => string_array_schema(),
+      "risks" => string_array_schema(),
+      "next_step" => %{"type" => "string"},
+      "reason" => %{"type" => ["string", "null"]},
+      "sha" => %{"type" => ["string", "null"]}
+    })
+  end
+
+  defp phase_report_schema(phase) when phase in [:qa, :review] do
+    properties = %{
+      "outcome" => %{
+        "type" => "string",
+        "enum" => ["passed", "changes_requested", "blocked", "failed", "defects_found"]
+      },
+      "summary" => %{"type" => "string"},
+      "findings" => %{
+        "type" => "array",
+        "items" => %{
+          "type" => "object",
+          "properties" => %{
+            "id" => %{"type" => "string"},
+            "reproduction" => %{"type" => "string"},
+            "criterion" => %{"type" => "string"}
+          },
+          "required" => ["id", "reproduction", "criterion"],
+          "additionalProperties" => false
+        }
+      },
+      "next_step" => %{"type" => "string"},
+      "reason" => %{"type" => ["string", "null"]},
+      "sha" => %{"type" => "string"}
+    }
+
+    phase_properties =
+      case phase do
+        :qa ->
+          %{
+            "criteria" => string_array_schema(),
+            "changes" => string_array_schema(),
+            "checks" => string_array_schema()
+          }
+
+        :review ->
+          %{"resolutions" => string_array_schema()}
+      end
+
+    report_schema(Map.merge(properties, phase_properties))
+  end
+
+  defp report_schema(properties) do
+    %{
+      "type" => "object",
+      "properties" => properties,
+      "required" => Map.keys(properties),
+      "additionalProperties" => false
+    }
+  end
+
+  defp string_array_schema, do: %{"type" => "array", "items" => %{"type" => "string"}}
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
