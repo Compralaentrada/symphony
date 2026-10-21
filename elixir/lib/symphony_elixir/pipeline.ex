@@ -758,17 +758,18 @@ defmodule SymphonyElixir.Pipeline do
 
   defp report_check_status(_status, _labels), do: nil
 
-  defp localize_check_evidence(evidence, :es) when is_binary(evidence) do
+  defp localize_check_evidence(evidence, locale) when is_binary(evidence) and locale in [:es, :fr] do
     case Regex.run(~r/^Symphony ran the configured check at SHA (.+); host exit status (\d+)\.$/, evidence) do
-      [_, sha, status] -> "Symphony ejecutó la comprobación configurada en SHA #{sha}; código de salida del host: #{status}."
-      _ -> localize_other_check_evidence(evidence, :es)
-    end
-  end
+      [_, sha, status] ->
+        report_text(
+          locale,
+          "Symphony ran the configured check at SHA #{sha}; host exit status #{status}.",
+          "Symphony ejecutó la comprobación configurada en SHA #{sha}; código de salida del host: #{status}.",
+          "Symphony a exécuté la vérification configurée pour le SHA #{sha} ; code de sortie de l’hôte : #{status}."
+        )
 
-  defp localize_check_evidence(evidence, :fr) when is_binary(evidence) do
-    case Regex.run(~r/^Symphony ran the configured check at SHA (.+); host exit status (\d+)\.$/, evidence) do
-      [_, sha, status] -> "Symphony a exécuté la vérification configurée pour le SHA #{sha} ; code de sortie de l’hôte : #{status}."
-      _ -> localize_other_check_evidence(evidence, :fr)
+      _ ->
+        localize_other_check_evidence(evidence, locale)
     end
   end
 

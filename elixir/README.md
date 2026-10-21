@@ -55,7 +55,8 @@ item back to Ready requests corrections on the same branch and PR. To move unmer
 add a human-authored `Drop reason: <reason>` line to the issue body; after a `no_changes` result,
 this line confirms the decision to discard the work.
 
-Pipeline phase reports use Markdown in the issue description's language, omit empty sections, and
+Pipeline phase reports use Markdown in English, Spanish, or French, based on the issue description.
+Ambiguous text and unsupported languages fall back to English. Reports omit empty sections and
 distinguish blocked phases from checks that did not run.
 
 ## Prerequisites
