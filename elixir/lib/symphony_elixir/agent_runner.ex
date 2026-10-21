@@ -206,6 +206,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp phase_report_correction_prompt do
     """
     The previous response did not match the pipeline's required phase report. Return exactly one JSON object using the fields and allowed outcome from the preceding phase instructions, including the exact key names required for each finding. Preserve its findings and conclusions; do not repeat the work. The pipeline's JSON report contract overrides any skill's preferred prose format.
+    The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
     Do not include headings, bullets, Markdown, code fences, or text outside the JSON object.
     """
   end
@@ -239,6 +240,7 @@ defmodule SymphonyElixir.AgentRunner do
     Pipeline phase: autonomous code review. Inspect the diff and accepted commit #{Keyword.get(opts, :sha)} on branch #{Keyword.get(opts, :branch)}.
     Prior finding IDs to resolve explicitly: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
     Do not invoke the repository's `code-review` skill or its Markdown report format; perform this review directly under the pipeline's JSON contract.
+    The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
     Do not modify files or write to GitHub. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
     Use the Humanizer guidance for report values: write in the issue description's language, keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details.
     Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit. Do not include headings, bullets, Markdown, code fences, or commentary outside that object.
