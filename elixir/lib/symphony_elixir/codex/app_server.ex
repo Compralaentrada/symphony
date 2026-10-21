@@ -416,8 +416,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
-        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
+        handle_turn_completed(port, on_message, payload, payload_string)
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
         emit_turn_event(
@@ -485,6 +484,17 @@ defmodule SymphonyElixir.Codex.AppServer do
         end
 
         receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+    end
+  end
+
+  defp handle_turn_completed(port, on_message, payload, payload_string) do
+    case get_in(payload, ["params", "turn"]) do
+      %{"status" => status} = turn when status != "completed" ->
+        {:error, {:turn_not_completed, status, Map.get(turn, "error")}}
+
+      _ ->
+        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
+        {:ok, :turn_completed}
     end
   end
 
