@@ -144,16 +144,44 @@ defmodule SymphonyElixir.AgentRunner do
       issue
       |> PromptBuilder.build_prompt(opts)
       |> append_selected_skills(Keyword.get(opts, :selected_repo_skills), 1)
-      |> Kernel.<>("\n\n" <> pipeline_phase_instructions(phase, opts))
+      |> Kernel.<>(
+        "\n\n" <>
+          pipeline_phase_instructions(phase, opts) <>
+          "\nThe phase report JSON contract overrides any skill's preferred presentation format."
+      )
 
     try do
-      with {:ok, _turn} <- AppServer.run_turn(session, prompt, issue, on_message: on_message),
-           {:ok, report} <- decode_phase_report(phase_report_text(Process.get(message_key))) do
-        {:phase_result, report}
+      case run_phase_turn(session, prompt, issue, on_message, message_key) do
+        {:ok, report} ->
+          {:phase_result, report}
+
+        {:error, {:invalid_phase_report, _text}} ->
+          Process.delete(message_key)
+
+          case run_phase_turn(session, phase_report_correction_prompt(), issue, on_message, message_key) do
+            {:ok, report} -> {:phase_result, report}
+            error -> error
+          end
+
+        error ->
+          error
       end
     after
       Process.delete(message_key)
     end
+  end
+
+  defp run_phase_turn(session, prompt, issue, on_message, message_key) do
+    case AppServer.run_turn(session, prompt, issue, on_message: on_message) do
+      {:ok, _turn} -> decode_phase_report(phase_report_text(Process.get(message_key)))
+      error -> error
+    end
+  end
+
+  defp phase_report_correction_prompt do
+    """
+    The previous response did not match the pipeline's required phase report. Return exactly one JSON object using the fields and allowed outcome from the preceding phase instructions. Preserve its findings and conclusions; do not repeat the work. The pipeline's JSON report contract overrides any skill's preferred prose format.
+    """
   end
 
   defp pipeline_phase_instructions(:build, opts) do

@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
   use SymphonyElixir.TestSupport
 
-  test "uses the final assistant item and preserves a singular risk" do
+  test "recovers from a prose review before returning the final phase report" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -24,10 +24,20 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         "sha" => String.duplicate("a", 40)
       }
 
-      progress =
+      review_text =
+        """
+        **Potential improvements**
+
+        The separate modules may justify separate maps, but they can drift.
+        - **Stale helper arguments — baseline smell.** In `pipeline.ex`, `status_value(_task, status)` and `issue_status_value(_issue, status)` ignore their first arguments and only look up `@statuses[status]`. Dropping those arguments and simplifying the single-use `issue_status_value` wrapper would make the new fixed mapping clearer.
+
+        The merge commit brings in `origin/main`; I found no merge-resolution-specific standards issue.
+        """
+
+      review =
         Jason.encode!(%{
           "method" => "item/agentMessage/delta",
-          "params" => %{"itemId" => "progress-item", "delta" => "I am inspecting the issue."}
+          "params" => %{"itemId" => "report-item", "delta" => review_text}
         })
 
       report_json = Jason.encode!(report)
@@ -56,7 +66,11 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
           3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"phase-report-thread"}}}' ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"phase-report-turn"}}}'
-            printf '%s\\n' '#{progress}'
+            printf '%s\\n' '#{review}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"phase-report-retry"}}}'
             printf '%s\\n' '#{final_report_first_half}'
             printf '%s\\n' '#{final_report_second_half}'
             printf '%s\\n' '{"method":"turn/completed"}'

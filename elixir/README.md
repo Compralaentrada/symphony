@@ -136,7 +136,9 @@ If no path is passed, Symphony defaults to `./WORKFLOW.md`.
 
 Optional flags:
 
-- `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
+- `--logs-root` tells Symphony to write logs under a different directory (default: `./log`). All
+  events go to `symphony.log.1`; warnings and errors are also copied to `symphony-errors.log.1`.
+  Rotated segments use the same base names with suffixes `.2` through `.5`.
 - `--port` also starts the Phoenix observability service (default: disabled)
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
