@@ -75,6 +75,9 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     assert :ok = Tracker.block_issue(issue, "operator input required")
     assert_receive {:projects_block, ^issue, "operator input required"}
+
+    assert :ok = Tracker.set_pipeline_status(issue, :done)
+    assert_receive {:projects_pipeline_status, ^issue, :done, nil}
   end
 
   test "Projects configuration reports missing owner without exposing a token" do
@@ -87,7 +90,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
   test "Projects configuration requires auth, status-only routing, and requeue-safe terminal states" do
     settings = tracker_settings()
-    missing_token = tracker_settings(%{"token" => "$SYMPHONY_GH6_MISSING_TOKEN"})
+    missing_token = tracker_settings(%{"token" => ""})
 
     assert {:error, {:invalid_github_projects_settings, :missing_token}} =
              Client.validate_settings(missing_token)
@@ -97,6 +100,84 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     assert {:error, {:invalid_github_projects_settings, :terminal_states_must_preserve_requeue_and_include_closed}} =
              Client.validate_settings(%{settings | terminal_states: ["closed", "Done"]})
+  end
+
+  test "created pipeline PR includes the Build report body" do
+    settings = tracker_settings(%{"repositories" => [%{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]}]})
+    issue = %SymphonyElixir.Tracker.Issue{id: "octo/app#7", branch_name: "symphony/octo-app-7", native_ref: %{repository: "octo/app"}}
+    body = "<!-- symphony:delivery -->\n\nFixes octo/app#7\n\n## Summary\nImplemented it."
+    pr = pipeline_pr(issue, body)
+
+    request_fun = fn query, variables, _settings ->
+      cond do
+        query =~ "pullRequests" ->
+          {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => []}}}}}}
+
+        query =~ "SymphonyPipelineRepository" ->
+          {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"id" => "R_octopus"}}}}}
+
+        query =~ "createPullRequest" ->
+          assert variables["input"]["body"] == body
+          {:ok, %{status: 200, body: %{"data" => %{"createPullRequest" => %{"pullRequest" => pr}}}}}
+      end
+    end
+
+    attrs = %{branch: issue.branch_name, base: "main", sha: "sha-seven", body: body}
+    assert {:ok, %{body: ^body}} = Client.upsert_pull_request_for_test(issue, attrs, settings, request_fun)
+  end
+
+  test "pipeline PR lookup includes merged pull requests" do
+    settings = tracker_settings()
+
+    issue = %SymphonyElixir.Tracker.Issue{
+      id: "octo/app#7",
+      branch_name: "symphony/octo-app-7",
+      native_ref: %{repository: "octo/app", base_branch: "main"}
+    }
+
+    merged_pr =
+      pipeline_pr(issue, "delivery")
+      |> Map.merge(%{"state" => "MERGED", "isDraft" => false, "mergedAt" => "2026-10-21T09:00:00Z"})
+
+    request_fun = fn query, variables, _settings ->
+      assert query =~ "states: [OPEN, CLOSED, MERGED]"
+      assert variables == %{"owner" => "octo", "name" => "app", "branch" => issue.branch_name, "base" => "main"}
+
+      {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [merged_pr]}}}}}}
+    end
+
+    assert {:ok, %{merged: true, state: "MERGED", base: "main"}} =
+             Client.pull_request_for_test(issue, settings, request_fun)
+  end
+
+  test "refreshes a Symphony-owned PR body and preserves a human-edited body" do
+    settings = tracker_settings(%{"repositories" => [%{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]}]})
+    issue = %SymphonyElixir.Tracker.Issue{id: "octo/app#7", branch_name: "symphony/octo-app-7", native_ref: %{repository: "octo/app"}}
+    body = "<!-- symphony:delivery -->\n\nFixes octo/app#7\n\n## Summary\nUpdated it."
+    attrs = %{branch: issue.branch_name, base: "main", sha: "sha-seven", body: body}
+
+    for {existing_body, should_update?} <- [{"<!-- symphony:delivery -->\n\nOld report", true}, {"Human-edited PR description", false}] do
+      calls = Agent.start_link(fn -> [] end) |> elem(1)
+
+      request_fun = fn query, variables, _settings ->
+        Agent.update(calls, &[{query, variables} | &1])
+
+        if query =~ "pullRequests" do
+          pr = pipeline_pr(issue, existing_body)
+          {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [pr]}}}}}}
+        else
+          assert should_update?
+          assert query =~ "updatePullRequest"
+          assert variables["body"] == body
+          {:ok, %{status: 200, body: %{"data" => %{"updatePullRequest" => %{"pullRequest" => pipeline_pr(issue, body)}}}}}
+        end
+      end
+
+      assert {:ok, result} = Client.upsert_pull_request_for_test(issue, attrs, settings, request_fun)
+
+      assert result.body == if(should_update?, do: body, else: existing_body)
+      assert length(Agent.get(calls, & &1)) == if(should_update?, do: 2, else: 1)
+    end
   end
 
   test "fetches Ready native issues from the configured Project and qualifies identity by repository" do
@@ -123,6 +204,49 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert issue.dispatchable
     assert issue.requeueable
     assert issue.labels == ["bug"]
+  end
+
+  test "pipeline Projects polling returns QA, Review, and Human Review items as dispatchable" do
+    statuses = %{
+      "ready" => "Ready",
+      "building" => "Building",
+      "qa" => "QA",
+      "review" => "Review",
+      "human_review" => "Human Review",
+      "blocked" => "Blocked",
+      "dropped" => "Dropped",
+      "done" => "Done"
+    }
+
+    settings =
+      tracker_settings(%{
+        "status_values" => statuses,
+        "repositories" => [
+          %{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["mix test"]}
+        ]
+      })
+      |> Map.merge(%{active_states: ["Ready", "Building", "QA", "Review", "Human Review"], terminal_states: ["closed", "Dropped"]})
+
+    response =
+      project_response([
+        issue_item("octo/app", 1, "Ready"),
+        issue_item("octo/app", 2, "QA"),
+        issue_item("octo/app", 3, "Human Review"),
+        issue_item("octo/app", 4, "Dropped")
+      ])
+
+    response =
+      update_in(response, ["data", "organization", "projectV2", "fields", "nodes", Access.at(0), "options"], fn _ ->
+        Enum.map(statuses, fn {_key, name} -> %{"id" => "option-#{name}", "name" => name} end)
+      end)
+
+    assert {:ok, issues} =
+             Client.fetch_issues_by_states_for_test(Map.values(statuses) -- ["Blocked", "Dropped", "Done"], settings, fn
+               _query, _variables, _settings -> {:ok, %{status: 200, body: response}}
+             end)
+
+    assert Enum.map(issues, & &1.state) == ["Ready", "QA", "Human Review"]
+    assert Enum.all?(issues, & &1.dispatchable)
   end
 
   test "accepts an organization Project when the user lookup returns not found" do
@@ -465,6 +589,21 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     }
   end
 
+  defp pipeline_pr(issue, body) do
+    %{
+      "id" => "PR_pipeline",
+      "number" => 107,
+      "url" => "https://github.com/octo/app/pull/107",
+      "state" => "OPEN",
+      "isDraft" => true,
+      "mergedAt" => nil,
+      "baseRefName" => "main",
+      "headRefName" => issue.branch_name,
+      "headRefOid" => "sha-seven",
+      "body" => body
+    }
+  end
+
   defp issue_item(repository, number, status, issue_state) do
     item = issue_item(repository, number, status)
     put_in(item, ["content", "state"], issue_state)
@@ -524,6 +663,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest.FakeGitHubProjectsClient do
   def claim_issue(issue), do: notify({:projects_claim, issue})
   def complete_issue(issue), do: notify({:projects_complete, issue})
   def block_issue(issue, reason), do: notify({:projects_block, issue, reason})
+  def set_pipeline_status(issue, status, reason), do: notify({:projects_pipeline_status, issue, status, reason})
 
   defp notify(message) do
     send(Application.fetch_env!(:symphony_elixir, :projects_lifecycle_test_owner), message)

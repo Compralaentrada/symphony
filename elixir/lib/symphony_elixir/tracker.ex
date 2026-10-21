@@ -29,13 +29,25 @@ defmodule SymphonyElixir.Tracker do
   @callback claim_issue(Issue.t()) :: :ok | {:error, term()}
   @callback complete_issue(Issue.t()) :: :ok | {:error, term()}
   @callback block_issue(Issue.t(), String.t()) :: :ok | {:error, term()}
+  @callback set_pipeline_status(Issue.t(), atom(), String.t() | nil) :: :ok | {:error, term()}
+  @callback validate_pipeline_delivery(Issue.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  @callback upsert_pull_request(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
+  @callback set_pull_request_stage(Issue.t(), integer(), atom()) :: {:ok, map()} | {:error, term()}
+  @callback pull_request(Issue.t()) :: {:ok, map() | nil} | {:error, term()}
+  @callback publish_phase_report(Issue.t(), String.t(), String.t(), String.t()) :: :ok | {:error, term()}
 
   @optional_callbacks agent_tool_specs: 0,
                       execute_agent_tool: 3,
                       validate_config: 1,
                       claim_issue: 1,
                       complete_issue: 1,
-                      block_issue: 2
+                      block_issue: 2,
+                      set_pipeline_status: 3,
+                      validate_pipeline_delivery: 3,
+                      upsert_pull_request: 2,
+                      set_pull_request_stage: 3,
+                      pull_request: 1,
+                      publish_phase_report: 4
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states) do
@@ -56,6 +68,29 @@ defmodule SymphonyElixir.Tracker do
   @spec block_issue(Issue.t(), String.t()) :: :ok | :ignore | {:error, term()}
   def block_issue(%Issue{} = issue, reason) when is_binary(reason),
     do: issue_lifecycle_callback(:block_issue, [issue, reason])
+
+  @spec set_pipeline_status(Issue.t(), atom(), String.t() | nil) :: :ok | :ignore | {:error, term()}
+  def set_pipeline_status(%Issue{} = issue, status, reason \\ nil),
+    do: issue_lifecycle_callback(:set_pipeline_status, [issue, status, reason])
+
+  @spec validate_pipeline_delivery(Issue.t(), String.t(), String.t()) :: :ok | :ignore | {:error, term()}
+  def validate_pipeline_delivery(%Issue{} = issue, branch, sha),
+    do: issue_lifecycle_callback(:validate_pipeline_delivery, [issue, branch, sha])
+
+  @spec upsert_pull_request(Issue.t(), map()) :: {:ok, map()} | :ignore | {:error, term()}
+  def upsert_pull_request(%Issue{} = issue, attrs),
+    do: issue_lifecycle_callback(:upsert_pull_request, [issue, attrs])
+
+  @spec set_pull_request_stage(Issue.t(), integer(), atom()) :: {:ok, map()} | :ignore | {:error, term()}
+  def set_pull_request_stage(%Issue{} = issue, number, stage),
+    do: issue_lifecycle_callback(:set_pull_request_stage, [issue, number, stage])
+
+  @spec pull_request(Issue.t()) :: {:ok, map() | nil} | :ignore | {:error, term()}
+  def pull_request(%Issue{} = issue), do: issue_lifecycle_callback(:pull_request, [issue])
+
+  @spec publish_phase_report(Issue.t(), String.t(), String.t(), String.t()) :: :ok | :ignore | {:error, term()}
+  def publish_phase_report(%Issue{} = issue, marker, body, phase),
+    do: issue_lifecycle_callback(:publish_phase_report, [issue, marker, body, phase])
 
   @doc """
   Captures the selected adapter and effective tracker settings for one

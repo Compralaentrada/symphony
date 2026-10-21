@@ -38,7 +38,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
-    dynamic_tool_binding = DynamicTool.bind()
+
+    dynamic_tool_binding =
+      if Keyword.get(opts, :disable_tracker_tools, false) do
+        %{DynamicTool.bind() | tool_specs: []}
+      else
+        DynamicTool.bind()
+      end
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do

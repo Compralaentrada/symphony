@@ -15,19 +15,21 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues,
    GitHub Projects v2, Jira Cloud, Asana, and GitLab)
-2. Creates a workspace per issue
-3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
-   workspace
-4. Sends a workflow prompt to Codex
-5. Keeps Codex working on the issue until the work is done
+2. Creates a workspace per issue and launches Codex in
+   [App Server mode](https://developers.openai.com/codex/app-server/)
+3. Uses separate Build, QA, and autonomous Review sessions when GitHub Projects v2 has the pipeline
+   statuses configured; other tracker configurations keep the existing single-run behavior
+4. Creates a draft PR after Build, marks it ready after QA and Review, then waits for a human decision
 
 Local runs discover repo-local Codex skills from `.agents/skills` in the workspace checkout. Symphony checks the selected skills before launching Codex and reports a missing `SKILL.md` path; pinned sources and fingerprints are listed in the repository's `.agents/skills/SOURCES.md`.
 
-During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
-Linear serves `linear_graphql`, GitHub Issues and GitHub Projects v2 serve `github_api`, Jira Cloud serves
-`jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
-tools with configured host-side auth and removes declared tracker-token environment variables from
-the Codex child, so the agent does not need a second tracker login.
+During single-run app-server sessions, the selected tracker adapter may advertise provider-native
+tools. Linear serves `linear_graphql`, GitHub Issues and GitHub Projects v2 serve `github_api`, Jira
+Cloud serves `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes
+those tools with configured host-side auth and removes declared tracker-token environment variables
+from the Codex child. Pipeline phase sessions disable tracker tools; Build pushes through the host's
+Git credential helper or SSH, while Symphony owns the API writes for PRs, Project status, and issue
+reports. Configure push access for each repository profile on the Symphony host.
 
 If a claimed issue moves to a configured terminal state, Symphony stops the active agent and cleans
 up its workspace. In GitHub Projects mode, closing the linked GitHub Issue is terminal; Project
@@ -36,7 +38,14 @@ items in Done or Blocked keep their workspace so moving them back to Ready can r
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. The GitHub
 Projects adapter also updates the Project status and comments on the linked issue with the reason.
-Runtime blocked entries are in memory only; restarting the orchestrator clears that map.
+For the durable Projects pipeline, phase checkpoints and pending external writes are stored in SQLite
+at `~/.symphony/pipeline.sqlite3`; a restart resumes from the last confirmed phase. After the
+independent QA review, Symphony runs every `required_checks` command from the repository profile in
+the task workspace and records host-generated evidence; a missing or failed check cannot pass QA.
+A merge into the configured base branch is required before Symphony sets Done. Moving a Human Review
+item back to Ready requests corrections on the same branch and PR. To move unmerged work to Dropped,
+add a human-authored `Drop reason: <reason>` line to the issue body; after a `no_changes` result,
+this line confirms the decision to discard the work.
 
 ## How to use it
 
@@ -160,7 +169,11 @@ Notes:
   case and surrounding whitespace. A blank configured label matches no issue.
 - GitHub Projects v2 uses Project status for routing and rejects `required_labels`. Its repository
   profiles define the exact repositories Symphony may work in, the base branch, and a preparation
-  command for new workspaces.
+  command for new workspaces. To enable the durable Build → QA → Review pipeline, configure the
+  `qa`, `review`, `human_review`, and `dropped` status values, include the active phase statuses in
+  `tracker.active_states`, include `Dropped` in `tracker.terminal_states`, and set nonempty
+  `required_checks` for each repository profile. The Symphony host also needs Git push credentials
+  for each profile; pipeline agents do not receive the tracker token.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`

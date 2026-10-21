@@ -4,8 +4,12 @@ tracker:
   active_states:
     - Ready
     - Building
+    - QA
+    - Review
+    - Human Review
   terminal_states:
     - closed
+    - Dropped
   provider:
     owner: Compralaentrada
     project_number: 9
@@ -13,12 +17,18 @@ tracker:
     status_values:
       ready: Ready
       building: Building
+      qa: QA
+      review: Review
+      human_review: Human Review
       blocked: Blocked
+      dropped: Dropped
       done: Done
     token: "$GITHUB_TOKEN"
     repositories:
       - repository: Compralaentrada/symphony
         base_branch: main
+        required_checks:
+          - make -C elixir all
         prepare_command: |
           gh repo clone "$SYMPHONY_REPOSITORY" .
           if command -v mise >/dev/null 2>&1; then
@@ -72,13 +82,16 @@ No description provided.
 
 The configured Project status is the source of dispatch:
 
-- Ready: Symphony may start the issue when its repository has a configured profile.
-- Building: the current run may continue.
+- Ready: Symphony starts Build or resumes a human-requested correction on the same branch and PR.
+- Building: the Build phase may continue.
+- QA: an independent agent reviews the current SHA, then Symphony runs every `required_checks` command from the repository profile in the task workspace. Missing or failed host checks cannot pass QA.
+- Review: Symphony runs autonomous code review against the QA-accepted SHA.
+- Human Review: the PR is ready for a person; Symphony waits for a merge or a move back to Ready.
 - Blocked: intervention is required. Record the reason in the issue and workpad; after it is resolved, a human moves the issue to Ready.
-- Done: the current integration considers the run complete. An open issue can be moved back to Ready for another attempt.
+- Done: the PR merge into the configured base branch has been confirmed.
 - Closed GitHub issue: terminal; stop.
 - Backlog: not dispatched.
-- QA, Review, Human Review, and Dropped are reserved for the pipeline in issue #9. The current integration does not dispatch these states; do not move work into them manually.
+- Dropped: terminal work without a merge. Include a human-authored `Drop reason: <reason>` line in the issue body; after `no_changes`, this confirms the decision to discard the work.
 
 The issue identifier starts with the target repository in the form owner/repository#number. Work only in that repository. Do not assume a specific organization, repository, or default branch. The runtime has selected a repository profile and checked out the task branch from that profile's base branch.
 

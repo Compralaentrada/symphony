@@ -8,6 +8,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   @default_graphql_url "https://api.github.com/graphql"
   @statuses ["ready", "building", "blocked", "done"]
+  @pipeline_statuses ["qa", "review", "human_review", "dropped"]
   @project_query """
   query SymphonyProject($owner: String!, $number: Int!, $after: String) {
     user(login: $owner) { projectV2(number: $number) { ...SymphonyProjectFields } }
@@ -28,7 +29,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
         content {
           __typename
           ... on Issue {
-            id number title body state url createdAt updatedAt
+            id number title body state stateReason url createdAt updatedAt
             repository { nameWithOwner }
             labels(first: 100) { nodes { name } }
           }
@@ -67,6 +68,68 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   mutation SymphonyAddIssueComment($subjectId: ID!, $body: String!) {
     addComment(input: { subjectId: $subjectId, body: $body }) {
       commentEdge { node { id } }
+    }
+  }
+  """
+
+  @delivery_query """
+  query SymphonyPipelineDelivery($owner: String!, $name: String!, $branch: String!) {
+    repository(owner: $owner, name: $name) {
+      ref(qualifiedName: $branch) { name target { ... on Commit { oid } } }
+    }
+  }
+  """
+
+  @repository_query """
+  query SymphonyPipelineRepository($owner: String!, $name: String!) {
+    repository(owner: $owner, name: $name) { id }
+  }
+  """
+
+  @pull_request_query """
+  query SymphonyPipelinePullRequest($owner: String!, $name: String!, $branch: String!, $base: String!) {
+    repository(owner: $owner, name: $name) {
+      pullRequests(first: 100, states: [OPEN, CLOSED, MERGED], headRefName: $branch, baseRefName: $base) {
+        nodes { id number url state isDraft mergedAt baseRefName headRefName headRefOid body }
+      }
+    }
+  }
+  """
+
+  @create_pull_request_mutation """
+  mutation SymphonyCreatePipelinePullRequest($input: CreatePullRequestInput!) {
+    createPullRequest(input: $input) { pullRequest { id number url state isDraft mergedAt baseRefName headRefName headRefOid body } }
+  }
+  """
+
+  @update_pull_request_body_mutation """
+  mutation SymphonyUpdatePipelinePullRequestBody($pullRequestId: ID!, $body: String!) {
+    updatePullRequest(input: { pullRequestId: $pullRequestId, body: $body }) {
+      pullRequest { id number url state isDraft mergedAt baseRefName headRefName headRefOid body }
+    }
+  }
+  """
+
+  @draft_mutation """
+  mutation SymphonyConvertPipelinePullRequestToDraft($pullRequestId: ID!) {
+    convertPullRequestToDraft(input: { pullRequestId: $pullRequestId }) {
+      pullRequest { id number url state isDraft mergedAt baseRefName headRefName headRefOid }
+    }
+  }
+  """
+
+  @ready_mutation """
+  mutation SymphonyMarkPipelinePullRequestReady($pullRequestId: ID!) {
+    markPullRequestReadyForReview(input: { pullRequestId: $pullRequestId }) {
+      pullRequest { id number url state isDraft mergedAt baseRefName headRefName headRefOid }
+    }
+  }
+  """
+
+  @comments_query """
+  query SymphonyPipelineReportComments($owner: String!, $name: String!, $number: Int!, $after: String) {
+    repository(owner: $owner, name: $name) {
+      issue(number: $number) { comments(first: 100, after: $after) { nodes { body } pageInfo { hasNextPage endCursor } } }
     }
   }
   """
@@ -152,6 +215,126 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     update_issue_status(issue, :blocked, reason, Config.settings!().tracker, &perform_request/3)
   end
 
+  @spec set_pipeline_status(Issue.t(), atom(), String.t() | nil) :: :ok | {:error, term()}
+  def set_pipeline_status(issue, status, _reason \\ nil) do
+    with {:ok, settings} <- settings(Config.settings!().tracker),
+         ref when is_map(ref) <- issue.native_ref,
+         status when is_binary(status) <- Map.get(settings.statuses, status),
+         :ok <- set_item_status(ref, status, settings, &perform_request/3) do
+      :ok
+    else
+      nil -> {:error, {:github_projects_api_error, "Project item reference is missing."}}
+      {:error, _reason} = error -> error
+      _other -> {:error, {:github_projects_configuration_error, "Pipeline status is not configured."}}
+    end
+  end
+
+  @spec validate_pipeline_delivery(Issue.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def validate_pipeline_delivery(issue, branch, sha)
+      when is_binary(branch) and is_binary(sha) do
+    with {:ok, settings} <- settings(Config.settings!().tracker),
+         {:ok, data} <- graphql(&perform_request/3, @delivery_query, delivery_variables(issue, branch), settings),
+         %{"target" => %{"oid" => ^sha}} <- get_in(data, ["repository", "ref"]) do
+      :ok
+    else
+      {:error, _reason} = error -> error
+      _ -> {:error, {:github_projects_api_error, "The pushed branch does not contain the reported SHA in the configured repository."}}
+    end
+  end
+
+  @spec upsert_pull_request(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
+  def upsert_pull_request(issue, attrs) do
+    upsert_pull_request(issue, attrs, Config.settings!().tracker, &perform_request/3)
+  end
+
+  @doc false
+  @spec upsert_pull_request_for_test(Issue.t(), map(), map(), function()) :: {:ok, map()} | {:error, term()}
+  def upsert_pull_request_for_test(issue, attrs, tracker_settings, request_fun)
+      when is_struct(issue, Issue) and is_map(attrs) and is_map(tracker_settings) and is_function(request_fun, 3) do
+    upsert_pull_request(issue, attrs, tracker_settings, request_fun)
+  end
+
+  defp upsert_pull_request(issue, attrs, tracker_settings, request_fun) do
+    with {:ok, settings} <- settings(tracker_settings),
+         {:ok, repository} <- repository_for_issue(issue),
+         {:ok, existing} <- find_pull_request(issue, attrs.branch, attrs.base, settings, request_fun) do
+      case existing do
+        %{} = pr -> update_pull_request_body(pr, Map.get(attrs, :body), settings, request_fun)
+        nil -> create_pull_request(issue, repository, attrs, settings, request_fun)
+      end
+    end
+  end
+
+  @spec set_pull_request_stage(Issue.t(), integer(), :draft | :ready) :: {:ok, map()} | {:error, term()}
+  def set_pull_request_stage(issue, _number, stage) when stage in [:draft, :ready] do
+    with {:ok, settings} <- settings(Config.settings!().tracker),
+         {:ok, %{} = pr} <- pull_request(issue, settings, &perform_request/3) do
+      update_pull_request_stage(pr, stage, settings)
+    else
+      {:error, _reason} = error -> error
+      _ -> {:error, {:github_projects_api_error, "Unable to update the pull request review stage."}}
+    end
+  end
+
+  defp update_pull_request_stage(%{draft: draft} = pr, stage, _settings) when draft == (stage == :draft),
+    do: {:ok, pr}
+
+  defp update_pull_request_stage(pr, stage, settings) do
+    {mutation, result_key} = pull_request_stage_mutation(stage)
+
+    case graphql(&perform_request/3, mutation, %{"pullRequestId" => pr.id}, settings) do
+      {:ok, data} ->
+        case get_in(data, [result_key, "pullRequest"]) do
+          %{} = updated -> {:ok, normalize_pull_request(updated)}
+          _ -> {:error, {:github_projects_api_error, "Unable to update the pull request review stage."}}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp pull_request_stage_mutation(:draft), do: {@draft_mutation, "convertPullRequestToDraft"}
+  defp pull_request_stage_mutation(:ready), do: {@ready_mutation, "markPullRequestReadyForReview"}
+
+  @spec pull_request(Issue.t()) :: {:ok, map() | nil} | {:error, term()}
+  def pull_request(issue) do
+    with {:ok, settings} <- settings(Config.settings!().tracker) do
+      pull_request(issue, settings, &perform_request/3)
+    end
+  end
+
+  @doc false
+  @spec pull_request_for_test(Issue.t(), map(), function()) :: {:ok, map() | nil} | {:error, term()}
+  def pull_request_for_test(issue, tracker_settings, request_fun)
+      when is_struct(issue, Issue) and is_map(tracker_settings) and is_function(request_fun, 3) do
+    with {:ok, settings} <- settings(tracker_settings) do
+      pull_request(issue, settings, request_fun)
+    end
+  end
+
+  @spec publish_phase_report(Issue.t(), String.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def publish_phase_report(issue, marker, body, _phase) do
+    with {:ok, settings} <- settings(Config.settings!().tracker),
+         {:ok, issue_ref} <- issue_repository_and_number(issue),
+         {:ok, exists?} <- issue_comment_has_marker?(issue_ref, marker, settings, &perform_request/3, nil) do
+      if exists?, do: :ok, else: create_phase_report(issue, body, settings)
+    end
+  end
+
+  defp create_phase_report(issue, body, settings) do
+    case ref_value(issue.native_ref, :issue_node_id) do
+      subject_id when is_binary(subject_id) ->
+        case graphql(&perform_request/3, @comment_mutation, %{"subjectId" => subject_id, "body" => body}, settings) do
+          {:ok, _} -> :ok
+          {:error, _reason} = error -> error
+        end
+
+      _ ->
+        {:error, {:github_projects_api_error, "Linked GitHub Issue has no node ID for the phase report."}}
+    end
+  end
+
   defp fetch_issues_by_states(states, tracker_settings, request_fun) do
     requested = MapSet.new(states, &normalize_state/1)
 
@@ -159,7 +342,9 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          {:ok, metadata, items} <- project_items(settings, request_fun),
          {:ok, issues} <- normalize_items(items, metadata, settings, request_fun) do
       # Building items are reconciled by ID; only Ready items enter the dispatch poll.
-      dispatch_ready? = MapSet.member?(requested, normalize_state(settings.statuses.ready))
+      dispatch_ready? =
+        MapSet.member?(requested, normalize_state(settings.statuses.ready)) and
+          not pipeline_statuses?(settings.statuses)
 
       issues
       |> Enum.filter(&requested_state?(&1, requested, dispatch_ready?, settings))
@@ -325,19 +510,24 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     repository = get_in(content, ["repository", "nameWithOwner"])
     number = content["number"]
     id = "#{repository}##{number}"
-    dispatch_status? = status_in?(project_status, [settings.statuses.ready, settings.statuses.building])
+
+    dispatch_status? =
+      status_in?(project_status, [settings.statuses.ready, settings.statuses.building] ++ pipeline_status_values(settings.statuses))
 
     native_ref = %{
       project_item_id: item["id"],
       project_id: metadata.project_id,
       status_field_id: metadata.status_field_id,
       status_option_ids: metadata.status_option_ids,
+      status_values: Map.new(settings.statuses, fn {key, value} -> {Atom.to_string(key), value} end),
       project_status: project_status,
       issue_node_id: content["id"],
       issue_state: content["state"],
+      issue_state_reason: content["stateReason"],
       repository: repository,
       base_branch: profile && profile.base_branch,
-      prepare_command: profile && profile.prepare_command
+      prepare_command: profile && profile.prepare_command,
+      required_checks: profile && profile.required_checks
     }
 
     %Issue{
@@ -360,7 +550,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp maybe_mark_closed(item, status, settings, metadata, request_fun) do
-    if normalize_state(status) == normalize_state(settings.statuses.done) do
+    if pipeline_statuses?(settings.statuses) or normalize_state(status) == normalize_state(settings.statuses.done) do
       :ok
     else
       item
@@ -511,6 +701,152 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     end
   end
 
+  defp delivery_variables(issue, branch) do
+    {owner, name} = split_repository(ref_value(issue.native_ref, :repository))
+    %{"owner" => owner, "name" => name, "branch" => "refs/heads/" <> branch}
+  end
+
+  defp repository_for_issue(issue) do
+    case split_repository(ref_value(issue.native_ref, :repository)) do
+      {owner, name} when is_binary(owner) and is_binary(name) -> {:ok, %{owner: owner, name: name}}
+      _ -> {:error, {:github_projects_configuration_error, "Pipeline issue has no configured repository."}}
+    end
+  end
+
+  defp issue_repository_and_number(issue) do
+    case String.split(issue.id, "#", parts: 2) do
+      [repository, number] ->
+        case Integer.parse(number) do
+          {number, ""} ->
+            {owner, name} = split_repository(repository)
+            {:ok, %{"owner" => owner, "name" => name, "number" => number}}
+
+          _ ->
+            {:error, {:github_projects_api_error, "Pipeline issue identifier is invalid."}}
+        end
+
+      _ ->
+        {:error, {:github_projects_api_error, "Pipeline issue identifier is invalid."}}
+    end
+  end
+
+  defp issue_comment_has_marker?(issue_ref, marker, settings, request_fun, cursor) do
+    variables = Map.put(issue_ref, "after", cursor)
+
+    with {:ok, data} <- graphql(request_fun, @comments_query, variables, settings) do
+      comments = get_in(data, ["repository", "issue", "comments"]) || %{}
+      nodes = comments["nodes"] || []
+      page_info = comments["pageInfo"] || %{}
+      found? = Enum.any?(nodes, &String.contains?(&1["body"] || "", marker))
+
+      cond do
+        found? -> {:ok, true}
+        page_info["hasNextPage"] -> issue_comment_has_marker?(issue_ref, marker, settings, request_fun, page_info["endCursor"])
+        true -> {:ok, false}
+      end
+    end
+  end
+
+  defp find_pull_request(issue, branch, base, settings, request_fun) do
+    variables = repository_for_issue(issue)
+
+    with {:ok, repository} <- variables,
+         {:ok, data} <-
+           graphql(request_fun, @pull_request_query, pull_request_variables(repository, branch, base), settings) do
+      nodes = get_in(data, ["repository", "pullRequests", "nodes"]) || []
+
+      {:ok,
+       nodes
+       |> Enum.map(&normalize_pull_request/1)
+       |> Enum.find(&(&1.branch == branch and &1.base == base and &1.state == "OPEN" and not &1.merged))}
+    end
+  end
+
+  defp pull_request(issue, settings, request_fun) do
+    branch = issue.branch_name
+    base = ref_value(issue.native_ref, :base_branch)
+
+    with {:ok, repository} <- repository_for_issue(issue),
+         {:ok, data} <-
+           graphql(request_fun, @pull_request_query, pull_request_variables(repository, branch, base), settings) do
+      nodes = get_in(data, ["repository", "pullRequests", "nodes"]) || []
+      pr = nodes |> Enum.map(&normalize_pull_request/1) |> Enum.find(&(&1.branch == branch and &1.base == base))
+      {:ok, pr}
+    end
+  end
+
+  defp pull_request_variables(repository, branch, base) do
+    %{"owner" => repository.owner, "name" => repository.name, "branch" => branch, "base" => base}
+  end
+
+  defp create_pull_request(issue, repository, attrs, settings, request_fun) do
+    variables = %{"owner" => repository.owner, "name" => repository.name}
+
+    with {:ok, data} <- graphql(request_fun, @repository_query, variables, settings),
+         repository_id when is_binary(repository_id) <- get_in(data, ["repository", "id"]),
+         {:ok, issue_ref} <- issue_repository_and_number(issue),
+         input = %{
+           "repositoryId" => repository_id,
+           "baseRefName" => attrs.base,
+           "headRefName" => attrs.branch,
+           "title" => issue.title,
+           "body" => attrs[:body] || "Fixes ##{issue_ref["number"]}\n\nCreated by Symphony after the Build phase.",
+           "draft" => true
+         },
+         {:ok, created} <- graphql(request_fun, @create_pull_request_mutation, %{"input" => input}, settings),
+         %{} = pr <- get_in(created, ["createPullRequest", "pullRequest"]) do
+      {:ok, normalize_pull_request(pr)}
+    else
+      {:error, _reason} = error -> error
+      _ -> {:error, {:github_projects_api_error, "GitHub did not create the pipeline pull request."}}
+    end
+  end
+
+  defp normalize_pull_request(pr) do
+    %{
+      id: pr["id"],
+      number: pr["number"],
+      url: pr["url"],
+      state: pr["state"],
+      draft: pr["isDraft"],
+      merged: is_binary(pr["mergedAt"]),
+      base: pr["baseRefName"],
+      branch: pr["headRefName"],
+      sha: pr["headRefOid"],
+      body: pr["body"]
+    }
+  end
+
+  defp update_pull_request_body(pr, body, _settings, _request_fun) when not is_binary(body), do: {:ok, pr}
+
+  defp update_pull_request_body(%{body: current} = pr, body, settings, request_fun) do
+    cond do
+      current == body ->
+        {:ok, pr}
+
+      is_binary(current) and String.contains?(current, "<!-- symphony:delivery -->") ->
+        with {:ok, data} <- graphql(request_fun, @update_pull_request_body_mutation, %{"pullRequestId" => pr.id, "body" => body}, settings),
+             %{} = updated <- get_in(data, ["updatePullRequest", "pullRequest"]) do
+          {:ok, normalize_pull_request(updated)}
+        else
+          {:error, _reason} = error -> error
+          _ -> {:error, {:github_projects_api_error, "Unable to update the pipeline pull request body."}}
+        end
+
+      true ->
+        {:ok, pr}
+    end
+  end
+
+  defp split_repository(repository) when is_binary(repository) do
+    case String.split(repository, "/", parts: 2) do
+      [owner, name] -> {owner, name}
+      _ -> {nil, nil}
+    end
+  end
+
+  defp split_repository(_repository), do: {nil, nil}
+
   defp add_issue_comment(ref, reason, settings, request_fun) do
     subject_id = ref_value(ref, :issue_node_id)
 
@@ -610,6 +946,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          {:ok, profiles} <- repository_settings(provider),
          {:ok, graphql_url} <- graphql_url_setting(provider),
          {:ok, token} <- token_setting(provider),
+         :ok <- validate_pipeline_profiles(statuses, profiles),
          :ok <- validate_routing_settings(tracker_settings, statuses) do
       {:ok,
        Map.merge(project, %{
@@ -684,10 +1021,12 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp status_values(values) when is_map(values) do
     result = Map.new(values, fn {key, value} -> {to_string(key), normalize_string(value)} end)
+    pipeline_configured? = Enum.any?(@pipeline_statuses, &Map.has_key?(result, &1))
+    keys = if pipeline_configured?, do: @statuses ++ @pipeline_statuses, else: @statuses
 
-    if Enum.all?(@statuses, &present_string?(Map.get(result, &1))) and
-         length(Enum.uniq(Map.take(result, @statuses) |> Map.values())) == length(@statuses) do
-      Map.new(@statuses, fn key -> {String.to_existing_atom(key), result[key]} end)
+    if Enum.all?(keys, &present_string?(Map.get(result, &1))) and
+         length(Enum.uniq(Map.take(result, keys) |> Map.values())) == length(keys) do
+      Map.new(keys, fn key -> {String.to_existing_atom(key), result[key]} end)
     end
   end
 
@@ -698,14 +1037,16 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       repository = normalize_string(profile_value(profile, "repository"))
       base_branch = normalize_string(profile_value(profile, "base_branch"))
       prepare_command = normalize_string(profile_value(profile, "prepare_command"))
+      required_checks = normalize_required_checks(profile_value(profile, "required_checks"))
       key = normalize_repository(repository)
 
       if valid_repository?(repository) and present_string?(base_branch) and
-           present_string?(prepare_command) and not Map.has_key?(acc, key) do
+           present_string?(prepare_command) and not is_nil(required_checks) and not Map.has_key?(acc, key) do
         normalized = %{
           repository: repository,
           base_branch: base_branch,
-          prepare_command: prepare_command
+          prepare_command: prepare_command,
+          required_checks: required_checks
         }
 
         {:cont, Map.put(acc, key, normalized)}
@@ -717,20 +1058,47 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp repository_profiles(_profiles), do: nil
 
+  defp normalize_required_checks(nil), do: []
+
+  defp normalize_required_checks(checks) when is_list(checks) do
+    normalized = Enum.map(checks, &normalize_string/1)
+    if Enum.all?(normalized, &present_string?/1), do: Enum.uniq(normalized), else: nil
+  end
+
+  defp normalize_required_checks(_checks), do: nil
+
+  defp validate_pipeline_profiles(statuses, profiles) do
+    if pipeline_statuses?(statuses) and Enum.any?(profiles, fn {_repo, profile} -> profile.required_checks == [] end) do
+      invalid_settings(:pipeline_requires_repository_required_checks)
+    else
+      :ok
+    end
+  end
+
+  defp pipeline_statuses?(statuses), do: Enum.all?(@pipeline_statuses, &Map.has_key?(statuses, String.to_existing_atom(&1)))
+
+  defp pipeline_status_values(statuses) do
+    if pipeline_statuses?(statuses), do: Enum.map([:qa, :review, :human_review], &Map.fetch!(statuses, &1)), else: []
+  end
+
   defp valid_active_states(states, statuses) when is_list(states) do
     normalized = MapSet.new(states, &normalize_state/1)
+    active_pipeline = Enum.map([:qa, :review, :human_review], &Map.get(statuses, &1)) |> Enum.reject(&is_nil/1)
 
     Enum.all?([statuses.ready, statuses.building], &MapSet.member?(normalized, normalize_state(&1))) and
-      Enum.all?([statuses.blocked, statuses.done], &(not MapSet.member?(normalized, normalize_state(&1))))
+      Enum.all?(active_pipeline, &MapSet.member?(normalized, normalize_state(&1))) and
+      Enum.all?([statuses.blocked, statuses.done, Map.get(statuses, :dropped)], &(is_nil(&1) or not MapSet.member?(normalized, normalize_state(&1))))
   end
 
   defp valid_active_states(_states, _statuses), do: false
 
   defp valid_terminal_states(states, statuses) when is_list(states) do
     normalized = MapSet.new(states, &normalize_state/1)
+    dropped = Map.get(statuses, :dropped)
 
     MapSet.member?(normalized, "closed") and
-      Enum.all?([statuses.done, statuses.blocked], &(not MapSet.member?(normalized, normalize_state(&1))))
+      Enum.all?([statuses.done, statuses.blocked], &(not MapSet.member?(normalized, normalize_state(&1)))) and
+      (is_nil(dropped) or MapSet.member?(normalized, normalize_state(dropped)))
   end
 
   defp valid_terminal_states(_states, _statuses), do: false
