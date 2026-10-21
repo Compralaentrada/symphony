@@ -1,7 +1,7 @@
 import Config
 
 config :phoenix, :json_library, Jason
-config :tongue, languages: ~w(en es)a
+config :tongue, languages: ~w(en es fr)a
 
 config :symphony_elixir, SymphonyElixirWeb.Endpoint,
   adapter: Bandit.PhoenixAdapter,
