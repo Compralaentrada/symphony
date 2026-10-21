@@ -283,6 +283,35 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     File.rm_rf!(Path.dirname(path))
   end
 
+  test "blocked reports retry until their summary, reason, and next step are present" do
+    issue = %{issue("octo/app#15", 15) | description: "Falta acceso al entorno de pruebas."}
+
+    incomplete_reports = [
+      Map.put(blocked(), "summary", " "),
+      Map.put(blocked(), "reason", "\n"),
+      Map.put(blocked(), "next_step", "")
+    ]
+
+    table = start_board([issue], %{issue.id => %{build: incomplete_reports ++ [blocked()]}})
+    path = pipeline_database!(table, retry_backoff_ms: 1)
+    orchestrator = start_orchestrator()
+
+    assert await(fn -> project_state(table, issue.id) == "Blocked" end)
+    assert agent_calls(table, issue.id, :build) == 4
+    assert report_phases(table, issue.id) == [:build]
+
+    report = table |> lookup({:reports, issue.id}) |> Map.values() |> List.first()
+    assert report =~ "### Resumen\n\nHace falta acceso al entorno de pruebas."
+    assert report =~ "### Bloqueo\n\nNo están disponibles las credenciales necesarias para las pruebas."
+    assert report =~ "### Siguiente paso\n\nResuelve el acceso y mueve la tarea a Ready."
+    assert report =~ "No se ejecutaron pruebas porque la fase quedó bloqueada."
+    refute report =~ "null"
+    refute report =~ ~r/\"(?:outcome|summary|reason|next_step)\"\s*:/
+
+    stop_orchestrator(orchestrator)
+    File.rm_rf!(Path.dirname(path))
+  end
+
   test "QA host checks reject workspace drift after the accepted Build SHA" do
     issue = issue("octo/app#11", 11)
 

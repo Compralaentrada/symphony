@@ -894,7 +894,7 @@ defmodule SymphonyElixir.Pipeline do
           }),
         else: result
 
-    if is_binary(result["outcome"]) and is_binary(result["summary"]) and valid_report?(phase, result),
+    if is_binary(result["outcome"]) and nonblank_string?(result["summary"]) and valid_report?(phase, result),
       do: {:ok, result},
       else: {:error, {:invalid_phase_report, invalid_report_details(phase, result)}}
   end
@@ -927,27 +927,32 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp valid_report?("build", %{"outcome" => "ready"} = result) do
-    is_binary(result["sha"]) and is_binary(result["next_step"]) and
+    nonblank_string?(result["sha"]) and nonblank_string?(result["next_step"]) and
       Enum.all?(["criteria", "changes", "checks", "risks"], &is_list(result[&1]))
   end
 
   defp valid_report?("build", %{"outcome" => outcome} = result) when outcome in ["no_changes", "blocked"],
-    do: is_binary(result["reason"])
+    do: nonblank_string?(result["reason"]) and nonblank_string?(result["next_step"])
 
   defp valid_report?("qa", %{"outcome" => outcome} = result) when outcome in ["passed", "changes_requested", "failed", "defects_found"] do
-    is_binary(result["sha"]) and is_list(result["criteria"]) and is_list(result["changes"]) and
-      is_list(result["checks"]) and valid_findings?(result["findings"]) and is_binary(result["next_step"])
+    nonblank_string?(result["sha"]) and is_list(result["criteria"]) and is_list(result["changes"]) and
+      is_list(result["checks"]) and valid_findings?(result["findings"]) and nonblank_string?(result["next_step"])
   end
 
-  defp valid_report?("qa", %{"outcome" => "blocked"} = result), do: is_binary(result["reason"])
+  defp valid_report?("qa", %{"outcome" => "blocked"} = result),
+    do: nonblank_string?(result["reason"]) and nonblank_string?(result["next_step"])
 
   defp valid_report?("review", %{"outcome" => outcome} = result) when outcome in ["passed", "changes_requested", "failed", "defects_found"] do
-    is_binary(result["sha"]) and valid_findings?(result["findings"]) and is_list(result["resolutions"]) and
-      is_binary(result["next_step"])
+    nonblank_string?(result["sha"]) and valid_findings?(result["findings"]) and is_list(result["resolutions"]) and
+      nonblank_string?(result["next_step"])
   end
 
-  defp valid_report?("review", %{"outcome" => "blocked"} = result), do: is_binary(result["reason"])
+  defp valid_report?("review", %{"outcome" => "blocked"} = result),
+    do: nonblank_string?(result["reason"]) and nonblank_string?(result["next_step"])
+
   defp valid_report?(_phase, _result), do: false
+
+  defp nonblank_string?(value), do: is_binary(value) and not blank?(value)
 
   defp valid_findings?(findings) when is_list(findings) do
     Enum.all?(findings, fn
