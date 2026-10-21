@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  validate-pr-description:
+  validate-pr-title-and-description:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -27,12 +27,26 @@ jobs:
           cache: true
           working_directory: elixir
 
-      - name: Validate PR description format
-        env:
-          PR_BODY_JSON: ${{ toJson(github.event.pull_request.body) }}
+      - name: Install Mix dependencies
         run: |
           mix local.hex --force
           mix local.rebar --force
           mix deps.get
+
+      # Existing drafts are checked when readied; title edits are checked immediately.
+      - name: Validate PR title format
+        if: >-
+          github.event.action == 'opened' ||
+          github.event.action == 'reopened' ||
+          github.event.action == 'ready_for_review' ||
+          github.event.changes.title != null
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: mix title.check --title "$PR_TITLE"
+
+      - name: Validate PR description format
+        env:
+          PR_BODY_JSON: ${{ toJson(github.event.pull_request.body) }}
+        run: |
           printf '%s' "$PR_BODY_JSON" | jq -r '.' > /tmp/pr_body.md
           mix pr_body.check --file /tmp/pr_body.md

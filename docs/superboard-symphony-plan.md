@@ -1,9 +1,10 @@
 # Plan de implementación de Super Board sobre Symphony
 
 **Proyecto:** [Compralaentrada/symphony](https://github.com/Compralaentrada/symphony)  
-**Estado:** decisiones de producto validadas para el piloto; diseño técnico pendiente
+**Estado:** roadmap de pipeline validado; issue #9 en curso
 **Fecha:** 20 de octubre de 2026  
-**Base inspeccionada:** `15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d` de `Compralaentrada/symphony`
+**HEAD del fork revisado para este roadmap:** `4f2fbc8`
+**Base de la investigación técnica:** `15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d` de `Compralaentrada/symphony`
 
 El fork convertirá Symphony en un servicio capaz de tomar tareas de un tablero compartido, ejecutarlas en el repositorio adecuado y conducirlas por Build, QA y Review hasta una entrega verificable. El objetivo operativo es que las tareas terminen o comuniquen un bloqueo concreto, conservando el trabajo cuando falle una dependencia o se reinicie el servicio.
 
@@ -23,7 +24,9 @@ El sistema debe permitir:
 - Reanudar tras un reinicio desde el último resultado confirmado, conservando ramas, artefactos y decisiones.
 - Mostrar por qué una tarea avanza, espera o se bloquea, con un siguiente paso concreto.
 - Limitar concurrencia, intentos, tiempo y consumo acumulado.
-- Incorporar posteriormente recogida de incidencias, refinado de UI, visualizaciones y automatización de merge.
+- Despachar tareas Ready con un máximo global configurable de cinco slots y dependencias explícitas.
+- Mantener el estado del Project como autoridad, usando SQLite solo como diario interno de ejecución.
+- Conservar el merge humano por defecto y permitir auto-merge únicamente con activación explícita y el gate completo.
 
 La primera demostración útil será una tarea real que complete el recorrido hasta una PR revisable sin reparar manualmente el ejecutor entre fases. Después se comprobarán dos repositorios en el mismo tablero y la recuperación ante fallos.
 
@@ -32,16 +35,20 @@ La primera demostración útil será una tarea real que complete el recorrido ha
 | Asunto | Dirección propuesta | Alcance |
 | --- | --- | --- |
 | Base | Fork existente de Symphony y referencia Elixir | Mantener transporte Codex, supervisión OTP, workspaces y observabilidad que sigan siendo válidos. |
-| Tracker | GitHub Issues actual o GitHub Projects v2, seleccionable por instalación | Se conserva el contrato de GitHub Issues; Projects v2 añade el tablero multi-repo con campos y opciones configurables, sin fijar una organización. |
-| Ejecución | Un servicio Symphony con registro de repositorios | Un scheduler propietario de las tareas y procesos de agente por fase. |
-| Pipeline | Build → QA → Review autónoma → Human Review | QA y Review usan sesiones nuevas; los resultados validados gobiernan el avance y los rebotes. |
-| Skills | Catálogo versionado de Super Board y skills específicas de cada repo | Cargar las necesarias por fase y capacidades, con su procedencia. |
-| Persistencia | SQLite en un host | Persistir fases, checkpoints, evidencias e intenciones de efectos externos en almacenamiento durable. |
-| Entrega inicial | PR draft después de Build; lista para revisión tras QA y Review; merge humano | `Done` exige confirmar el merge; la espera de una persona usa `Human Review`. |
-| Paralelismo inicial | Un agente global | La arquitectura admite varios repos; aumentar el paralelismo tras validar la recuperación. |
+| Tracker | Se conserva GitHub Issues y se añade Projects v2 | La instalación conserva el tracker existente; en modo Projects se configura un único Project ID para coordinar repositorios. |
+| Estado del trabajo | El Project gobierna la intención y estado visible | SQLite registra ejecución, fases, checkpoints y operaciones; nunca sustituye una decisión visible del Project. |
+| Ejecución | Un servicio Symphony con perfiles de repositorio | Un scheduler global despacha tareas independientes a slots disponibles; no usa waves ni prioridad por fase. |
+| Pipeline | `bug`/`feature`: Build → QA → Review; `qa`: QA → Review | La app define los estados y las skills del ciclo; cada fase autónoma usa una sesión separada. |
+| Skills | Catálogo y enrutamiento propios de la app | Se usan skills fijadas solo cuando aplican; la instalación no configura el mapeo por fase. |
+| Persistencia | SQLite en un host | Diario interno de ejecución, checkpoints, evidencias y operaciones idempotentes; el Project sigue siendo la autoridad del estado visible. |
+| Configuración | Project, perfiles de repo, un modelo global, slots y política de merge | Cada perfil contiene repo, rama base y preparación del entorno; estados y skills son fijos de la app. |
+| Slots | `max_active_tasks: 5` por defecto | Una tarea ocupa un slot durante Build, QA y Review; se despachan las Ready elegibles más antiguas. |
+| Entrega | Human Review por defecto; auto-merge opt-in | `Done` exige verificar el merge; las esperas humanas liberan el slot. |
 | Idioma | Español para títulos, explicaciones e informes | Mantener código, identificadores, comandos y nombres técnicos cuando corresponda. |
 
-El primer piloto usa una issue de Symphony en un Project de prueba elegido en la configuración local. La arquitectura sigue siendo válida para cualquier instalación, organización y conjunto de repositorios. El merge automático y el procesamiento coordinado en varios hosts quedan fuera del piloto.
+El primer piloto usa una issue de Symphony en un Project de prueba elegido en la configuración local. La arquitectura sigue siendo válida para cualquier instalación, organización y conjunto de repositorios. El merge automático permanece desactivado por defecto; la política puede activarlo explícitamente tras validar el gate.
+
+El roadmap se limita al pipeline y a su operación: Projects, routing por repo, skills de Build/QA/Review, dependencias, slots, recuperación, seguridad y entrega. Intake, UI refine, visualización, calibración y otros productos de Super Board quedan fuera.
 
 ## 3 Base disponible y extensiones necesarias
 
@@ -67,6 +74,7 @@ flowchart TD
     R[Perfiles de repositorios] --> O
     D[Almacén de ejecuciones y operaciones] <--> O
     O --> B[Sesión Build]
+    O -->|tipo qa| Q
     B --> Q[Sesión QA]
     Q --> V[Sesión Review]
     B --> H[Herramientas del host]
@@ -89,7 +97,7 @@ Se empezará con un host y un almacén de escritura. Los workers remotos y varia
 
 ### Estados visibles
 
-Al seleccionar Projects v2, el campo de estado y sus valores se configuran por instalación. Los nombres conceptuales del ciclo inicial son **Backlog, Ready, Building, QA, Review, Human Review, Blocked, Done y Dropped**. `Review` siempre significa revisión autónoma; la espera de decisión humana usa `Human Review`. El tracker GitHub Issues mantiene su contrato actual de issues abiertas y cerradas; esta entrega piloto del pipeline usa Projects v2.
+En Projects v2, Symphony exige el campo y las opciones de estado definidos por la app: **Backlog, Ready, Building, QA, Review, Human Review, Blocked, Done y Dropped**. El onboarding valida que el Project los tenga; no se configura un mapping distinto por instalación. `Review` siempre significa revisión autónoma; la espera humana usa `Human Review`. El tracker GitHub Issues mantiene su contrato actual de issues abiertas y cerradas.
 
 | Columna | Significado | Condición para actuar |
 | --- | --- | --- |
@@ -109,13 +117,13 @@ Cada fase usa una sesión nueva. La espera en `Human Review` libera el slot y pe
 
 La identidad estable contendrá `project_id`, `project_item_id`, `issue_node_id` y `repository_id`. La referencia humana será `owner/repo#number`. Cambiar el título, renombrar el repo o repetir `#42` en otro repositorio no debe crear una ejecución incorrecta. La branch y el workspace incluirán un identificador único del intento.
 
-Campos mínimos: Status, repositorio asociado a la issue, prioridad, tipo, riesgo, responsable, PR y resultado de ejecución. Conservar `bug`, `feature` y `qa` permite reproducir la clasificación de Super Board; una tarjeta `qa` comienza en QA y no crea una implementación ficticia. [SB1]
+El item debe vincular una issue, un repo registrado y un tipo de tarea. Las dependencias se leen de relaciones explícitas entre issues. `bug` y `feature` recorren Build → QA → Review; `qa` entra directamente en QA y luego pasa por Review, sin fabricar una fase de implementación. La antigüedad de Ready decide el despacho; la prioridad del Project no altera el orden. [SB1]
 
 Las ideas sin issue pueden permanecer en Backlog. Para pasar a ejecución deben convertirse en una issue con repo inequívoco. Un item PR se vincula como resultado; no se interpreta automáticamente como una nueva tarea de implementación.
 
 ### Autoridad y sincronización
 
-El tablero expresa el estado de trabajo y la intención humana. El almacén de ejecuciones es la autoridad de los intentos, las fases y los efectos confirmados. Un estado visible no sustituye la evidencia que exige su transición.
+El Project es la autoridad del estado visible y la intención humana. SQLite es un diario interno de intentos, fases, checkpoints, evidencias y efectos externos; no puede contradecir ni reemplazar el estado del Project. Al reiniciar, Symphony reconcilia el Project, GitHub y SQLite antes de reanudar. Si no puede resolver una discrepancia sin adivinar, detiene la tarea y muestra el motivo.
 
 Mover a `Ready` inicia o reanuda según el estado anterior. Si una persona pide cambios desde `Human Review`, Symphony devuelve la misma PR a draft y conserva su rama; tras rehacer Build y repetir QA y Review, la marca lista para revisión antes de volver a `Human Review`. Desde `Blocked`, se conserva la rama y PR si existen y se reanuda desde el último checkpoint confirmado. Una issue cerrada en `Done` no se reactiva al mover el item del Project a `Ready`; el trabajo posterior requiere una issue nueva. Mover una tarea activa a `Blocked` o `Backlog` solicita parar: Symphony cancela el proceso, conserva el trabajo y confirma la parada. Un cambio manual a `Done` no acredita un merge.
 
@@ -123,57 +131,49 @@ El agente publica la rama y devuelve el SHA. Symphony verifica ese resultado y e
 
 Una indisponibilidad de GitHub mantiene el estado conocido y limita los efectos nuevos. Las lecturas paginadas incompletas, permisos insuficientes o respuestas GraphQL con errores no equivalen a un tablero vacío.
 
-El adaptador usará los IDs reales de campos y opciones. Resolverlos por nombre sirve para onboarding, pero una vez configurados se validan; no se crean columnas ni se migran tareas silenciosamente al arrancar. Projects permite consultar items y mutar campos mediante GraphQL. [GH1]
+El adaptador valida el campo y las opciones canónicas durante el onboarding. No crea columnas, renombra estados ni migra tareas al arrancar. Projects permite consultar items y mutar campos mediante GraphQL. [GH1]
 
 ## 6 Registro de repositorios y configuración
 
-Un perfil por repo declarará su identidad remota, rama base, runtime, preparación del entorno, capacidades, comprobaciones, skills y política de entrega. Evitar rutas específicas del portátil como parte de la configuración compartida.
+La configuración de instalación contiene el Project ID, la lista de perfiles de repositorio, un modelo común para todas las fases, `max_active_tasks` y la política de merge. Cada perfil de repo declara su identidad remota, rama base y preparación del entorno. Los estados, las fases, el catálogo de skills y su routing son propios de la app, no opciones por instalación.
 
 Estructura propuesta, pendiente de implementar:
 
 ```text
-WORKFLOW.md                         configuración común y contrato de despacho
-config/repositories/*.yaml          perfiles de repositorios
-skills/*/SKILL.md                   skills portadas
+WORKFLOW.md                         Project ID, modelo, slots, merge y perfiles de repos
+skills/*/SKILL.md                   skills incluidas y mantenidas por la app
 skills/catalog.lock.json            procedencia y revisiones fijadas
-docs/superboard-symphony-plan.md     especificación de producto
+docs/superboard-symphony-plan.md     especificación y roadmap del pipeline
 ```
 
-El archivo de bloqueo registra SHA y huella de contenido; no instala skills por similitud de nombre. Las credenciales y los datos de ejecución se guardan fuera del repositorio.
+El archivo de bloqueo registra SHA y huella de contenido; la app resuelve skills aplicables y verifica su disponibilidad, sin permitir que una instalación las remapee por fase. Las credenciales y los datos de ejecución se guardan fuera del repositorio.
 
-Ejemplo conceptual de perfil; este esquema no existe todavía en el fork:
+Ejemplo conceptual de configuración; este esquema no existe todavía en el fork:
 
 ```yaml
-schema_version: 1
-repository: owner/example-repo
-base_branch: master
-workspace_strategy: isolated_clone
-runtime_profile: example-runtime
-phases:
-  build: { skill: super-build }
-  qa: { skill: super-qa }
-  review: { skill: super-review }
-checks_profile: vue-impact-scoped
-delivery:
-  pull_request: draft
-  merge_policy: human
-limits:
-  max_active_runs: 1
+project_id: github-project-node-id
+model: configured-model
+max_active_tasks: 5
+merge_policy: human # auto solo por activación explícita
+repositories:
+  - repository: owner/example-repo
+    base_branch: main
+    prepare: ["mise", "install"]
 ```
 
-No se ejecutan comandos interpolados desde el título de una tarea. Los checks se representan como argumentos estructurados, con directorio de trabajo, timeout y entorno permitidos. La configuración efectiva se valida y se guarda por intento antes de ejecutar código.
+El modelo se aplica a Build, QA y Review y no cambia silenciosamente ante un error. No se ejecutan comandos interpolados desde el título de una tarea; la preparación del repo usa argumentos estructurados, con directorio de trabajo, timeout y entorno permitidos. Los checks se obtienen de las instrucciones y herramientas del repo junto con los controles fijos de la app. La configuración efectiva se valida y se guarda por intento antes de ejecutar código.
 
-Precedencia propuesta: invariantes del host → política organizativa → perfil del repo → reglas de desarrollo del repo → instrucciones específicas de la tarea. Las reglas del repositorio pueden exigir más comprobaciones; una contradicción material con el perfil bloquea admisión con un diagnóstico. El contenido de una issue no modifica permisos del ejecutor.
+Precedencia: invariantes de la app → configuración de instalación → instrucciones del repo → instrucciones específicas de la tarea. Las reglas del repositorio pueden exigir más comprobaciones; una contradicción material bloquea la admisión con un diagnóstico. El contenido de una issue no modifica permisos del ejecutor.
 
-Al recargar configuración, los intentos activos conservan su snapshot. Una petición explícita de parada o una revocación de acceso sí debe poder cancelarlos. Esto exige separar recarga rutinaria de revocación operativa.
+Al recargar configuración, los intentos activos conservan su snapshot de repo, modelo y límites. Una petición explícita de parada o una revocación de acceso puede cancelarlos. Esto separa recarga rutinaria de revocación operativa.
 
 ## 7 Contrato del pipeline
 
 ### Admisión y preparación
 
-Antes de gastar un turno de implementación, el host comprueba repo y rama base, acceso necesario, disponibilidad de skills y herramientas, estado del workspace, dependencias de la tarea y perfil de checks. La comprobación de aceptación determina si se puede trabajar, si otra PR ya resuelve el problema o si falta información.
+Antes de gastar un turno, el host comprueba Project, issue, repo y rama base, preparación del entorno, modelo configurado, disponibilidad de las skills fijas y estado del workspace. El scheduler considera elegible una tarea Ready solo cuando sus dependencias explícitas están resueltas. Una tarea con una dependencia pendiente permanece en `Ready` sin ocupar slot; si la relación no puede interpretarse, requiere intervención y pasa a `Blocked` con un motivo claro.
 
-La deduplicación usa identidad de tarea y PR vinculada; los candidatos similares requieren interpretación. Una coincidencia de palabras no cierra automáticamente un bug. Las dependencias entre repos se resuelven por identidad completa, no por números locales.
+El scheduler llena los slots libres con las tareas Ready elegibles más antiguas. Una tarea ocupa un slot durante sus fases automáticas Build, QA y Review; libera el slot al terminar, quedar `Blocked` o esperar en `Human Review`. No hay waves, prioridad por fase ni capacidad independiente por lane. `max_active_tasks` limita el total de tareas activas.
 
 Los fallos de entorno se comunican con comando o recurso afectado y solución propuesta. No se transforma un fallo del ejecutor en una devolución al Builder para que reescriba código del producto.
 
@@ -219,7 +219,7 @@ Con QA y Review aceptados, el sistema guarda una entrega revisable vinculada a `
 
 La PR se crea como draft tras Build. GitHub permite cambiarla a lista para revisión o devolverla a draft; mientras siga como draft no se puede fusionar. [GH3]
 
-Una persona puede fusionar la PR o pedir cambios. Si pide cambios, mueve la tarea a `Ready`; Symphony conserva la rama y PR, la devuelve a draft y vuelve a ejecutar Build, QA y Review según corresponda. Si pasan de nuevo, Symphony la marca lista para revisión. El merge automático queda fuera de esta entrega.
+Una persona puede fusionar la PR o pedir cambios. Si pide cambios, mueve la tarea a `Ready`; Symphony conserva la rama y PR, la devuelve a draft y vuelve a ejecutar Build, QA y Review según corresponda. Si pasan de nuevo, Symphony la marca lista para revisión. El E2E inicial mantiene merge humano; el hito 4 añade auto-merge opt-in tras probar el gate.
 
 `Done` exige confirmar el merge y su presencia en la rama destino. Cerrar una issue sin merge termina el trabajo como `Dropped` con motivo. Si el agente no encuentra cambios necesarios, `Dropped` requiere confirmación humana. Una issue que ya está cerrada y fusionada no se reabre moviendo el item del Project a `Ready`; para trabajo posterior se crea una issue nueva.
 
@@ -269,7 +269,7 @@ Resultados admitidos: `passed`, `changes_requested`, `needs_input` y `blocked`. 
 
 ## 8 Skills y herramientas de Super Board
 
-El catálogo de Super Board inspeccionado contiene ocho skills: cinco de uso directo y tres de pipeline. El fork debe conservar su cobertura funcional con una adaptación explícita al host Symphony. [SB2]
+El fork conserva la cobertura de las skills del pipeline de Super Board mediante skills mantenidas y versionadas por la app. El resolver selecciona las que aplican a cada tarea y fase; una instalación no cambia el routing. [SB2]
 
 | Skill | Función en el fork | Adaptación |
 | --- | --- | --- |
@@ -277,18 +277,14 @@ El catálogo de Super Board inspeccionado contiene ocho skills: cinco de uso dir
 | `super-build` | Implementación por criterios y entrega | Reemplazar scripts de manager y mutaciones directas por herramientas del host. |
 | `super-qa` | Checks, huecos de pruebas y evidencias | Integrar perfiles por repo, navegador y contratos de resultados. |
 | `super-review` | Revisión, hallazgos persistentes y validación de correcciones | Separar sesión, conclusiones del modelo y autorización de entrega. |
-| `super-collect` | Recogida, verificación y deduplicación de problemas | Conectores posteriores que crean Backlog, sin activar trabajo por sí mismos. |
-| `ui-refine-loop` | Ciclo de crítica y mejora de una pantalla o componente | Flujo optativo iniciado expresamente, con navegador, evidencia y límite de iteraciones. |
-| `visual` | Explicación o mapa visual de planes y cambios | Artefacto enlazado a la tarea y mantenido fuera de decisiones de autorización. |
-| `git-sync` | Sincronización de cambios y ramas | Operaciones acotadas al repo y branch del intento; publicación controlada por host. |
 
-Las skills externas se resuelven por capacidad: framework, pruebas, frontend, diseño, diagnóstico o revisión. El catálogo fija origen, revisión, licencia, huella y fases compatibles. Los fallbacks deben estar declarados y ser funcionalmente válidos. Si falta una skill obligatoria, la tarea espera una reparación de readiness; no se inventa una skill equivalente ni se descarga código durante la ejecución sin control.
+El catálogo fijo de la app incluye las skills integradas de Matt Pocock, Impeccable y Humanizer. El resolver aplica cada una solo cuando la tarea lo requiere, además de las skills de Build, QA y Review. Registra origen, revisión, licencia y huella; si falta una skill requerida, la tarea no se reclama y se muestra el fallo de readiness.
 
 Las instrucciones del repo se descubren en cada checkout. Una actualización de skills se prueba con tareas representativas y se aplica a nuevos intentos. QA y Review pueden reproducir una ejecución con las mismas versiones de la entrega original.
 
 La resolución distingue skills obligatorias, condicionales, opcionales e interactivas. Un worker desatendido no carga una skill que exige diálogo interactivo para completarse. Readiness debe comprobar la skill efectiva y su contrato; el resolver existente comprueba disponibilidad, pero el pin de revisiones es una extensión del fork. [SB10]
 
-Los comandos de Super Board son referencia de experiencia de uso, no una obligación de conservar su implementación shell. El fork debe cubrir onboarding, ejecución, estado, parada, clasificación, calibración y limpieza, además de las operaciones directas de las skills. La matriz de paridad del apartado 16 mantiene visibles las capacidades pendientes.
+Los comandos de Super Board son referencia de experiencia de uso, no una obligación de conservar su implementación shell. El fork cubre onboarding, ejecución, estado, parada y limpieza necesarios para operar el pipeline. Clasificación automática de intake, calibración y comandos de visualización quedan fuera.
 
 | Interfaz observada en Super Board | Equivalente funcional en el fork |
 | --- | --- |
@@ -297,11 +293,9 @@ Los comandos de Super Board son referencia de experiencia de uso, no una obligac
 | `status` | Consultar fase, progreso, PR y bloqueos. |
 | `run` y reanudación mediante `run` | Activar admisión o solicitar continuación controlada. |
 | `stop` | Detener trabajo conservando contexto y artefactos. |
-| `run --low`, `--high`, `--codex` y modelo explícito | Perfil de modelos y presupuesto por rol, validado por el host. |
-| `super-collect` con fuentes y `--since` | Intake acotado por origen y periodo, con previsualización antes de publicación. |
-| `visual recap`, `plan` y `map` | Artefactos de explicación y exploración vinculados a la tarea. |
+| Modelo explícito | Un modelo común para Build, QA y Review, configurado por instalación sin fallback silencioso. |
 
-`ui-refine-loop` no se dispara automáticamente desde las fases del board en Super Board; su incorporación conserva la activación explícita. `git-sync` es una utilidad optativa y no el cierre automático de cualquier tarea. [SB6], [SB11], [SB12], [SB13]
+La app no añade comandos ni productos de `super-collect`, `ui-refine-loop`, `visual` o `git-sync`; las comprobaciones de UI que formen parte de una tarea siguen siendo parte de QA y usan las herramientas disponibles en el repo. [SB6], [SB11], [SB12], [SB13]
 
 ### Formato de los entregables
 
@@ -325,13 +319,13 @@ Las siguientes operaciones son contratos propuestos, no APIs existentes de Symph
 | Pedir aclaración | Pregunta concreta y relación con la tarea | Espera persistida y punto de reanudación. |
 | Registrar revisión | SHA revisado y hallazgos estructurados | Informe y revisión verificables. |
 
-El agente sube su rama y propone un SHA; Symphony valida la entrega y ejecuta las escrituras de PR, estado e informes. El merge de esta entrega lo realiza una persona. Un wrapper no constituye una barrera si el agente mantiene shell y credenciales con las que puede saltárselo. El perfil de aislamiento debe hacer efectivas las restricciones que se prometen.
+El agente sube su rama y propone un SHA; Symphony valida la entrega y ejecuta las escrituras de PR, estado e informes. El merge es humano por defecto. Auto-merge requiere activación explícita y el gate de la app; el agente nunca puede saltárselo mediante credenciales o shell. El aislamiento debe hacer efectivas las restricciones prometidas.
 
 Las herramientas base incluyen Git, Codex `app-server`, acceso API GitHub y runtimes del repo. GitHub CLI puede servir para diagnóstico o como transporte inicial encapsulado; las mutaciones del producto no se reparten entre scripts independientes sin contratos comunes.
 
-Browser y Playwright son capacidades para QA de UI; las conexiones a Nightwatch, Sentry, PostHog, Asana y otros MCP son opcionales por perfil. Cada integración necesita operaciones y credenciales concretas. El código no debe asumir que un plugin de esta conversación existe en el host donde se despliegue el servicio.
+Browser y Playwright pueden usarse en QA si el repo y su entorno los incluyen. Crear conectores a Nightwatch, Sentry, PostHog, Asana u otros MCP queda fuera del pipeline de este roadmap; el servicio no asume que un plugin externo existe en cada instalación.
 
-El crawler de QA, la exploración de recorridos de varias pantallas, el verificador funcional del proyecto y los checks de rendimiento y memoria son capacidades separadas. Se habilitan por perfil cuando hay un entorno y criterios reproducibles. Una página vacía, una pantalla de login o un backend caído no cuentan como verificación de una pantalla del producto. [SB8]
+Las comprobaciones de UI pertenecen a QA cuando la tarea lo exige y existe un entorno reproducible. Una página vacía, una pantalla de login o un backend caído no cuentan como verificación de una pantalla del producto. Los productos autónomos de exploración visual quedan fuera. [SB8]
 
 ## 10 Persistencia y recuperación
 
@@ -339,8 +333,8 @@ El crawler de QA, la exploración de recorridos de varias pantallas, el verifica
 
 | Registro | Contenido y propósito |
 | --- | --- |
-| Tarea | Identidad global, repo, última intención del tablero y generación admitida. |
-| Ejecución | Fase, estado, contexto de código, propietario, límites, configuración y motivo de espera. |
+| Tarea | Identidad global, repo, último estado observado del Project y generación admitida. |
+| Ejecución | Fase, contexto de código, propietario, límites, configuración capturada y punto de recuperación. No es autoridad del estado visible. |
 | Intento de fase | Sesión, inicio y fin, resultado, error y consumo. |
 | Evidencia | Entrega y SHA asociados, check, revisión, informe de fase y ubicación de artefactos. |
 | Operación externa | Intención, clave estable, estado de confirmación y referencia remota para PR, estado o comentario de issue. |
@@ -349,9 +343,9 @@ El primer almacén será SQLite en un host y ofrecerá transacciones y restricci
 
 ### Propiedad de ejecución
 
-Debe existir como máximo un intento activo por tarea y generación. Un token de propiedad impide que un proceso antiguo publique resultados después de que otro haya recuperado su trabajo. El contador de concurrencia incluye Build, QA y Review; las esperas humanas liberan capacidad.
+Debe existir como máximo un intento activo por tarea y generación. `max_active_tasks` establece el límite global de tareas activas y vale cinco por defecto. Cada tarea ocupa un slot durante Build, QA y Review; las esperas en Human Review, Blocked, una parada a Backlog y los estados terminales liberan capacidad. No hay límites distintos por fase ni prioridad de lanes. Un token de propiedad impide que un proceso antiguo publique resultados después de que otro haya recuperado su trabajo.
 
-Al reiniciar, el servicio reconcilia procesos vivos, registros, workspaces, branches y efectos remotos. No supone que un proceso desaparecido falló antes de hacer cambios, ni que un proceso que terminó correctamente completó la tarea.
+Al reiniciar, el servicio lee primero la intención vigente del Project y consulta las PR y ramas remotas; después usa SQLite para reconciliar procesos vivos, workspaces, branches, checkpoints y efectos remotos. No restaura un estado visible antiguo desde SQLite. Si una operación externa quedó incierta, consulta GitHub antes de repetirla; si la intención humana y el checkpoint no se pueden combinar con seguridad, requiere intervención.
 
 Una sesión de Codex puede continuar si el protocolo y sus datos lo permiten. Si no, se abre una nueva sesión desde el último checkpoint confirmado, con la conversación resumida y las evidencias. La garantía del fork será recuperar el trabajo, no prometer restauración exacta de toda conversación sin haberla implementado. El código actual guarda los bloqueos en memoria y necesita persistencia adicional. [SY2], [SY8]
 
@@ -378,7 +372,7 @@ Las operaciones confirmadas no se repiten al reanudar. Un worker que perdió su 
 
 Los límites acumulados incluirán intentos de fase, rebotes, tiempo total y tokens. Si no hay precio verificado para un modelo, se controla consumo por tokens; no se publica un coste monetario inventado. Los límites de turnos de una sesión de Codex no bastan como presupuesto de toda la tarea. [SY8], [SY9]
 
-El esquema debe exigir límites finitos o aplicar defaults explícitos y finitos. El contador no vuelve a cero al reiniciar el servicio ni al cambiar de modelo. La política distinguirá reintentos de infraestructura y ciclos de corrección del producto para que un fallo externo no consuma indefinidamente turnos de Build.
+El esquema debe exigir límites finitos o aplicar defaults explícitos y finitos. El contador de intentos no vuelve a cero al reiniciar el servicio ni al cambiar de configuración. La política distingue reintentos de infraestructura y ciclos de corrección del producto para que un fallo externo no consuma indefinidamente turnos de Build.
 
 ## 11 Workspaces y entornos por repositorio
 
@@ -417,7 +411,7 @@ Los límites efectivos deben cubrir rutas canónicas y symlinks, `.git`, ramas a
 
 Los hooks de Super Board son filtros de su host original y no se trasladan como garantía de autorización. Los invariantes del fork se comprueban en código y con el aislamiento real del proceso.
 
-El modo de merge se declara por repo. En modo humano, el sistema ofrece el resultado y espera; en modo automático, el host aplica el gate. Una aprobación identifica repo, PR, HEAD revisado, base validada y política efectiva. Si cambia el código, se invalida la aprobación correspondiente.
+La política de merge es global, `human` por defecto. `auto` solo se activa explícitamente y exige el mismo gate de seguridad. La autorización identifica repo, PR, HEAD revisado, base validada y política efectiva; cualquier cambio de código invalida la aprobación.
 
 Las protecciones y checks de GitHub completan el control de integración. Un mutex local y un pin del HEAD no impiden por sí solos que otro actor mueva la base remota; la estrategia de merge debe incluir validación actualizada o cola de merge. [SB3], [SB4]
 
@@ -435,11 +429,6 @@ Los logs incluyen task, repo, run, fase, intento, sesión y operación. Se conse
 
 El onboarding valida herramientas y acceso antes de activar el repo. Su modo de diagnóstico es de lectura; las correcciones que instalen herramientas, creen campos o cambien configuración son acciones explícitas con resultado comprobable.
 
-### Intake de incidencias
-
-Los conectores normalizan candidatos conservando repo, fuente, referencia y evidencia. Distinguen lectura correcta, vacío, truncado y no disponible. Antes de publicar, un verificador comprueba vigencia del problema y posibles arreglos. El fingerprint incluye repositorio, fuente y causa; se consulta el historial para adoptar una tarea existente o enlazar una recurrencia sin duplicarla indiscriminadamente.
-
-El modo inicial ofrece previsualización. La publicación crea o actualiza Backlog y nunca concede por sí sola admisión a ejecución. Nightwatch y Asana se implementan como fuentes propias si se eligen; no se presentan como conectores nativos ya disponibles de Super Board. [SB15]
 
 ## 15 Mantenimiento del fork
 
@@ -462,48 +451,53 @@ Usar `origin` como fuente y destino del trabajo del fork, y registrar la revisi�
 
 Conservar Apache 2.0 y NOTICE de Symphony; conservar MIT y atribuciones del código copiado de Super Board. Registrar individualmente las licencias de skills y dependencias externas. [SY12], [SB5]
 
-## 16 Matriz de paridad y fases de entrega
+## 16 Roadmap del pipeline
 
-| Capacidad de Super Board | Entrega prevista | Condición de aceptación |
-| --- | --- | --- |
-| Tablero y pipeline con estados configurables | Núcleo inicial | Una tarea recorre fases sin acciones manuales de reparación. |
-| Builder, QA y Reviewer | Núcleo inicial | Sesiones distintas y resultados asociados al código. |
-| Readiness y skills por tarea | Núcleo inicial | Dependencia ausente produce diagnóstico y conserva estado. |
-| PR draft tras Build, lista para revisión tras QA/Review e informes en la issue | Núcleo inicial | Cambios de estado de PR, estados del Project e informes se confirman y reconcilian sin duplicados. |
-| Rebotes y memoria de hallazgos | Robustez del pipeline | Review identifica qué hallazgos se resolvieron en cada entrega. |
-| Tipo `qa` sin Build | Robustez del pipeline | Verifica producto existente sin fingir implementación. |
-| Dependencias, prioridades y tandas | Extensión de planificación | Tareas de repos distintos se ordenan sin colisión de identidad. |
-| Límites y detección de falta de avance | Núcleo y endurecimiento | La ejecución se detiene con un checkpoint recuperable. |
-| Política humana y gate de merge | Modo humano inicial y automatización posterior | Un cambio de SHA invalida evidencia y aprobación afectadas. |
-| Calibración y graduación de autonomía | Posterior al piloto | Se basa en resultados registrados y reglas explicables. |
-| Intake `super-collect` | Después del ciclo fiable | Incidencia verificada y deduplicada entra en Backlog. |
-| Sentry, PostHog, arquitectura, PR y fuentes custom | Conectores progresivos | Cada origen tiene contrato de lectura, verificación y deduplicación. |
-| Nightwatch y Asana de la organización | Conectores propios opcionales | Se confirma el acceso y mapping sin duplicar tareas. |
-| UI refine loop y evidencias de navegador | Perfil de frontend | Comparación antes y después con límite de iteraciones. |
-| Visualizaciones y mapas | Extensión de artefactos | Resultado visible y vinculado a la tarea y entrega. |
-| Git sync | Integración acotada | Conserva trabajo y opera sobre branch y repo del intento. |
-| Fallback de modelos y cuentas | Posterior al piloto | Selección explícita; conserva límites y no cambia proveedor silenciosamente. |
-| Onboarding, status, stop y cleanup | Operación inicial | Permiten diagnóstico, parada y recuperación sin manipular archivos internos. |
+El roadmap termina cuando una instalación puede despachar tareas de sus repositorios configurados por el pipeline, recuperarse de fallos sin perder trabajo ni duplicar efectos y completar el piloto con el límite de slots elegido. No incluye `super-collect`, UI refine, visualizaciones, calibración, conectores adicionales, fallbacks de modelos ni sincronización Git como productos independientes.
 
-### Entrega uno Tarea completa en un repositorio
+### Hito 0 — Completar el E2E de Symphony (en curso: issue #9)
 
-Sobre el tracker Projects v2 y los perfiles configurables de la fase anterior, implementar persistencia SQLite mínima y el pipeline Build → QA → Review autónoma → Human Review para una issue del repo Symphony en un host. El agente sube la rama; Symphony crea la PR draft después de Build, la marca lista para revisión tras QA y Review aceptadas, cambia estados y deja un informe en la issue al finalizar cada fase. Se conserva el contrato del tracker GitHub Issues existente. Una persona pide cambios o fusiona; `Done` solo se marca después de verificar el merge. `Dropped` requiere motivo y, si no hacen falta cambios, confirmación humana. `Blocked → Ready` reanuda desde el checkpoint conservando la rama y PR. Una issue fusionada y cerrada no se reactiva: el trabajo posterior usa una issue nueva. Criterio: un recorrido real deja evidencia de Build, QA, Review, PR y estados correctos, y se recupera del reinicio sin duplicar efectos externos.
+Terminar una tarea de Symphony en un host y un repo: Build → QA → Review → Human Review, PR draft tras Build, PR lista tras QA/Review e informes por fase en la issue. SQLite conserva checkpoints y operaciones idempotentes; el Project decide la intención y el estado visible. Mantener GitHub Issues compatible.
 
-### Entrega dos Recuperación y dos repositorios
+Aceptación: la ejecución se recupera tras reiniciar; el estado actual del Project prevalece sobre cualquier snapshot local; una respuesta incierta no duplica PR, comentario ni transición; `Done` requiere comprobar el merge.
 
-Ampliar reconciliación y operación a dos repositorios, añadir aclaraciones, cancelación, límites y un segundo perfil. Provocar fallos entre una publicación remota y su confirmación local. Criterio: dos tareas `#42` de repos diferentes mantienen ramas, evidencias e informes separados, y un reinicio no duplica PRs, estados ni comentarios.
+### Hito 1 — Completar el contrato de tarea
 
-### Entrega tres Paridad del pipeline
+Usar estados y skills definidos por Symphony, verificar el Project en onboarding e integrar el tipo `qa` que entra directamente en QA. Añadir dependencias explícitas entre issues. Las dependencias abiertas dejan la tarea sin despacho ni slot; las relaciones inválidas o irresolubles muestran un motivo y requieren intervención. `bug` y `feature` recorren Build → QA → Review.
 
-Completar `qa`, rebotes, historial de hallazgos, dependencias, acciones humanas y configuración de checks por impacto. Ejecutar un piloto de 10 a 20 tareas con criterios definidos. Criterio: tareas aceptadas, bloqueos accionables y tiempo de supervisión registrados; ningún fallo se oculta como éxito.
+Aceptación: la ruta `qa` nunca ejecuta Build; las dependencias se resuelven por identidad repo/issue, no por número local; una tarea con dependencia pendiente permanece en `Ready` sin ocupar slot; ningún estado o skill depende de un mapping configurado por instalación.
 
-### Entrega cuatro Todos los repositorios
+### Hito 2 — Despachar por slots
 
-Añadir los perfiles restantes y las verificaciones de plataforma de Flutter. Subir concurrencia gradualmente con aislamiento de DB y procesos. Criterio: el mismo tablero mantiene control y trazabilidad del conjunto.
+Añadir un límite global `max_active_tasks`, configurable y con valor inicial 5. Cada tarea activa conserva un slot durante sus fases automáticas; el scheduler llena slots libres con las tareas Ready elegibles más antiguas. No adopta waves, prioridad por fase, workers por lane ni límites específicos por repo. Las esperas en Human Review o Blocked liberan el slot.
 
-### Entrega cinco Extensiones de producto
+Aceptación: nunca se supera el límite; dos eventos no crean ejecuciones duplicadas; tareas que esperan dependencias no consumen slots; al liberarse uno se despacha la siguiente Ready elegible.
 
-Incorporar intake, refinado de UI, visualizaciones, calibración y merge automático según prioridades. Cada extensión debe conservar los contratos del pipeline y contar con un criterio de aceptación propio.
+### Hito 3 — Probar dos repos y recuperación
+
+Ejecutar tareas de al menos dos repos distintos del mismo Project. Inyectar reinicios y respuestas inciertas durante Build, QA, Review, creación de PR y publicación de informes. Comprobar ramas, workspaces, identidades, checkpoints y dependencias entre repos.
+
+La issue #38 cubre la omisión puntual de una issue activa en un refresh de Projects: detectarla antes de detener o reanudar una ejecución y evitar que una respuesta incompleta fuerce un requeue manual.
+
+Aceptación: issues con el mismo número en repos distintos no colisionan; el estado del Project prevalece al reanudar; no se pierden cambios confirmados ni se duplican PRs, comentarios o transiciones.
+
+### Hito 4 — Activar el gate de merge opt-in
+
+Mantener `human` como política por defecto. Añadir la política global `auto`, activada solo explícitamente, que exige base actualizada, checks requeridos aprobados, revisión del mismo SHA, ausencia de hallazgos bloqueantes y protecciones de rama satisfechas. Si falta evidencia o falla el gate, la PR espera en Human Review.
+
+Aceptación: auto-merge nunca ocurre por default; cambios de HEAD o base invalidan evidencia aplicable; estados, permisos o checks inciertos impiden fusionar.
+
+### Hito 5 — Piloto progresivo de estabilidad
+
+Probar entre 10 y 20 tareas de al menos dos repos. Empezar con un slot e incrementarlo gradualmente hasta el límite configurado, que por defecto será cinco. Incluir rutas `bug`, `feature` y `qa`, dependencias, feedback humano, recuperación de cada fase y el modo de merge elegido.
+
+Criterio para declarar el piloto estable: cero tareas perdidas, cero efectos externos duplicados, cero transiciones falsas a Done, ningún límite de slots excedido y toda ejecución fallida queda recuperable o con un bloqueo accionable. Registrar tasa de aceptación, reintentos, tiempo de supervisión y motivos de bloqueo.
+
+### Hito 6 — Incorporar repos a cualquier instalación
+
+Registrar los repos que el operador quiera usar en cada Project, con repo, rama base y preparación propios. Mantener intactos los repos/tracker que la instalación no seleccione; no incluir nombres de organizaciones o repositorios permitidos en el código.
+
+Aceptación: los mismos contratos operan en repositorios con runtimes distintos cuando su preparación y reglas están disponibles; las limitaciones de un repo bloquean solo sus tareas y explican qué falta.
 
 ## 17 Verificación de la implementación
 
@@ -513,6 +507,18 @@ El documento define las comprobaciones que habrá que construir y ejecutar al im
 | --- | --- |
 | Dos repos con issue `#42` | Identidades, branches, workspaces y PRs independientes. |
 | Dos eventos o polls de la misma tarea | Un único intento activo. |
+| Una tarea `qa` entra en `Ready` | Entra a QA directamente y nunca ejecuta Build. |
+| Dependencia explícita aún abierta | La tarea permanece en `Ready`, no ocupa slot y no se marca `Blocked` por una espera normal. |
+| Relación de dependencia incompleta o inválida | No se adivina; se informa el motivo y requiere intervención en `Blocked`. |
+| Varias Ready elegibles y un slot libre | Se inicia la Ready con más antigüedad. |
+| Cinco slots activos y llega otra Ready | No se supera el límite; la tarea espera sin reclamar agente. |
+| Tarea pasa a Human Review o Blocked | Libera el slot y conserva rama, PR y checkpoints. |
+| Tarea activa se mueve a Backlog | Detiene el agente, conserva el trabajo y libera el slot. |
+| Project tiene estados no admitidos | El onboarding explica los estados requeridos y no reclama tareas. |
+| SQLite guarda un estado anterior al del Project | Al reanudar se respeta el Project y no se restaura el estado visible viejo. |
+| Política de merge es `human` | La PR espera en Human Review tras pasar QA y Review. |
+| Política `auto` sin checks, protección o SHA vigentes | El gate impide fusionar y la PR espera en Human Review. |
+| El modelo configurado no está disponible | Se detiene con diagnóstico; no cambia a otro modelo automáticamente. |
 | Fallo al leer una página del Project | No se consideran desaparecidas las tareas ni se borra trabajo. |
 | Reinicio durante Build | Recuperación del workspace y del último checkpoint confirmado. |
 | Reinicio esperando respuesta humana | La tarea sigue esperando, sin lanzar otro agente. |
@@ -541,19 +547,19 @@ El documento define las comprobaciones que habrá que construir y ejecutar al im
 
 Para el código Elixir se usarán checks específicos durante cada cambio y los gates del repositorio antes de entrega: `make all` desde `elixir/` y los contratos documentados en `elixir/AGENTS.md`. La documentación del sistema y sus ejemplos de configuración deben evolucionar en el mismo cambio que los contratos implementados. Este documento, por sí solo, no introduce comportamiento ejecutable.
 
-## 18 Decisiones pendientes antes de implementar
+## 18 Decisiones técnicas pendientes
 
 | Decisión | Propuesta inicial | Cuándo cerrarla |
 | --- | --- | --- |
-| Project y opciones de estado | Configurar identidad, campo y valores por instalación; validarlos antes de escribir | Durante el onboarding de la instalación piloto. |
-| Host y volumen SQLite | Un solo host con volumen durable | Antes del primer despliegue del piloto. |
+| Acceso al Project y validación de estados canónicos | Validar acceso y opciones fijas de Symphony en onboarding | Antes del E2E. |
+| Host y volumen SQLite | Un host con volumen durable, backup y restauración probados | Antes del piloto multi-repo. |
 | SQLite y acceso desde Elixir | Elegir dependencia y mecanismo de migraciones compatibles con el fork | Al diseñar el almacén mínimo. |
-| Checks de cada repo | Perfiles derivados de sus reglas y entornos | Antes de admitir tareas de ese repo. |
+| Descubrimiento de preparación y checks por repo | Usar instrucciones/manifiestos del repo y bloquear con diagnóstico cuando no sean suficientes | Antes de admitir cada repo. |
 | Acceso al dashboard | Local inicialmente; autenticado antes de acceso compartido | Antes de habilitar acciones remotas. |
 | Destino de artefactos y retención | Volumen persistente y referencias desde la ejecución | Con la primera entrega de evidencias. |
-| Prioridad de conectores adicionales | Después del pipeline fiable | Tras el piloto. |
+| Condiciones técnicas del auto-merge | Verificar checks requeridos, protección de ramas, permisos y actualización de base | Antes de habilitar `merge_policy: auto`. |
 
-Las decisiones de producto para la Entrega uno ya están cerradas; las filas anteriores son elecciones técnicas o de despliegue que se concretan al implementar sin fijar ninguna organización o repositorio en el código.
+Las decisiones de producto del apartado 2 están cerradas. Las filas anteriores son elecciones técnicas o de despliegue; se concretan durante la implementación sin fijar una organización o repositorio en el código.
 
 ## 19 Fuentes y referencias
 

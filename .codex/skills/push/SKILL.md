@@ -41,7 +41,9 @@ description:
    - If no PR exists, create one.
    - If a PR exists and is open, update it.
    - If branch is tied to a closed/merged PR, create a new branch + PR.
-   - Write a proper PR title that clearly describes the change outcome
+   - Follow the title format in `docs/agents/issue-tracker.md`. Validate the
+     title with `(cd elixir && mise exec -- mix title.check --title
+     "$pr_title")` before creating or updating the PR. CI checks it as well.
    - For branch updates, explicitly reconsider whether current PR title still
      matches the latest scope; update it if it no longer does.
 6. Write/update PR body explicitly using `.github/pull_request_template.md`:
@@ -84,8 +86,9 @@ if [ "$pr_state" = "MERGED" ] || [ "$pr_state" = "CLOSED" ]; then
   exit 1
 fi
 
-# Write a clear, human-friendly title that summarizes the shipped change.
+# Follow docs/agents/issue-tracker.md and validate the title.
 pr_title="<clear PR title written for this change>"
+(cd elixir && mise exec -- mix title.check --title "$pr_title")
 if [ -z "$pr_state" ]; then
   gh pr create --title "$pr_title"
 else

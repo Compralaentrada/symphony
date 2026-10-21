@@ -4,13 +4,38 @@ Issues and specs for this repo live as GitHub issues in `Compralaentrada/symphon
 
 ## Conventions
 
-- **Create an issue**: `gh issue create --repo Compralaentrada/symphony --title "..." --body "..."`. Use a heredoc for multi-line bodies.
+- **Create an issue**: validate the title as described in **Title format**, then run `gh issue create --repo Compralaentrada/symphony --title "$title" --body "..."`. Use a heredoc for multi-line bodies.
 - **Read an issue**: `gh issue view <number> --repo Compralaentrada/symphony --json number,title,body,labels,comments`.
 - **List issues**: `gh issue list --repo Compralaentrada/symphony --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
 - **Make an issue a sub-issue of a parent**: `gh issue create --repo Compralaentrada/symphony --parent <parent> ...`, or `gh issue edit <parent> --repo Compralaentrada/symphony --add-sub-issue <child>` afterwards (`gh` 2.94+). Older `gh`: `gh api --repo Compralaentrada/symphony --method POST repos/Compralaentrada/symphony/issues/<parent>/sub_issues -F sub_issue_id=<child-db-id>` (database id, as in **Blocking** below). Without sub-issues, put `Part of #<parent>` at the top of the child body.
 - **Comment on an issue**: `gh issue comment <number> --repo Compralaentrada/symphony --body "..."`
 - **Apply / remove labels**: `gh issue edit <number> --repo Compralaentrada/symphony --add-label "..."` / `--remove-label "..."`
 - **Close**: `gh issue close <number> --repo Compralaentrada/symphony --comment "..."`
+
+## Title format
+
+Use the same local Conventional Commit format for issue, pull request, and commit subjects:
+
+```text
+<type>(<scope>): <imperative description>
+<type>(<scope>)!: <imperative description>   # breaking change
+```
+
+Allowed types are `feat`, `fix`, `docs`, `refactor`, `test`, `ci`, `build`, `chore`, `perf`, and `security`. `security` is a repository-specific type. Use `fix` for bugs and `feat` for features; `qa` remains a routing label, not a title type.
+
+Every title needs one lowercase kebab-case scope naming a stable area, such as `projects`, `workflow`, `orchestrator`, `skills`, `docs`, or `ci`. The scope list is open so new areas do not require a policy change. Keep the subject imperative, at most 72 characters for the full title, and without a final period. Spanish and English descriptions are both accepted.
+
+Before any `gh issue create` command, validate its title from the repository root:
+
+```sh
+title="feat(projects): usar estados canónicos"
+(cd elixir && mise exec -- mix title.check --title "$title")
+gh issue create --repo Compralaentrada/symphony --title "$title" --body-file /path/to/issue.md
+```
+
+The checker validates the type, scope, single-line structure, whitespace, length, and final punctuation. Keep the imperative description meaningful by review. The title format for issues and pull requests is a Symphony repository rule; the Conventional Commits specification itself standardizes commit messages. GitHub's manual issue form does not enforce this rule, so apply it when creating or editing issues by hand.
+
+Title types do not control pipeline routing. Keep using the issue labels and Project status for that.
 
 ## Pull requests as a triage surface
 

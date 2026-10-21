@@ -32,10 +32,11 @@ description:
    (build artifacts, logs, temp files), flag it to the user before committing.
 5. If staging is incomplete or includes unrelated files, fix the index or ask
    for confirmation.
-6. Choose a conventional type and optional scope that match the change (e.g.,
-   `feat(scope): ...`, `fix(scope): ...`, `refactor(scope): ...`).
-7. Write a subject line in imperative mood, <= 72 characters, no trailing
-   period.
+6. Follow the title format in `docs/agents/issue-tracker.md` for the type,
+   required scope, and breaking-change marker.
+7. Write an imperative subject in the language of the change and validate it
+   with `(cd elixir && mise exec -- mix title.check --title "$subject")` before
+   committing.
 8. Write a body that includes:
    - Summary of key changes (what changed).
    - Rationale and trade-offs (why it changed).
