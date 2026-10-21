@@ -106,13 +106,15 @@ defmodule SymphonyElixir.AgentRunner do
       end
 
     opts = Keyword.put(opts, :selected_repo_skills, selected_repo_skills)
+    opts = Keyword.put_new(opts, :host_checks, run_pipeline_host_checks(workspace, issue, opts, worker_host))
+    agent_context = github_agent_context(issue, opts)
 
     with :ok <- ensure_skills_available(workspace, issue, worker_host),
          {:ok, session} <-
            AppServer.start_session(
              workspace,
              worker_host: worker_host,
-             disable_tracker_tools: Keyword.has_key?(opts, :phase)
+             agent_context: agent_context
            ) do
       try do
         if Keyword.has_key?(opts, :phase) do
@@ -126,12 +128,75 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  defp run_pipeline_host_checks(workspace, issue, opts, worker_host) do
+    if Keyword.get(opts, :phase) == :qa do
+      task = Keyword.get(opts, :pipeline_task, %{})
+
+      Enum.map(task["required_checks"] || [], fn command ->
+        run_pipeline_host_check(workspace, issue, worker_host, command, task["current_sha"])
+      end)
+    else
+      []
+    end
+  end
+
+  defp run_pipeline_host_check(workspace, issue, worker_host, command, current_sha) do
+    case SymphonyElixir.Workspace.run_required_check(workspace, command, current_sha, issue, worker_host) do
+      {:ok, evidence} ->
+        %{"name" => command, "status" => "passed", "evidence" => evidence}
+
+      {:error, {:check_failed, status}} ->
+        %{
+          "name" => command,
+          "status" => "failed",
+          "evidence" => "Symphony ran the configured check at SHA #{current_sha}; host exit status #{status}."
+        }
+
+      {:error, :workspace_mismatch} ->
+        %{
+          "name" => command,
+          "status" => "failed",
+          "finding_id" => "workspace-sha-mismatch",
+          "evidence" => "Symphony did not run the check because workspace HEAD or files differed from accepted SHA #{current_sha}."
+        }
+
+      {:error, :check_unavailable} ->
+        %{"name" => command, "status" => "unavailable", "evidence" => "Symphony could not execute the required check."}
+    end
+  end
+
+  defp github_agent_context(issue, opts) do
+    tracker = Config.settings!().tracker
+
+    %{
+      issue: issue,
+      lane: Keyword.get(opts, :phase, :individual),
+      task: Keyword.get(opts, :pipeline_task),
+      generation: Keyword.get(opts, :generation),
+      attempt: Keyword.get(opts, :phase_attempt),
+      lease_token: Keyword.get(opts, :github_lease_token),
+      host_checks: Keyword.get(opts, :host_checks, []),
+      tracker_kind: tracker.kind,
+      merge_policy: Map.get(tracker.provider, "merge_policy", "human")
+    }
+  end
+
   defp run_pipeline_phase(session, issue, recipient, opts) do
     phase = Keyword.fetch!(opts, :phase)
     message_key = {__MODULE__, make_ref()}
+    evidence_key = {message_key, :remote_evidence}
 
     on_message = fn message ->
       send_codex_update(recipient, issue, message)
+
+      case message do
+        %{event: :tool_call_completed, result: %{"evidence" => evidence}}
+        when is_map(evidence) ->
+          Process.put(evidence_key, [evidence | Process.get(evidence_key, [])])
+
+        _ ->
+          :ok
+      end
 
       case phase_delta(message) do
         nil ->
@@ -147,6 +212,17 @@ defmodule SymphonyElixir.AgentRunner do
       end
     end
 
+    try do
+      run_pipeline_turn(session, issue, on_message, message_key, phase, opts)
+    after
+      Process.delete(message_key)
+      Process.delete(evidence_key)
+    end
+  end
+
+  defp run_pipeline_turn(session, issue, on_message, message_key, phase, opts) do
+    evidence_key = {message_key, :remote_evidence}
+
     prompt =
       issue
       |> PromptBuilder.build_prompt(opts)
@@ -159,32 +235,28 @@ defmodule SymphonyElixir.AgentRunner do
 
     output_schema = phase_report_schema(phase)
 
-    try do
-      case run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema) do
-        {:ok, report} ->
-          {:phase_result, report}
+    case run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema) do
+      {:ok, report} ->
+        phase_result(report, phase, opts, evidence_key)
 
-        {:error, {:invalid_phase_report, _details}} ->
-          Process.delete(message_key)
+      {:error, {:invalid_phase_report, _details}} ->
+        Process.delete(message_key)
 
-          case run_phase_turn(
-                 session,
-                 phase_report_correction_prompt(),
-                 issue,
-                 on_message,
-                 message_key,
-                 phase,
-                 output_schema
-               ) do
-            {:ok, report} -> {:phase_result, report}
-            error -> error
-          end
+        case run_phase_turn(
+               session,
+               phase_report_correction_prompt(),
+               issue,
+               on_message,
+               message_key,
+               phase,
+               output_schema
+             ) do
+          {:ok, report} -> phase_result(report, phase, opts, evidence_key)
+          error -> error
+        end
 
-        error ->
-          error
-      end
-    after
-      Process.delete(message_key)
+      error ->
+        error
     end
   end
 
@@ -203,6 +275,12 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  defp phase_result(report, phase, opts, evidence_key) do
+    evidence = evidence_key |> Process.get([]) |> Enum.reverse()
+    report = if phase == :qa, do: Map.put(report, "checks", Keyword.get(opts, :host_checks, [])), else: report
+    {:phase_result, report |> Map.put("_remote_evidence", evidence) |> Map.put("_host_checks", Keyword.get(opts, :host_checks, []))}
+  end
+
   defp phase_report_correction_prompt do
     """
     The previous response did not match the pipeline's required phase report. Return exactly one JSON object using the fields and allowed outcome from the preceding phase instructions, including the exact key names required for each finding. Preserve its findings and conclusions; do not repeat the work. The pipeline's JSON report contract overrides any skill's preferred prose format.
@@ -215,7 +293,10 @@ defmodule SymphonyElixir.AgentRunner do
     Pipeline phase: Build.
     Implement the issue, preserve the configured branch #{Keyword.get(opts, :branch)}, and push your work to origin.
     Previously reported findings to address: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
-    Do not create or update a pull request, change Project status, or comment on the issue; Symphony owns those writes.
+    Before editing, create or update the persistent issue workpad with `github_workflow` operation `workpad` and record the plan.
+    Before editing, call `github_workflow` with operation `claim` and stop if the claim is rejected.
+    After pushing, call `github_workflow` with operation `handoff`, outcome `ready`, and your complete report; the host verifies the SHA, creates or updates the draft PR, posts your report, and moves the Project item to QA.
+    For `no_changes` or `blocked`, hand off that result with a concise reason. Never merge a PR.
     Finish with exactly one JSON object containing outcome (ready, no_changes, or blocked), summary, criteria, changes, checks, risks, next_step, reason when blocked or no_changes, and sha after pushing.
     criteria, changes, checks, and risks must be JSON arrays, even when empty. Put each risk in its own string element.
     Use sha null only for no_changes or blocked.
@@ -227,8 +308,10 @@ defmodule SymphonyElixir.AgentRunner do
     Pipeline phase: independent QA. Review and test the accepted commit #{Keyword.get(opts, :sha)} on branch #{Keyword.get(opts, :branch)}.
     Prior findings to recheck after Build: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
     Required checks: #{Enum.join(Keyword.get(opts, :required_checks, []), ", ")}.
-    Symphony runs these configured checks on the workspace after your review. Do not claim their result or evidence; return an empty checks list. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings.
-    Do not modify files or write to GitHub. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
+    Host check evidence: #{Jason.encode!(Keyword.get(opts, :host_checks, []), pretty: true)}.
+    Symphony ran every configured check before this session on the accepted SHA. Do not modify files. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings.
+    Update the persistent workpad with QA evidence and findings using `github_workflow` operation `workpad`.
+    Call `github_workflow` with operation `handoff` and your QA report; include the host check evidence exactly as supplied. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end
 
@@ -237,8 +320,18 @@ defmodule SymphonyElixir.AgentRunner do
     Pipeline phase: autonomous code review. Inspect the diff and accepted commit #{Keyword.get(opts, :sha)} on branch #{Keyword.get(opts, :branch)}.
     Prior finding IDs to resolve explicitly: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
     Do not invoke the repository's `code-review` skill or its Markdown report format; perform this review directly under the pipeline's JSON contract.
-    Do not modify files or write to GitHub. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
-    Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit. Do not include headings, bullets, Markdown, code fences, or commentary outside that object.
+    Do not modify files. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
+    Update the persistent workpad with review findings and resolutions using `github_workflow` operation `workpad`.
+    With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`, then call `request_merge`; if the host confirms the merge, hand off outcome `merged` so the host verifies the merge before closing the issue and moving the item to Done. If the gate rejects the request, leave the PR in Human Review.
+    Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
+    """
+  end
+
+  defp pipeline_phase_instructions(:finalize, opts) do
+    """
+    Pipeline phase: Finalize a human-merged pull request. Verify that PR #{Keyword.get(opts, :pr_number)} is merged into #{Keyword.get(opts, :base_branch)} at the accepted SHA #{Keyword.get(opts, :sha)}.
+    Do not modify files. Call `github_workflow` with operation `handoff`, outcome `merged`, and a short report. The host closes the issue and moves its Project item to Done only after verifying the remote merge.
+    Finish with exactly one JSON object containing outcome `merged`, summary, sha, and next_step.
     """
   end
 
@@ -338,6 +431,7 @@ defmodule SymphonyElixir.AgentRunner do
     issue
     |> PromptBuilder.build_prompt(opts)
     |> append_selected_skills(Keyword.get(opts, :selected_repo_skills), 1)
+    |> append_individual_github_instructions(issue, opts)
   end
 
   defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
@@ -350,6 +444,18 @@ defmodule SymphonyElixir.AgentRunner do
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
+  end
+
+  defp append_individual_github_instructions(prompt, issue, opts) do
+    if Config.settings!().tracker.kind in ["github", "github_projects"] and not Keyword.has_key?(opts, :phase) do
+      release = if Config.settings!().tracker.kind == "github", do: " After the handoff, release your claim.", else: ""
+
+      prompt <>
+        "\n\nFor this GitHub task, create or update the persistent issue workpad with `github_workflow` operation `workpad`, then claim the issue before working. Preserve branch #{issue.branch_name}, push it to origin, and hand off the complete report with outcome `ready` so the host can verify the SHA, create or update the draft PR, and publish the report. For `blocked` or `no_changes`, hand off that result with a reason and do not create a PR. Use `github_workflow` for every GitHub write; the default merge policy is human review." <>
+        release
+    else
+      prompt
+    end
   end
 
   defp append_selected_skills(prompt, selected_skills, 1) when is_list(selected_skills) do

@@ -41,9 +41,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     dynamic_tool_binding =
       if Keyword.get(opts, :disable_tracker_tools, false) do
-        %{DynamicTool.bind() | tool_specs: []}
+        %{DynamicTool.bind(agent_context: Keyword.get(opts, :agent_context, %{})) | tool_specs: []}
       else
-        DynamicTool.bind()
+        DynamicTool.bind(agent_context: Keyword.get(opts, :agent_context, %{}))
       end
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
@@ -635,7 +635,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         _ -> :tool_call_failed
       end
 
-    emit_message(on_message, event, %{payload: payload, raw: payload_string}, metadata)
+    emit_message(on_message, event, %{payload: payload, raw: payload_string, result: result}, metadata)
 
     :approved
   end

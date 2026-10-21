@@ -1,7 +1,7 @@
 # Plan de implementación de Super Board sobre Symphony
 
 **Proyecto:** [Compralaentrada/symphony](https://github.com/Compralaentrada/symphony)  
-**Estado:** pipeline base de issue #9 terminado; delegación de escrituras a agentes aprobada en ADR-0002, implementación en issue #40
+**Estado:** pipeline base de issue #9 y delegación de escrituras a agentes de issue #40 implementados
 **Fecha:** 21 de octubre de 2026
 **HEAD del fork revisado para este roadmap:** `4f2fbc8`
 **Base de la investigación técnica:** `15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d` de `Compralaentrada/symphony`
@@ -464,7 +464,7 @@ Terminar una tarea de Symphony en un host y un repo: Build → QA → Review →
 
 Aceptación del pipeline base: la ejecución se recupera tras reiniciar; el estado actual del Project prevalece sobre cualquier snapshot local; una respuesta incierta no duplica PR, comentario ni transición; `Done` requiere comprobar el merge.
 
-### Hito 0.1 — Delegar las escrituras de GitHub a los agentes (issue #40)
+### Hito 0.1 — Delegar las escrituras de GitHub a los agentes (completado: issue #40)
 
 En todas las ejecuciones iniciadas desde GitHub Issues o GitHub Projects, el agente gestiona las escrituras de su issue y PR. Dentro del pipeline Projects, Build, QA y Review se reparten las escrituras por lane. Symphony queda como lector y coordinador, conserva leases, slots, journal y recuperación, y verifica los efectos remotos. Build crea la draft PR; Review prepara la revisión humana o invoca el gate determinista cuando auto-merge está activado. Esta decisión está registrada en ADR-0002 y sigue el contrato de lanes de Super Board [SB1], [SB17].
 

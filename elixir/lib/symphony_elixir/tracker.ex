@@ -49,6 +49,16 @@ defmodule SymphonyElixir.Tracker do
                       pull_request: 1,
                       publish_phase_report: 4
 
+  @agent_owned_callbacks [
+    :claim_issue,
+    :complete_issue,
+    :block_issue,
+    :set_pipeline_status,
+    :upsert_pull_request,
+    :set_pull_request_stage,
+    :publish_phase_report
+  ]
+
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states) do
     adapter().fetch_issues_by_states(states)
@@ -58,6 +68,9 @@ defmodule SymphonyElixir.Tracker do
   def fetch_issues_by_ids(issue_ids) do
     adapter().fetch_issues_by_ids(issue_ids)
   end
+
+  @spec agent_owned_writes?() :: boolean()
+  def agent_owned_writes?, do: Config.settings!().tracker.kind in ["github", "github_projects"]
 
   @spec claim_issue(Issue.t()) :: :ok | :ignore | {:error, term()}
   def claim_issue(%Issue{} = issue), do: issue_lifecycle_callback(:claim_issue, [issue])
@@ -97,22 +110,23 @@ defmodule SymphonyElixir.Tracker do
   app-server session so tool advertisement and execution cannot drift across a
   workflow reload.
   """
-  @spec bind_agent_tools() :: map()
-  def bind_agent_tools do
+  @spec bind_agent_tools(map()) :: map()
+  def bind_agent_tools(agent_context \\ %{}) do
     tracker_settings = Config.settings!().tracker
     adapter = adapter_for_settings!(tracker_settings)
 
     %{
       adapter: adapter,
       tracker_settings: tracker_settings,
-      tool_specs: adapter_agent_tool_specs(adapter),
+      agent_context: agent_context,
+      tool_specs: adapter_agent_tool_specs(adapter, agent_context),
       secret_environment_names: adapter_secret_environment_names(adapter, tracker_settings)
     }
   end
 
   @spec execute_bound_agent_tool(map(), String.t(), term(), keyword()) :: map()
   def execute_bound_agent_tool(
-        %{adapter: adapter, tracker_settings: tracker_settings},
+        %{adapter: adapter, tracker_settings: tracker_settings} = binding,
         tool,
         arguments,
         opts \\ []
@@ -121,7 +135,9 @@ defmodule SymphonyElixir.Tracker do
       adapter,
       tool,
       arguments,
-      Keyword.put(opts, :tracker_settings, tracker_settings)
+      opts
+      |> Keyword.put(:tracker_settings, tracker_settings)
+      |> Keyword.put(:agent_context, Map.get(binding, :agent_context, %{}))
     )
   end
 
@@ -155,19 +171,26 @@ defmodule SymphonyElixir.Tracker do
     adapter
   end
 
-  defp adapter_agent_tool_specs(adapter) do
+  defp adapter_agent_tool_specs(adapter, agent_context) do
     if Code.ensure_loaded?(adapter) and function_exported?(adapter, :agent_tool_specs, 0) do
-      adapter.agent_tool_specs()
+      if function_exported?(adapter, :agent_tool_specs, 1),
+        do: adapter.agent_tool_specs(agent_context),
+        else: adapter.agent_tool_specs()
     else
       []
     end
   end
 
   defp execute_agent_tool_with_adapter(adapter, tool, arguments, opts) do
-    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :execute_agent_tool, 3) do
-      adapter.execute_agent_tool(tool, arguments, opts)
-    else
-      unsupported_agent_tool_response(tool)
+    cond do
+      Code.ensure_loaded?(adapter) and function_exported?(adapter, :execute_agent_tool, 4) ->
+        adapter.execute_agent_tool(tool, arguments, opts, Keyword.get(opts, :agent_context, %{}))
+
+      Code.ensure_loaded?(adapter) and function_exported?(adapter, :execute_agent_tool, 3) ->
+        adapter.execute_agent_tool(tool, arguments, opts)
+
+      true ->
+        unsupported_agent_tool_response(tool)
     end
   end
 
@@ -178,10 +201,14 @@ defmodule SymphonyElixir.Tracker do
   defp issue_lifecycle_callback(callback, arguments) do
     adapter = adapter()
 
-    if Code.ensure_loaded?(adapter) and function_exported?(adapter, callback, length(arguments)) do
-      apply(adapter, callback, arguments)
-    else
+    if agent_owned_writes?() and callback in @agent_owned_callbacks do
       :ignore
+    else
+      if Code.ensure_loaded?(adapter) and function_exported?(adapter, callback, length(arguments)) do
+        apply(adapter, callback, arguments)
+      else
+        :ignore
+      end
     end
   end
 

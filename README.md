@@ -23,10 +23,10 @@ pipeline multi-repositorio descrito aquí está centrado en GitHub Projects v2.
 
 ## Estado del proyecto
 
-El pipeline y la recuperación durable están implementados. La migración para que cada agente de
-fase sea propietario de sus escrituras de GitHub está aprobada y sigue en curso en la issue
-[#40](https://github.com/Compralaentrada/symphony/issues/40); hasta que termine, Symphony coordina
-esas escrituras.
+El pipeline y la recuperación durable están implementados. En ejecuciones desde GitHub Issues o
+GitHub Projects, el agente de cada tarea es propietario de sus escrituras de issue y PR. En el
+pipeline Projects, Build, QA y Review gestionan las operaciones de su lane mediante herramientas del
+host; Symphony conserva la lectura, el scheduling, los leases, los checkpoints y la reconciliación.
 
 ## Empezar en local
 

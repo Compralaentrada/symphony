@@ -20,36 +20,36 @@ installation.
 
 ## GitHub write ownership
 
-The target ownership model in [ADR-0002](../docs/adr/0002-agentes-propietarios-de-escrituras-github.md)
-assigns issue, Project, and pull request writes to the agent handling each run or pipeline phase.
-That migration is tracked in [issue #40](https://github.com/Compralaentrada/symphony/issues/40) and
-is not complete yet: the current pipeline centralizes those writes in Symphony and disables tracker
-tools in phase sessions. Build publishes through the host's Git credential helper or SSH. Configure
-push access for each repository profile on the Symphony host.
+As recorded in [ADR-0002](../docs/adr/0002-agentes-propietarios-de-escrituras-github.md), the agent
+handling a GitHub Issues run or Projects phase owns the writes for its issue and pull request.
+GitHub agents use the host-mediated `github_workflow` tool for lane-authorized writes; the
+`github_api` tool is read-only and scoped to the task repository. Symphony keeps credentials on the
+host, verifies remote evidence, and reconciles the resulting state. Build pushes through the host's
+Git credential helper or SSH. Configure push access for each repository profile on the Symphony
+host.
 
 Local runs discover repo-local Codex skills from `.agents/skills` in the workspace checkout.
 Symphony checks selected skills before launching Codex and reports a missing `SKILL.md` path; pinned
 sources and fingerprints are listed in [`../.agents/skills/SOURCES.md`](../.agents/skills/SOURCES.md).
 
 During single-run app-server sessions, the selected tracker adapter may advertise provider-native
-tools. Linear serves `linear_graphql`, GitHub Issues and GitHub Projects v2 serve `github_api`, Jira
-Cloud serves `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes
-those tools with configured host-side auth and removes declared tracker-token environment variables
-from the Codex child. Pipeline phase sessions currently disable tracker tools; until issue #40 lands,
-Symphony owns the API writes for PRs, Project status, and issue reports. Build publishes through the
-host's Git credential helper or SSH. Configure push access for each repository profile on the host.
+tools. Linear serves `linear_graphql`, GitHub Issues and GitHub Projects v2 serve the read-only
+`github_api` plus the task-scoped `github_workflow`, Jira Cloud serves `jira_rest`, Asana serves
+`asana_api`, and GitLab serves `gitlab_api`. Symphony executes tools with configured host-side auth
+and removes declared tracker-token environment variables from the Codex child. GitHub workflow
+permissions are restricted by repository, issue, lane, lease, and operation.
 
 If a claimed issue moves to a configured terminal state, Symphony stops the active agent and cleans
 up its workspace. In GitHub Projects mode, closing the linked GitHub Issue is terminal; Project
 items in Done or Blocked keep their workspace so moving them back to Ready can resume prior work.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
-issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. The GitHub
-Projects adapter also updates the Project status and comments on the linked issue with the reason.
-For the durable Projects pipeline, phase checkpoints and pending external writes are stored in SQLite
-at `~/.symphony/pipeline.sqlite3`; a restart resumes from the last confirmed phase. After the
-independent QA review, Symphony runs every `required_checks` command from the repository profile in
-the task workspace and records host-generated evidence; a missing or failed check cannot pass QA.
+issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. For the durable
+Projects pipeline, phase checkpoints and external-operation records are stored in SQLite at
+`~/.symphony/pipeline.sqlite3`; GitHub agent writes are verified remotely before Symphony advances
+the checkpoint. After the independent QA review, Symphony runs every `required_checks` command from
+the repository profile in the task workspace and gives the evidence to the QA agent; missing or
+failed host checks cannot pass QA.
 A merge into the configured base branch is required before Symphony sets Done. Moving a Human Review
 item back to Ready requests corrections on the same branch and PR. To move unmerged work to Dropped,
 add a human-authored `Drop reason: <reason>` line to the issue body; after a `no_changes` result,

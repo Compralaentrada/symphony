@@ -56,25 +56,30 @@ defmodule SymphonyElixir.Orchestrator do
   def init(opts) do
     case Config.settings() do
       {:ok, config} ->
-        now_ms = System.monotonic_time(:millisecond)
+        with :ok <- Pipeline.Store.revoke_agent_leases(),
+             :ok <- Pipeline.Store.interrupt_running_phases() do
+          now_ms = System.monotonic_time(:millisecond)
 
-        state = %State{
-          poll_interval_ms: config.polling.interval_ms,
-          max_concurrent_agents: config.agent.max_concurrent_agents,
-          next_poll_due_at_ms: now_ms,
-          poll_check_in_progress: false,
-          tick_timer_ref: nil,
-          tick_token: nil,
-          task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
-          agent_runner: Keyword.get(opts, :agent_runner, AgentRunner),
-          codex_totals: @empty_codex_totals,
-          codex_rate_limits: nil
-        }
+          state = %State{
+            poll_interval_ms: config.polling.interval_ms,
+            max_concurrent_agents: config.agent.max_concurrent_agents,
+            next_poll_due_at_ms: now_ms,
+            poll_check_in_progress: false,
+            tick_timer_ref: nil,
+            tick_token: nil,
+            task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
+            agent_runner: Keyword.get(opts, :agent_runner, AgentRunner),
+            codex_totals: @empty_codex_totals,
+            codex_rate_limits: nil
+          }
 
-        run_terminal_workspace_cleanup()
-        state = schedule_tick(state, 0)
+          run_terminal_workspace_cleanup()
+          state = schedule_tick(state, 0)
 
-        {:ok, state}
+          {:ok, state}
+        else
+          {:error, reason} -> {:stop, reason}
+        end
 
       {:error, reason} ->
         {:stop, reason}
@@ -236,6 +241,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
+    case Map.get(running_entry, :agent_lease_token) do
+      token when is_binary(token) -> Pipeline.Store.end_agent_lease(issue_id, token)
+      _ -> :ok
+    end
+
     if Map.has_key?(running_entry, :pipeline_phase) do
       handle_pipeline_agent_down(reason, state, issue_id, running_entry, session_id)
     else
@@ -263,8 +273,7 @@ defmodule SymphonyElixir.Orchestrator do
             retry_agent_down(state, issue_id, running_entry, session_id, {:tracker_completion_failed, reason})
 
           :ignore ->
-            Logger.info("Agent task completed for #{issue_context(running_entry.issue)} session_id=#{session_id}; scheduling active-state continuation check")
-            schedule_active_state_continuation(state, issue_id, running_entry)
+            handle_ignored_legacy_completion(state, issue_id, running_entry, session_id)
         end
     end
   end
@@ -277,8 +286,18 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp handle_ignored_legacy_completion(state, issue_id, running_entry, session_id) do
+    if Tracker.agent_owned_writes?() do
+      Logger.info("Agent task completed for #{issue_context(running_entry.issue)} session_id=#{session_id}; releasing local claim")
+      state |> complete_issue(issue_id) |> release_issue_claim(issue_id)
+    else
+      Logger.info("Agent task completed for #{issue_context(running_entry.issue)} session_id=#{session_id}; scheduling active-state continuation check")
+      schedule_active_state_continuation(state, issue_id, running_entry)
+    end
+  end
+
   defp handle_pipeline_agent_down(:normal, state, issue_id, running_entry, session_id) do
-    result = verify_required_pipeline_checks(running_entry, Map.get(running_entry, :completion))
+    result = Map.get(running_entry, :completion)
 
     case Pipeline.finish_phase(
            running_entry.issue,
@@ -318,80 +337,6 @@ defmodule SymphonyElixir.Orchestrator do
       )
 
       retry_agent_down(state, issue_id, running_entry, session_id, reason)
-    end
-  end
-
-  defp verify_required_pipeline_checks(%{pipeline_phase: "qa"} = entry, result) when is_map(result) do
-    task = entry.pipeline_task
-
-    checks =
-      Enum.map(task["required_checks"] || [], &run_pipeline_required_check(entry, task, &1))
-
-    check_findings =
-      checks
-      |> Enum.filter(&(&1["status"] == "failed"))
-      |> Enum.map(fn check ->
-        %{
-          "id" => check["finding_id"] || "required-check:" <> check["name"],
-          "reproduction" => check["evidence"],
-          "criterion" => "All required checks must pass on accepted SHA #{task["current_sha"]}."
-        }
-      end)
-
-    result =
-      result
-      |> Map.put("checks", checks)
-      |> Map.update("findings", check_findings, fn findings ->
-        Enum.uniq_by(findings ++ check_findings, & &1["id"])
-      end)
-
-    cond do
-      Enum.any?(checks, &(&1["status"] == "unavailable")) ->
-        Map.merge(result, %{
-          "outcome" => "blocked",
-          "summary" => "A required host check was unavailable.",
-          "reason" => "Symphony could not execute every configured required check.",
-          "next_step" => "Resolve the host check issue before moving the item to Ready."
-        })
-
-      Enum.any?(checks, &(&1["status"] == "failed")) ->
-        Map.merge(result, %{
-          "outcome" => "changes_requested",
-          "summary" => "One or more required host checks failed or the workspace did not match the accepted SHA.",
-          "next_step" => "Fix the findings and submit a new Build delivery."
-        })
-
-      true ->
-        result
-    end
-  end
-
-  defp verify_required_pipeline_checks(_entry, result), do: result
-
-  defp run_pipeline_required_check(entry, task, command) do
-    case Workspace.run_required_check(
-           entry.workspace_path,
-           command,
-           task["current_sha"],
-           entry.issue,
-           entry.worker_host
-         ) do
-      {:ok, evidence} ->
-        %{"name" => command, "status" => "passed", "evidence" => evidence}
-
-      {:error, {:check_failed, status}} ->
-        %{"name" => command, "status" => "failed", "evidence" => "Symphony ran the configured check at SHA #{task["current_sha"]}; host exit status #{status}."}
-
-      {:error, :workspace_mismatch} ->
-        %{
-          "name" => command,
-          "status" => "failed",
-          "finding_id" => "workspace-sha-mismatch",
-          "evidence" => "Symphony did not run the check because workspace HEAD or files differed from accepted SHA #{task["current_sha"]}."
-        }
-
-      {:error, :check_unavailable} ->
-        %{"name" => command, "status" => "unavailable", "evidence" => "Symphony could not execute the required check."}
     end
   end
 
@@ -1243,6 +1188,10 @@ defmodule SymphonyElixir.Orchestrator do
         attempt: retry_attempt,
         worker_host: worker_host,
         phase: String.to_existing_atom(phase),
+        pipeline_task: task,
+        generation: task["generation"],
+        phase_attempt: phase_attempt,
+        pr_number: task["pr_number"],
         branch: task["branch"],
         base_branch: task["base_branch"],
         sha: task["current_sha"],
@@ -1289,8 +1238,38 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    lease_token = if Tracker.agent_owned_writes?(), do: Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
+
+    case begin_legacy_agent_lease(issue, lease_token) do
+      :ok ->
+        spawn_legacy_agent(state, issue, attempt, recipient, worker_host, lease_token)
+
+      {:error, reason} ->
+        schedule_issue_retry(state, issue.id, attempt || 1, %{
+          identifier: issue.identifier,
+          issue_url: issue.url,
+          error: "unable to establish agent write lease: #{inspect(reason)}",
+          worker_host: worker_host
+        })
+    end
+  end
+
+  defp begin_legacy_agent_lease(_issue, nil), do: :ok
+
+  defp begin_legacy_agent_lease(issue, token),
+    do: Pipeline.Store.begin_agent_lease(issue.id, token)
+
+  defp spawn_legacy_agent(state, issue, attempt, recipient, worker_host, lease_token) do
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           try do
+             AgentRunner.run(issue, recipient,
+               attempt: attempt,
+               worker_host: worker_host,
+               github_lease_token: lease_token
+             )
+           after
+             end_legacy_agent_lease(issue, lease_token)
+           end
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -1318,6 +1297,7 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
+            agent_lease_token: lease_token,
             started_at: DateTime.utc_now()
           })
 
@@ -1329,6 +1309,7 @@ defmodule SymphonyElixir.Orchestrator do
         }
 
       {:error, reason} ->
+        if is_binary(lease_token), do: Pipeline.Store.end_agent_lease(issue.id, lease_token)
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
         next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
 
@@ -1340,6 +1321,11 @@ defmodule SymphonyElixir.Orchestrator do
         })
     end
   end
+
+  defp end_legacy_agent_lease(issue, token) when is_binary(token),
+    do: Pipeline.Store.end_agent_lease(issue.id, token)
+
+  defp end_legacy_agent_lease(_issue, _token), do: :ok
 
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
        when is_binary(issue_id) and is_function(issue_fetcher, 1) do

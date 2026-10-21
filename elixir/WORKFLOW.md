@@ -82,9 +82,7 @@ No description provided.
 
 The configured Project status is the source of dispatch:
 
-The target ownership model is recorded in ADR-0002 and is being implemented in issue #40. Until that issue lands, use only the GitHub capabilities actually exposed by the runtime; do not work around missing tools with direct shell writes.
-
-- Symphony reads and reconciles Project state. After issue #40, each phase agent owns the GitHub writes for its lane, using authorized host tools and preserving newer human decisions.
+- Symphony reads and reconciles Project state. Each phase agent owns the GitHub writes for its lane through authorized host tools and preserves newer human decisions.
 - Ready: Symphony dispatches Build or resumes a human-requested correction on the same branch and PR.
 - Building: Build owns the issue claim, branch push, draft PR, report, and transition to QA.
 - QA: the QA agent reviews the current SHA, runs every `required_checks` command in the task workspace, records evidence, and advances or returns the task. Missing or failed host checks cannot pass QA.
@@ -98,7 +96,7 @@ The target ownership model is recorded in ADR-0002 and is being implemented in i
 
 The issue identifier starts with the target repository in the form owner/repository#number. Work only in that repository. Do not assume a specific organization, repository, or default branch. The runtime has selected a repository profile and checked out the task branch from that profile's base branch.
 
-Use `gh` with `--repo owner/repository` for GitHub operations. If the CLI cannot authenticate, use the injected `github_api` tool, which executes host-side with the configured token. Never copy tracker tokens into the workpad or command output.
+Use `github_workflow` for GitHub writes. `github_api` is read-only and scoped to the task repository. Do not use `gh` or shell commands to write issues, Project items, or pull requests. Git push is allowed for the Build handoff. Never copy tracker tokens into the workpad or command output.
 
 ## Skills
 
@@ -116,14 +114,14 @@ Before planning, inspect the relevant skills under `.agents/skills` and `.codex/
 2. Stop only for a real external blocker such as missing tools, authentication, permissions, or secrets. Record the exact blocker in the workpad and final report.
 3. Work only in the checked-out target repository.
 4. Read the target repository's `AGENTS.md` and relevant domain docs before editing.
-5. Use only GitHub tools exposed by the runtime. After issue #40, use them for issue, Project, and PR actions owned by your phase; verify each write and report its remote evidence, preserve human-authored text, and never bypass the merge gate. Until then, do not initiate GitHub writes yourself. A human requeues an open item by moving it to Ready.
+5. Use the lane-authorized `github_workflow` tool for issue, Project, and PR writes; verify each write and report its remote evidence, preserve human-authored text, and never bypass the merge gate. A human requeues an open item by moving it to Ready.
 6. For meaningful out-of-scope work, create a separate issue in the same target repository and link it to the current issue.
 7. Final response must report completed work, validation, and blockers. Do not include speculative next steps.
 
 ## Default posture
 
 - Read the issue, its comments, linked PRs, and review feedback before editing.
-- Keep one persistent issue comment marked `## Codex Workpad` as the source of truth for plan, progress, acceptance criteria, validation, and handoff notes. Update it in place; do not post separate progress summaries.
+- Keep one persistent issue comment marked `## Codex Workpad` as the source of truth for plan, progress, acceptance criteria, validation, and handoff notes. Create and update it with `github_workflow` operation `workpad`; do not post separate progress summaries.
 - Reproduce the issue signal before changing code. Plan the smallest change that fully meets its acceptance criteria.
 - Follow any issue-provided Validation, Test Plan, or Testing section.
 - For user-facing changes, include an end-to-end walkthrough. For application behavior changes, record the launch path, interaction, and expected result.
@@ -135,7 +133,7 @@ Before planning, inspect the relevant skills under `.agents/skills` and `.codex/
 1. Parse the repository and issue number from `{{ issue.identifier }}`, then fetch the issue with `gh issue view <number> --repo <owner/repository>`.
 2. If the GitHub issue is closed, stop. If the Project status is not Building, do not edit code or tracker content.
 3. Read the issue body, comments, and any linked PR feedback. Treat actionable review feedback as part of the acceptance criteria.
-4. Find or create the persistent workpad comment before implementation.
+4. Find or create the persistent workpad comment with `github_workflow` operation `workpad` before implementation.
 5. Record an environment stamp in the workpad:
    - Format: <host>:<absolute-workspace-path>@<short-sha>
    - Do not repeat the issue ID, branch, or PR URL already visible in GitHub.

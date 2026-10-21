@@ -9,7 +9,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
              Tracker.adapter_for_kind("github_projects")
   end
 
-  test "tracker lifecycle callbacks delegate claim, completion, and intervention blocking" do
+  test "the tracker exposes scoped GitHub tools and does not write through lifecycle callbacks" do
     previous_client = Application.get_env(:symphony_elixir, :github_projects_client_module)
     previous_owner = Application.get_env(:symphony_elixir, :projects_lifecycle_test_owner)
 
@@ -27,9 +27,10 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       restore_application_env(:projects_lifecycle_test_owner, previous_owner)
     end)
 
-    binding = Tracker.bind_agent_tools()
+    issue = %Issue{id: "octo/app#7", identifier: "octo/app#7", native_ref: %{repository: "octo/app"}}
+    binding = Tracker.bind_agent_tools(%{issue: issue, lane: :individual})
     assert binding.adapter == Adapter
-    assert [%{"name" => "github_api"}] = binding.tool_specs
+    assert Enum.map(binding.tool_specs, & &1["name"]) == ["github_api", "github_workflow"]
     assert "GITHUB_TOKEN" in binding.secret_environment_names
 
     assert {:ok, []} = Tracker.fetch_issues_by_states(["Ready"])
@@ -57,6 +58,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
         "github_api",
         %{"method" => "GET", "path" => "/user"},
         tracker_settings: %{provider: %{"repositories" => []}},
+        agent_context: %{issue: issue, lane: :individual},
         github_client: fn _method, _path, _params, _body, opts ->
           assert get_in(opts, [:tracker_settings, :provider, "repo"]) == nil
           {:ok, %{status: 200, body: %{"login" => "test-user"}}}
@@ -65,19 +67,121 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     assert fallback_tool_result["success"]
 
-    issue = %Issue{id: "octo/app#7", identifier: "octo/app#7", state: "Ready"}
+    assert :ignore = Tracker.claim_issue(issue)
+    assert :ignore = Tracker.complete_issue(issue)
+    assert :ignore = Tracker.block_issue(issue, "operator input required")
+    assert :ignore = Tracker.set_pipeline_status(issue, :done)
+    assert :ignore = Tracker.upsert_pull_request(issue, %{})
+    assert :ignore = Tracker.set_pull_request_stage(issue, 1, :draft)
+    assert :ignore = Tracker.publish_phase_report(issue, "marker", "report", "build")
+    refute_received {:projects_claim, _}
+    refute_received {:projects_complete, _}
+    refute_received {:projects_block, _, _}
+    refute_received {:projects_pipeline_status, _, _, _}
+  end
 
-    assert :ok = Tracker.claim_issue(issue)
+  test "Projects adapter forwards legacy lifecycle and pull request callbacks" do
+    previous_client = Application.get_env(:symphony_elixir, :github_projects_client_module)
+    previous_owner = Application.get_env(:symphony_elixir, :projects_lifecycle_test_owner)
+    Application.put_env(:symphony_elixir, :github_projects_client_module, FakeGitHubProjectsClient)
+    Application.put_env(:symphony_elixir, :projects_lifecycle_test_owner, self())
+
+    on_exit(fn ->
+      restore_application_env(:github_projects_client_module, previous_client)
+      restore_application_env(:projects_lifecycle_test_owner, previous_owner)
+    end)
+
+    issue = %Issue{id: "octo/app#8", identifier: "octo/app#8"}
+
+    assert :ok = Adapter.claim_issue(issue)
     assert_receive {:projects_claim, ^issue}
-
-    assert :ok = Tracker.complete_issue(issue)
+    assert :ok = Adapter.complete_issue(issue)
     assert_receive {:projects_complete, ^issue}
+    assert :ok = Adapter.block_issue(issue, "blocked")
+    assert_receive {:projects_block, ^issue, "blocked"}
+    assert :ok = Adapter.set_pipeline_status(issue, :blocked, "blocked")
+    assert_receive {:projects_pipeline_status, ^issue, :blocked, "blocked"}
 
-    assert :ok = Tracker.block_issue(issue, "operator input required")
-    assert_receive {:projects_block, ^issue, "operator input required"}
+    assert :ok = Adapter.validate_pipeline_delivery(issue, "branch", "sha")
+    assert_receive {:projects_delivery, ^issue, "branch", "sha"}
 
-    assert :ok = Tracker.set_pipeline_status(issue, :done)
-    assert_receive {:projects_pipeline_status, ^issue, :done, nil}
+    assert {:ok, %{number: 8}} = Adapter.upsert_pull_request(issue, %{number: 8})
+    assert_receive {:projects_upsert_pull_request, ^issue, %{number: 8}}
+    assert {:ok, %{number: 8}} = Adapter.set_pull_request_stage(issue, 8, :ready)
+    assert_receive {:projects_pull_request_stage, ^issue, 8, :ready}
+    assert {:ok, %{number: 8}} = Adapter.pull_request(issue)
+    assert_receive {:projects_pull_request, ^issue}
+    assert :ok = Adapter.publish_phase_report(issue, "marker", "body", "build")
+    assert_receive {:projects_phase_report, ^issue, "marker", "body", "build"}
+    assert [%{"name" => "github_api"}] = Adapter.agent_tool_specs()
+  end
+
+  test "a stale Build claim does not overwrite a human requeue to Ready" do
+    alias SymphonyElixir.Pipeline.Store
+
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    root = Path.join(System.tmp_dir!(), "symphony-project-claim-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    number = System.unique_integer([:positive])
+    issue_id = "octo/app##{number}"
+    issue = %Issue{id: issue_id, branch_name: "symphony/octo-app-#{number}", state: "Building", native_ref: %{repository: "octo/app", project_status: "Building"}}
+    task = %{"issue_id" => issue_id, "generation" => 1, "phase" => "build", "attempts" => %{"build" => 1}}
+
+    assert :ok = Store.save_task(task)
+    assert :ok = Store.begin_phase(issue_id, 1, "build", 1)
+
+    {:ok, remote_status} = Agent.start_link(fn -> "Ready" end)
+    test_process = self()
+
+    request_fun = fn query, _variables, _settings ->
+      if query =~ "updateProjectV2ItemFieldValue" do
+        send(test_process, :project_status_write_attempted)
+        Agent.update(remote_status, fn _status -> "Building" end)
+        {:ok, %{status: 200, body: %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}}}
+      else
+        status = Agent.get(remote_status, & &1)
+        {:ok, %{status: 200, body: project_response([issue_item("octo/app", number, status)])}}
+      end
+    end
+
+    context = %{
+      issue: issue,
+      lane: :build,
+      generation: 1,
+      attempt: 1,
+      task: task
+    }
+
+    assert {:error, :github_human_decision_changed} =
+             Client.agent_operation(issue, context, "claim", %{},
+               tracker_settings: tracker_settings(),
+               projects_request: request_fun
+             )
+
+    refute_received :project_status_write_attempted
+    assert Agent.get(remote_status, & &1) == "Ready"
+  end
+
+  test "Review cannot hand off unresolved prior findings to Human Review" do
+    finding = %{"id" => "QA-1", "reproduction" => "Run the failing case.", "criterion" => "The acceptance criterion passes."}
+    context = %{task: %{"prior_findings" => [finding]}}
+    report = %{"outcome" => "passed", "findings" => [], "resolutions" => []}
+
+    assert %{"outcome" => "changes_requested", "findings" => [^finding]} =
+             Client.normalize_agent_report_for_test(report, "review", context)
+
+    assert %{"outcome" => "passed", "findings" => []} =
+             Client.normalize_agent_report_for_test(%{report | "resolutions" => [finding["id"]]}, "review", context)
   end
 
   test "Projects configuration reports missing owner without exposing a token" do
@@ -153,10 +257,10 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
   test "refreshes a Symphony-owned PR body and preserves a human-edited body" do
     settings = tracker_settings(%{"repositories" => [%{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]}]})
     issue = %SymphonyElixir.Tracker.Issue{id: "octo/app#7", branch_name: "symphony/octo-app-7", native_ref: %{repository: "octo/app"}}
-    body = "<!-- symphony:delivery -->\n\nFixes octo/app#7\n\n## Summary\nUpdated it."
+    body = "<!-- symphony:delivery:start -->\n\nFixes octo/app#7\n\n## Summary\nUpdated it.\n<!-- symphony:delivery:end -->"
     attrs = %{branch: issue.branch_name, base: "main", sha: "sha-seven", body: body}
 
-    for {existing_body, should_update?} <- [{"<!-- symphony:delivery -->\n\nOld report", true}, {"Human-edited PR description", false}] do
+    for {existing_body, should_update?} <- [{"<!-- symphony:delivery:start -->\n\nOld report\n<!-- symphony:delivery:end -->", true}, {"Human-edited PR description", false}] do
       calls = Agent.start_link(fn -> [] end) |> elem(1)
 
       request_fun = fn query, variables, _settings ->
@@ -417,23 +521,24 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     refute message =~ "test-token"
   end
 
-  test "closed linked issues become terminal and their Project item moves to Done" do
+  test "closed linked issues become terminal without writing Project status" do
+    calls = Agent.start_link(fn -> [] end) |> elem(1)
+
     assert {:ok, [issue]} =
              Client.fetch_issues_by_states_for_test(["Ready", "Building"], tracker_settings(), fn
                query, variables, _settings ->
-                 if query =~ "updateProjectV2ItemFieldValue" do
-                   assert variables["optionId"] == "option-done"
-                   {:ok, %{status: 200, body: %{"data" => %{"updated" => true}}}}
-                 else
-                   {:ok, %{status: 200, body: project_response([issue_item("octo/app", 7, "Ready", "CLOSED")])}}
-                 end
+                 Agent.update(calls, &[{query, variables} | &1])
+                 {:ok, %{status: 200, body: project_response([issue_item("octo/app", 7, "Ready", "CLOSED")])}}
              end)
 
     assert issue.state == "closed"
     refute issue.dispatchable
+    refute Enum.any?(Agent.get(calls, & &1), fn {query, _} -> query =~ "updateProjectV2ItemFieldValue" or query =~ "addComment" end)
   end
 
-  test "closed linked issues without a Project status still move to Done" do
+  test "closed linked issues without a Project status are observed without writes" do
+    calls = Agent.start_link(fn -> [] end) |> elem(1)
+
     closed_item =
       "octo/app"
       |> issue_item(7, "Ready", "CLOSED")
@@ -442,19 +547,16 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert {:ok, [issue]} =
              Client.fetch_issues_by_states_for_test(["closed"], tracker_settings(), fn
                query, variables, _settings ->
-                 if query =~ "updateProjectV2ItemFieldValue" do
-                   assert variables["optionId"] == "option-done"
-                   {:ok, %{status: 200, body: %{"data" => %{"updated" => true}}}}
-                 else
-                   {:ok, %{status: 200, body: project_response([closed_item])}}
-                 end
+                 Agent.update(calls, &[{query, variables} | &1])
+                 {:ok, %{status: 200, body: project_response([closed_item])}}
              end)
 
     assert issue.state == "closed"
     refute issue.dispatchable
+    refute Enum.any?(Agent.get(calls, & &1), fn {query, _} -> query =~ "updateProjectV2ItemFieldValue" or query =~ "addComment" end)
   end
 
-  test "an unconfigured repository is blocked with an actionable issue comment" do
+  test "an unconfigured repository is ignored without writing Project status or comments" do
     calls = Agent.start_link(fn -> [] end) |> elem(1)
 
     assert {:ok, []} =
@@ -462,19 +564,11 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
                query, variables, _settings ->
                  Agent.update(calls, &[{query, variables} | &1])
 
-                 if query =~ "updateProjectV2ItemFieldValue" or query =~ "addComment" do
-                   {:ok, %{status: 200, body: %{"data" => %{"updated" => true}}}}
-                 else
-                   {:ok, %{status: 200, body: project_response([issue_item("other/repo", 8, "Ready")])}}
-                 end
+                 {:ok, %{status: 200, body: project_response([issue_item("other/repo", 8, "Ready")])}}
              end)
 
     calls = Agent.get(calls, &Enum.reverse/1)
-    assert Enum.count(calls, fn {query, _} -> query =~ "updateProjectV2ItemFieldValue" end) == 1
-    assert Enum.count(calls, fn {query, _} -> query =~ "addComment" end) == 1
-    {_, comment} = Enum.find(calls, fn {query, _} -> query =~ "addComment" end)
-    assert comment["body"] =~ "No repository profile is configured for other/repo"
-    assert comment["body"] =~ "tracker.provider.repositories"
+    refute Enum.any?(calls, fn {query, _} -> query =~ "updateProjectV2ItemFieldValue" or query =~ "addComment" end)
   end
 
   test "issues with the same number in different repositories have distinct identities" do
@@ -774,6 +868,18 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest.FakeGitHubProjectsClient do
   def complete_issue(issue), do: notify({:projects_complete, issue})
   def block_issue(issue, reason), do: notify({:projects_block, issue, reason})
   def set_pipeline_status(issue, status, reason), do: notify({:projects_pipeline_status, issue, status, reason})
+  def validate_pipeline_delivery(issue, branch, sha), do: notify({:projects_delivery, issue, branch, sha})
+
+  def upsert_pull_request(issue, attrs),
+    do: notify({:projects_upsert_pull_request, issue, attrs}, {:ok, %{number: attrs.number}})
+
+  def set_pull_request_stage(issue, number, stage),
+    do: notify({:projects_pull_request_stage, issue, number, stage}, {:ok, %{number: number}})
+
+  def pull_request(issue), do: notify({:projects_pull_request, issue}, {:ok, %{number: 8}})
+
+  def publish_phase_report(issue, marker, body, phase),
+    do: notify({:projects_phase_report, issue, marker, body, phase})
 
   defp notify(message) do
     send(Application.fetch_env!(:symphony_elixir, :projects_lifecycle_test_owner), message)
