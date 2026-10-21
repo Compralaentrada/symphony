@@ -52,7 +52,7 @@ defmodule SymphonyElixir.Pipeline do
 
   @spec finish_phase(Issue.t(), map(), String.t(), pos_integer(), term()) :: :ok | {:error, term()}
   def finish_phase(%Issue{} = issue, task, phase, attempt, result) do
-    case normalize_result(result, phase) do
+    case normalize_phase_result(result, phase) do
       {:ok, result} ->
         finish_valid_phase(issue, task, phase, attempt, result)
 
@@ -596,7 +596,9 @@ defmodule SymphonyElixir.Pipeline do
     %{key: key, issue_id: task["issue_id"], kind: kind, payload: payload}
   end
 
-  defp normalize_result(result, phase) when is_map(result) do
+  @doc false
+  @spec normalize_phase_result(term(), String.t()) :: {:ok, map()} | {:error, term()}
+  def normalize_phase_result(result, phase) when is_map(result) do
     result = Map.new(result, fn {key, value} -> {to_string(key), value} end)
 
     result =
@@ -611,10 +613,27 @@ defmodule SymphonyElixir.Pipeline do
 
     if is_binary(result["outcome"]) and is_binary(result["summary"]) and valid_report?(phase, result),
       do: {:ok, result},
-      else: {:error, :invalid_phase_report}
+      else: {:error, {:invalid_phase_report, invalid_report_details(phase, result)}}
   end
 
-  defp normalize_result(_result, _phase), do: {:error, :invalid_phase_report}
+  def normalize_phase_result(_result, phase),
+    do: {:error, {:invalid_phase_report, %{phase: phase, report_type: :not_an_object}}}
+
+  defp invalid_report_details(phase, result) do
+    finding_keys =
+      case result["findings"] do
+        findings when is_list(findings) ->
+          Enum.map(findings, fn
+            finding when is_map(finding) -> Map.keys(finding)
+            _ -> :not_an_object
+          end)
+
+        _ ->
+          nil
+      end
+
+    %{phase: phase, report_keys: Map.keys(result), finding_keys: finding_keys}
+  end
 
   defp valid_report?("build", %{"outcome" => "ready"} = result) do
     is_binary(result["sha"]) and is_binary(result["next_step"]) and
