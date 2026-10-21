@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.CLI do
   @moduledoc """
-  Escript entrypoint for running Symphony with an explicit WORKFLOW.md path.
+  Command-line entrypoint for running Symphony with an explicit WORKFLOW.md path.
   """
 
   alias SymphonyElixir.LogFile
