@@ -42,6 +42,11 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
             id number title body state stateReason url createdAt updatedAt
             repository { nameWithOwner }
             labels(first: 100) { nodes { name } }
+            blockedBy(first: 100) {
+              nodes { number state repository { nameWithOwner } }
+              pageInfo { hasNextPage endCursor }
+              totalCount
+            }
           }
         }
         fieldValues(first: 100) {
@@ -55,6 +60,20 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
         }
       }
       pageInfo { hasNextPage endCursor }
+    }
+  }
+  """
+
+  @issue_blockers_query """
+  query SymphonyIssueBlockers($issueId: ID!, $after: String) {
+    node(id: $issueId) {
+      ... on Issue {
+        blockedBy(first: 100, after: $after) {
+          nodes { number state repository { nameWithOwner } }
+          pageInfo { hasNextPage endCursor }
+          totalCount
+        }
+      }
     }
   }
   """
@@ -482,13 +501,21 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp normalize_linked_issue(item, metadata, settings, request_fun) do
     content = item["content"]
+
+    with {:ok, blockers} <- issue_blockers(content, settings, request_fun) do
+      normalize_linked_issue(item, metadata, settings, request_fun, blockers)
+    end
+  end
+
+  defp normalize_linked_issue(item, metadata, settings, request_fun, blockers) do
+    content = item["content"]
     status = item_status(item, settings.status_field)
     repository = get_in(content, ["repository", "nameWithOwner"])
     profile = Map.get(settings.repositories, normalize_repository(repository))
 
     cond do
       normalize_state(content["state"]) == "closed" ->
-        {:ok, normalize_issue(item, metadata, settings, profile, "closed", status)}
+        {:ok, normalize_issue(item, metadata, settings, profile, "closed", status, blockers)}
 
       is_nil(status) ->
         {:ok, nil}
@@ -499,11 +526,11 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
         end
 
       true ->
-        {:ok, normalize_issue(item, metadata, settings, profile, status, status)}
+        {:ok, normalize_issue(item, metadata, settings, profile, status, status, blockers)}
     end
   end
 
-  defp normalize_issue(item, metadata, settings, profile, state, project_status) do
+  defp normalize_issue(item, metadata, settings, profile, state, project_status, blockers) do
     content = item["content"]
     repository = get_in(content, ["repository", "nameWithOwner"])
     number = content["number"]
@@ -546,10 +573,101 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       dispatchable: not is_nil(profile) and dispatch_status? and state != "closed",
       requeueable: state != "closed" and not is_nil(profile) and status_in?(project_status, [settings.statuses.ready]),
       tracker_blocked: state != "closed" and status_in?(project_status, [settings.statuses.blocked]),
-      blocked_by: [],
+      blocked_by: blockers,
       created_at: parse_datetime(content["createdAt"]),
       updated_at: parse_datetime(content["updatedAt"])
     }
+  end
+
+  defp issue_blockers(content, settings, request_fun) do
+    with {:ok, blockers, page_info, total_count} <- blocker_page(content["blockedBy"]),
+         {:ok, remaining} <-
+           fetch_blocker_pages(content["id"], page_info, total_count, settings, request_fun, []) do
+      all_blockers = blockers ++ remaining
+
+      if length(all_blockers) == total_count, do: {:ok, all_blockers}, else: incomplete_blockers()
+    end
+  end
+
+  defp blocker_page(%{
+         "nodes" => nodes,
+         "pageInfo" => %{"hasNextPage" => has_next_page} = page_info,
+         "totalCount" => total_count
+       })
+       when is_list(nodes) and is_boolean(has_next_page) and is_integer(total_count) and total_count >= 0 do
+    with {:ok, blockers} <- normalize_blockers(nodes),
+         :ok <- validate_blocker_page(blockers, page_info, total_count) do
+      {:ok, blockers, page_info, total_count}
+    end
+  end
+
+  defp blocker_page(_connection), do: incomplete_blockers()
+
+  defp normalize_blockers(nodes) do
+    blockers = Enum.map(nodes, &normalize_blocker/1)
+    if Enum.any?(blockers, &is_nil/1), do: incomplete_blockers(), else: {:ok, blockers}
+  end
+
+  defp validate_blocker_page(blockers, page_info, total_count) do
+    has_next_page = page_info["hasNextPage"]
+
+    cond do
+      total_count < length(blockers) -> incomplete_blockers()
+      has_next_page and (blockers == [] or total_count == length(blockers)) -> incomplete_blockers()
+      has_next_page and not (is_binary(page_info["endCursor"]) and page_info["endCursor"] != "") -> incomplete_blockers()
+      true -> :ok
+    end
+  end
+
+  defp normalize_blocker(%{
+         "number" => number,
+         "state" => state,
+         "repository" => %{"nameWithOwner" => repository}
+       })
+       when is_integer(number) and number > 0 and is_binary(state) and
+              is_binary(repository) and repository != "" do
+    identity = "#{repository}##{number}"
+    %{id: identity, identifier: identity, state: state}
+  end
+
+  defp normalize_blocker(_blocker), do: nil
+
+  @spec fetch_blocker_pages(String.t() | nil, map(), non_neg_integer(), map(), function(), [String.t()]) ::
+          {:ok, [map()]} | {:error, term()}
+  defp fetch_blocker_pages(_issue_id, %{"hasNextPage" => false}, _total_count, _settings, _request_fun, _seen),
+    do: {:ok, []}
+
+  defp fetch_blocker_pages(
+         issue_id,
+         %{"hasNextPage" => true, "endCursor" => cursor},
+         total_count,
+         settings,
+         request_fun,
+         seen
+       )
+       when is_binary(issue_id) and is_binary(cursor) and cursor != "" do
+    if cursor in seen do
+      incomplete_blockers()
+    else
+      variables = %{"issueId" => issue_id, "after" => cursor}
+
+      with {:ok, data} <- graphql(request_fun, @issue_blockers_query, variables, settings),
+           {:ok, blockers, page_info, ^total_count} <- blocker_page(get_in(data, ["node", "blockedBy"])),
+           {:ok, remaining} <-
+             fetch_blocker_pages(issue_id, page_info, total_count, settings, request_fun, [cursor | seen]) do
+        {:ok, blockers ++ remaining}
+      else
+        {:ok, _blockers, _page_info, _other_total_count} -> incomplete_blockers()
+        other -> other
+      end
+    end
+  end
+
+  defp fetch_blocker_pages(_issue_id, _page_info, _total_count, _settings, _request_fun, _seen),
+    do: incomplete_blockers()
+
+  defp incomplete_blockers do
+    {:error, {:github_projects_api_error, "GitHub returned incomplete issue dependency data."}}
   end
 
   defp maybe_block_unconfigured(item, status, settings, metadata, request_fun) do

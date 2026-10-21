@@ -1,6 +1,97 @@
 defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
   use SymphonyElixir.TestSupport
 
+  test "does not treat a failed completed turn as a phase report" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-failed-phase-turn-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-input.trace")
+      File.mkdir_p!(test_root)
+
+      invalid_delta =
+        Jason.encode!(%{
+          "method" => "item/agentMessage/delta",
+          "params" => %{"itemId" => "review-output", "delta" => "The review is complete, with one concern."}
+        })
+
+      failed_completion =
+        Jason.encode!(%{
+          "method" => "turn/completed",
+          "params" => %{
+            "turn" => %{
+              "id" => "review-output-turn",
+              "status" => "failed",
+              "error" => %{"message" => "The final output did not satisfy its schema."}
+            }
+          }
+        })
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> '#{trace_file}'
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"failed-phase-thread"}}}' ;;
+          4|5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"failed-phase-turn"}}}'
+            printf '%s\\n' '#{invalid_delta}'
+            printf '%s\\n' '#{failed_completion}'
+            ;;
+          *) ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: required_skill_fixture_hook(),
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-failed-phase-turn",
+        identifier: "MT-FAILED-PHASE-TURN",
+        title: "Return a phase report",
+        description: "Review the accepted change and return a phase report.",
+        state: "Review",
+        url: "https://example.org/issues/MT-FAILED-PHASE-TURN",
+        labels: ["backend"]
+      }
+
+      assert_raise RuntimeError, ~r/turn_not_completed/, fn ->
+        AgentRunner.run(issue, nil,
+          phase: :review,
+          branch: "symphony/mt-failed-phase-turn",
+          sha: String.duplicate("a", 40)
+        )
+      end
+
+      turn_starts =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.filter(&(&1["method"] == "turn/start"))
+
+      assert length(turn_starts) == 1
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "QA phase corrects schema-invalid findings before returning a report" do
     test_root =
       Path.join(
@@ -175,16 +266,12 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
           3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"structured-phase-report-thread"}}}' ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"structured-phase-report-turn"}}}'
-            if printf '%s' "$line" | grep -q '"outputSchema"'; then
-              printf '%s\\n' '#{report_delta}'
-            else
-              printf '%s\\n' '#{prose_delta}'
-            fi
+            printf '%s\\n' '#{prose_delta}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
           5)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"structured-phase-report-retry"}}}'
-            printf '%s\\n' '#{prose_delta}'
+            printf '%s\\n' '#{report_delta}'
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;
@@ -220,20 +307,25 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
 
       assert %{"outcome" => "passed", "summary" => "Review passed"} = result
 
-      turn_params =
+      turn_starts =
         trace_file
         |> File.read!()
         |> String.split("\n", trim: true)
         |> Enum.map(&String.trim_leading(&1, "JSON:"))
         |> Enum.map(&Jason.decode!/1)
-        |> Enum.find(&(&1["method"] == "turn/start"))
-        |> Map.fetch!("params")
+        |> Enum.filter(&(&1["method"] == "turn/start"))
 
-      schema = Map.fetch!(turn_params, "outputSchema")
+      assert length(turn_starts) == 2
+      [initial_turn, correction_turn] = turn_starts
+      assert get_in(initial_turn, ["params", "input", Access.at(0), "text"]) =~ "Do not invoke the repository's `code-review` skill or its Markdown report format"
+      assert get_in(correction_turn, ["params", "input", Access.at(0), "text"]) =~ "Do not include headings, bullets, Markdown, code fences, or text outside the JSON object."
+
+      schema = get_in(initial_turn, ["params", "outputSchema"])
       assert schema["type"] == "object"
       assert "outcome" in schema["required"]
       assert "findings" in schema["required"]
       assert get_in(schema, ["properties", "findings", "items", "required"]) == ["id", "reproduction", "criterion"]
+      assert is_map(get_in(correction_turn, ["params", "outputSchema"]))
     after
       File.rm_rf(test_root)
     end

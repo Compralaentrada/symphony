@@ -535,6 +535,99 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     refute Workspace.workspace_key(app) == Workspace.workspace_key(docs)
   end
 
+  test "reads native blockers with repository-qualified identities and ignores title matches" do
+    settings =
+      tracker_settings(%{
+        "repositories" => [
+          %{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]},
+          %{"repository" => "octo/docs", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]}
+        ]
+      })
+
+    dependent =
+      issue_item("octo/app", 7, "Ready")
+      |> put_in(["content", "blockedBy"], dependency_connection([blocker("octo/app", 8), blocker("octo/docs", 8)]))
+
+    title_only = put_in(issue_item("octo/app", 9, "Ready"), ["content", "title"], "Blocked by #8")
+
+    assert {:ok, issues} =
+             Client.fetch_issues_by_states_for_test(["Ready"], settings, fn _query, _variables, _settings ->
+               {:ok, %{status: 200, body: project_response([dependent, title_only, issue_item("octo/app", 8, "Ready")])}}
+             end)
+
+    assert Enum.find(issues, &(&1.id == "octo/app#7")).blocked_by == [
+             %{id: "octo/app#8", identifier: "octo/app#8", state: "OPEN"},
+             %{id: "octo/docs#8", identifier: "octo/docs#8", state: "OPEN"}
+           ]
+
+    assert Enum.find(issues, &(&1.id == "octo/app#9")).blocked_by == []
+  end
+
+  test "follows blocker pages before returning Project issues" do
+    dependent =
+      issue_item("octo/app", 7, "Ready")
+      |> put_in(
+        ["content", "blockedBy"],
+        dependency_connection([blocker("octo/app", 8)], true, "blocker-cursor", 2)
+      )
+
+    assert {:ok, [issue]} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn query, variables, _settings ->
+               if query =~ "SymphonyIssueBlockers" do
+                 assert variables == %{"issueId" => "I_issue_7", "after" => "blocker-cursor"}
+
+                 {:ok,
+                  %{
+                    status: 200,
+                    body: %{
+                      "data" => %{
+                        "node" => %{
+                          "blockedBy" => dependency_connection([blocker("octo/docs", 8)], false, nil, 2)
+                        }
+                      }
+                    }
+                  }}
+               else
+                 {:ok, %{status: 200, body: project_response([dependent])}}
+               end
+             end)
+
+    assert Enum.map(issue.blocked_by, & &1.id) == ["octo/app#8", "octo/docs#8"]
+  end
+
+  test "incomplete blocker pages and blocker read errors fail the Project read" do
+    incomplete =
+      issue_item("octo/app", 7, "Ready")
+      |> put_in(["content", "blockedBy"], %{"nodes" => [], "pageInfo" => %{"hasNextPage" => true}})
+
+    assert {:error, {:github_projects_api_error, _}} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn _query, _variables, _settings ->
+               {:ok, %{status: 200, body: project_response([incomplete])}}
+             end)
+
+    incomplete_count =
+      issue_item("octo/app", 7, "Ready")
+      |> put_in(["content", "blockedBy"], dependency_connection([], false, nil, 1))
+
+    assert {:error, {:github_projects_api_error, _}} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn _query, _variables, _settings ->
+               {:ok, %{status: 200, body: project_response([incomplete_count])}}
+             end)
+
+    paged =
+      issue_item("octo/app", 7, "Ready")
+      |> put_in(["content", "blockedBy"], dependency_connection([], true, "blocker-cursor", 1))
+
+    assert {:error, {:github_projects_api_error, _}} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn query, _variables, _settings ->
+               if query =~ "SymphonyIssueBlockers" do
+                 {:error, :tracker_read_failed}
+               else
+                 {:ok, %{status: 200, body: project_response([paged])}}
+               end
+             end)
+  end
+
   defp tracker_settings(provider_overrides \\ %{}) do
     %{
       kind: "github_projects",
@@ -612,7 +705,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
         "state" => "OPEN",
         "url" => "https://github.com/#{repository}/issues/#{number}",
         "repository" => %{"nameWithOwner" => repository},
-        "labels" => %{"nodes" => [%{"name" => "Bug"}]}
+        "labels" => %{"nodes" => [%{"name" => "Bug"}]},
+        "blockedBy" => dependency_connection([])
       },
       "fieldValues" => %{
         "nodes" => [
@@ -623,6 +717,22 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
           }
         ]
       }
+    }
+  end
+
+  defp dependency_connection(blockers, has_next_page \\ false, end_cursor \\ nil, total_count \\ nil) do
+    %{
+      "nodes" => blockers,
+      "pageInfo" => %{"hasNextPage" => has_next_page, "endCursor" => end_cursor},
+      "totalCount" => total_count || length(blockers)
+    }
+  end
+
+  defp blocker(repository, number, state \\ "OPEN") do
+    %{
+      "number" => number,
+      "state" => state,
+      "repository" => %{"nameWithOwner" => repository}
     }
   end
 
