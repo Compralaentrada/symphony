@@ -254,6 +254,9 @@ tracker:
 - Work identity is `owner/repository#number`. Claiming moves Ready to Building, successful completion
   moves Building to Done, and intervention-required failures move to Blocked with a comment. Transient
   failures retry on the existing backoff path.
+- Native GitHub `blocked by` relations populate `issue.blocked_by` with `owner/repository#number`
+  identities. Incomplete or failed blocker reads fail the Project refresh instead of dropping
+  dependency data.
 - Project items can belong to either a user or organization Project. The optional `graphql_url`
   setting defaults to `https://api.github.com/graphql`.
 - Tool: the Linear adapter advertises `linear_graphql`, accepting either a raw query string or an
