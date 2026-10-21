@@ -89,7 +89,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   @pull_request_query """
   query SymphonyPipelinePullRequest($owner: String!, $name: String!, $branch: String!, $base: String!) {
     repository(owner: $owner, name: $name) {
-      pullRequests(first: 100, states: [OPEN, CLOSED], headRefName: $branch, baseRefName: $base) {
+      pullRequests(first: 100, states: [OPEN, CLOSED, MERGED], headRefName: $branch, baseRefName: $base) {
         nodes { id number url state isDraft mergedAt baseRefName headRefName headRefOid body }
       }
     }
@@ -301,6 +301,15 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   def pull_request(issue) do
     with {:ok, settings} <- settings(Config.settings!().tracker) do
       pull_request(issue, settings, &perform_request/3)
+    end
+  end
+
+  @doc false
+  @spec pull_request_for_test(Issue.t(), map(), function()) :: {:ok, map() | nil} | {:error, term()}
+  def pull_request_for_test(issue, tracker_settings, request_fun)
+      when is_struct(issue, Issue) and is_map(tracker_settings) and is_function(request_fun, 3) do
+    with {:ok, settings} <- settings(tracker_settings) do
+      pull_request(issue, settings, request_fun)
     end
   end
 

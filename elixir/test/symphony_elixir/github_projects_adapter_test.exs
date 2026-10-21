@@ -126,6 +126,30 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert {:ok, %{body: ^body}} = Client.upsert_pull_request_for_test(issue, attrs, settings, request_fun)
   end
 
+  test "pipeline PR lookup includes merged pull requests" do
+    settings = tracker_settings()
+
+    issue = %SymphonyElixir.Tracker.Issue{
+      id: "octo/app#7",
+      branch_name: "symphony/octo-app-7",
+      native_ref: %{repository: "octo/app", base_branch: "main"}
+    }
+
+    merged_pr =
+      pipeline_pr(issue, "delivery")
+      |> Map.merge(%{"state" => "MERGED", "isDraft" => false, "mergedAt" => "2026-10-21T09:00:00Z"})
+
+    request_fun = fn query, variables, _settings ->
+      assert query =~ "states: [OPEN, CLOSED, MERGED]"
+      assert variables == %{"owner" => "octo", "name" => "app", "branch" => issue.branch_name, "base" => "main"}
+
+      {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [merged_pr]}}}}}}
+    end
+
+    assert {:ok, %{merged: true, state: "MERGED", base: "main"}} =
+             Client.pull_request_for_test(issue, settings, request_fun)
+  end
+
   test "refreshes a Symphony-owned PR body and preserves a human-edited body" do
     settings = tracker_settings(%{"repositories" => [%{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]}]})
     issue = %SymphonyElixir.Tracker.Issue{id: "octo/app#7", branch_name: "symphony/octo-app-7", native_ref: %{repository: "octo/app"}}
