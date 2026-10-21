@@ -220,16 +220,6 @@ tracker:
   provider:
     owner: your-user-or-organization
     project_number: 12
-    status_field: Status
-    status_values:
-      ready: Ready
-      building: Building
-      qa: QA
-      review: Review
-      human_review: Human Review
-      blocked: Blocked
-      dropped: Dropped
-      done: Done
     token: $GITHUB_TOKEN
     repositories:
       - repository: your-org/api
@@ -242,12 +232,13 @@ tracker:
           mise exec -- mix deps.get
 ```
 
-- `owner` and `project_number` identify a user or organization Project. `status_field` and the
-  `status_values` must match a single-select Project field and its options.
+- `owner` and `project_number` identify a user or organization Project. Symphony uses its `Status`
+  single-select field and canonical options: Backlog, Ready, Building, QA, Review, Human Review,
+  Blocked, Done, and Dropped.
 - `token` defaults to `GITHUB_TOKEN` and accepts `$ENV_VAR`; never put a literal token in
   `WORKFLOW.md`. The token needs access to read and update the Project and linked issues.
-- `active_states` must include the configured Ready and Building values. `terminal_states` must
-  include `closed` and must leave Done and Blocked requeueable.
+- `active_states` must include Ready, Building, QA, Review, and Human Review. `terminal_states` must
+  include `closed` and Dropped, leaving Done and Blocked requeueable.
 - Only Ready Project items linked to native GitHub Issues with an exact repository profile are
   dispatched. Pull requests, draft issues, and unsupported item types are ignored. An unconfigured
   repository is moved to Blocked and receives a comment explaining the missing profile.

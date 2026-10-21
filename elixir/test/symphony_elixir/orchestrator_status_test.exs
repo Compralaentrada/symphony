@@ -1946,17 +1946,16 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       ---
       tracker:
         kind: github_projects
-        active_states: [Ready, Building]
-        terminal_states: [closed]
+        active_states: [Ready, Building, QA, Review, Human Review]
+        terminal_states: [closed, Dropped]
         provider:
           owner: acme
           project_number: 12
-          status_field: Status
-          status_values: {ready: Ready, building: Building, blocked: Blocked, done: Done}
           repositories:
             - repository: repo/app
               base_branch: main
               prepare_command: "true"
+              required_checks: ["true"]
           token: test-token
       ---
       Work on {{ issue.identifier }}.

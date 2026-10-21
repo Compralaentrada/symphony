@@ -6,6 +6,7 @@ defmodule SymphonyElixir.Pipeline do
 
   @phases ~w(build qa review)
   @statuses %{
+    backlog: "Backlog",
     ready: "Ready",
     building: "Building",
     qa: "QA",
@@ -19,8 +20,7 @@ defmodule SymphonyElixir.Pipeline do
   @spec enabled?() :: boolean()
   def enabled? do
     tracker = Config.settings!().tracker
-    values = Map.get(tracker.provider, "status_values", %{})
-    tracker.kind == "github_projects" and Enum.all?(~w(qa review human_review dropped), &Map.has_key?(values, &1))
+    tracker.kind == "github_projects"
   end
 
   @spec reconcile() :: :ok | {:error, term()}
@@ -132,7 +132,6 @@ defmodule SymphonyElixir.Pipeline do
         "branch" => issue.branch_name,
         "base_branch" => profile_value(profile, :base_branch),
         "required_checks" => profile_value(profile, :required_checks) || [],
-        "status_values" => profile_value(profile, :status_values) || %{},
         "generation" => 1,
         "phase" => "build",
         "status" => "building",
@@ -689,6 +688,7 @@ defmodule SymphonyElixir.Pipeline do
   defp ensure_current_sha(%{"current_sha" => sha}, sha) when is_binary(sha), do: :ok
   defp ensure_current_sha(_task, _sha), do: {:error, :phase_sha_mismatch}
 
+  defp status_atom("backlog"), do: :backlog
   defp status_atom("ready"), do: :ready
   defp status_atom("building"), do: :building
   defp status_atom("qa"), do: :qa
@@ -702,12 +702,9 @@ defmodule SymphonyElixir.Pipeline do
     Enum.find_value(@statuses, fn {atom, value} -> if value == status, do: atom end)
   end
 
-  defp status_value(task, status), do: Map.get(task["status_values"] || %{}, Atom.to_string(status)) || @statuses[status]
+  defp status_value(_task, status), do: @statuses[status]
 
-  defp issue_status_value(issue, status) do
-    statuses = profile_value(issue.native_ref || %{}, :status_values) || %{}
-    Map.get(statuses, Atom.to_string(status)) || @statuses[status]
-  end
+  defp issue_status_value(_issue, status), do: @statuses[status]
 
   defp status_phase("building"), do: :building
   defp status_phase("qa"), do: :qa
