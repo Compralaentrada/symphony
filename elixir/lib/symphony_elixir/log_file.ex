@@ -6,7 +6,9 @@ defmodule SymphonyElixir.LogFile do
   require Logger
 
   @handler_id :symphony_disk_log
+  @error_handler_id :symphony_error_disk_log
   @default_log_relative_path "log/symphony.log"
+  @error_log_filename "symphony-errors.log"
   @default_max_bytes 10 * 1024 * 1024
   @default_max_files 5
 
@@ -25,34 +27,36 @@ defmodule SymphonyElixir.LogFile do
     log_file = Application.get_env(:symphony_elixir, :log_file, default_log_file())
     max_bytes = Application.get_env(:symphony_elixir, :log_file_max_bytes, @default_max_bytes)
     max_files = Application.get_env(:symphony_elixir, :log_file_max_files, @default_max_files)
+    error_log_file = Path.join(Path.dirname(Path.expand(log_file)), @error_log_filename)
 
-    setup_disk_handler(log_file, max_bytes, max_files)
+    :ok = setup_disk_handler(@handler_id, log_file, max_bytes, max_files, :all)
+    setup_disk_handler(@error_handler_id, error_log_file, max_bytes, max_files, :warning)
   end
 
-  defp setup_disk_handler(log_file, max_bytes, max_files) do
+  defp setup_disk_handler(handler_id, log_file, max_bytes, max_files, level) do
     expanded_path = Path.expand(log_file)
     :ok = File.mkdir_p(Path.dirname(expanded_path))
-    :ok = remove_existing_handler()
+    :ok = remove_existing_handler(handler_id)
 
     case :logger.add_handler(
-           @handler_id,
+           handler_id,
            :logger_disk_log_h,
-           disk_log_handler_config(expanded_path, max_bytes, max_files)
+           disk_log_handler_config(expanded_path, max_bytes, max_files, level)
          ) do
       :ok ->
-        remove_default_console_handler()
+        if handler_id == @handler_id, do: remove_default_console_handler()
         :ok
 
       {:error, reason} ->
-        Logger.warning("Failed to configure rotating log file handler: #{inspect(reason)}")
+        Logger.warning("Failed to configure rotating log file handler id=#{handler_id}: #{inspect(reason)}")
         :ok
     end
   end
 
-  defp remove_existing_handler do
-    case :logger.remove_handler(@handler_id) do
+  defp remove_existing_handler(handler_id) do
+    case :logger.remove_handler(handler_id) do
       :ok -> :ok
-      {:error, {:not_found, @handler_id}} -> :ok
+      {:error, {:not_found, ^handler_id}} -> :ok
       {:error, _reason} -> :ok
     end
   end
@@ -65,9 +69,9 @@ defmodule SymphonyElixir.LogFile do
     end
   end
 
-  defp disk_log_handler_config(path, max_bytes, max_files) do
+  defp disk_log_handler_config(path, max_bytes, max_files, level) do
     %{
-      level: :all,
+      level: level,
       formatter: {:logger_formatter, %{single_line: true}},
       config: %{
         file: String.to_charlist(path),
