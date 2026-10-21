@@ -21,15 +21,22 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
    configurations keep the existing single-run behavior
 4. Creates a draft PR after Build, marks it ready after QA and Review, then waits for a human decision
 
+## Pipeline ownership decision
+
+The accepted design in [ADR-0002](../docs/adr/0002-agentes-propietarios-de-escrituras-github.md) assigns GitHub issue and PR writes to the agent handling each run dispatched through GitHub Issues or GitHub Projects. In the Projects pipeline, Build, QA, and Review own writes for their respective lanes. Build opens the draft PR; Review prepares it for human review and invokes the deterministic merge gate only when auto-merge is explicitly enabled. Symphony remains the reader and execution coordinator.
+
+The current prototype still centralizes these writes in Symphony and disables tracker tools in pipeline sessions. Issue #40 tracks moving the implementation to the accepted design.
+
 Local runs discover repo-local Codex skills from `.agents/skills` in the workspace checkout. Symphony checks the selected skills before launching Codex and reports a missing `SKILL.md` path; pinned sources and fingerprints are listed in the repository's `.agents/skills/SOURCES.md`.
 
 During single-run app-server sessions, the selected tracker adapter may advertise provider-native
 tools. Linear serves `linear_graphql`, GitHub Issues and GitHub Projects v2 serve `github_api`, Jira
 Cloud serves `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes
 those tools with configured host-side auth and removes declared tracker-token environment variables
-from the Codex child. Pipeline phase sessions disable tracker tools; Build pushes through the host's
-Git credential helper or SSH, while Symphony owns the API writes for PRs, Project status, and issue
-reports. Configure push access for each repository profile on the Symphony host.
+from the Codex child. Until issue #40 lands, pipeline phase sessions disable tracker tools; Build
+pushes through the host's Git credential helper or SSH, while Symphony owns the API writes for PRs,
+Project status, and issue reports. Configure push access for each repository profile on the Symphony
+host.
 
 If a claimed issue moves to a configured terminal state, Symphony stops the active agent and cleans
 up its workspace. In GitHub Projects mode, closing the linked GitHub Issue is terminal; Project
@@ -82,9 +89,11 @@ cd symphony/elixir
 mise trust
 mise install
 mise exec -- mix setup
-mise exec -- mix build
-mise exec -- ./bin/symphony ./WORKFLOW.md
+mise exec -- mix run --no-start --no-halt -e 'SymphonyElixir.CLI.main(["--i-understand-that-this-will-be-running-without-the-usual-guardrails", "./WORKFLOW.md"])'
 ```
+
+The local Mix run loads Exqlite's native SQLite library from the compiled dependency. Do not build
+or run an escript; its archive cannot provide the NIF used by the pipeline journal.
 
 ## Burrito releases
 
@@ -112,15 +121,15 @@ After downloading the executable for your platform from a release:
 
 ```bash
 chmod +x ./symphony-v0.0.1-macos_arm64
-./symphony-v0.0.1-macos_arm64 ./WORKFLOW.md
+./symphony-v0.0.1-macos_arm64 --i-understand-that-this-will-be-running-without-the-usual-guardrails ./WORKFLOW.md
 ```
 
 ## Configuration
 
-Pass a custom workflow file path to `./bin/symphony` when starting the service:
+Pass a custom workflow file path to the Burrito executable when starting the service:
 
 ```bash
-./bin/symphony /path/to/custom/WORKFLOW.md
+./burrito_out/symphony_macos_arm64 --i-understand-that-this-will-be-running-without-the-usual-guardrails /path/to/custom/WORKFLOW.md
 ```
 
 If no path is passed, Symphony defaults to `./WORKFLOW.md`.

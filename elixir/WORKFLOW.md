@@ -25,7 +25,7 @@ tracker:
             cd elixir && mise trust && mise exec -- mix deps.get
           fi
 polling:
-  interval_ms: 5000
+  interval_ms: 30000
 workspace:
   root: ~/code/symphony-workspaces
 hooks:
@@ -72,12 +72,15 @@ No description provided.
 
 The configured Project status is the source of dispatch:
 
-- Ready: Symphony starts Build or resumes a human-requested correction on the same branch and PR.
-- Building: the Build phase may continue.
-- QA: an independent agent reviews the current SHA, then Symphony runs every `required_checks` command from the repository profile in the task workspace. Missing or failed host checks cannot pass QA.
-- Review: Symphony runs autonomous code review against the QA-accepted SHA.
+The target ownership model is recorded in ADR-0002 and is being implemented in issue #40. Until that issue lands, use only the GitHub capabilities actually exposed by the runtime; do not work around missing tools with direct shell writes.
+
+- Symphony reads and reconciles Project state. After issue #40, each phase agent owns the GitHub writes for its lane, using authorized host tools and preserving newer human decisions.
+- Ready: Symphony dispatches Build or resumes a human-requested correction on the same branch and PR.
+- Building: Build owns the issue claim, branch push, draft PR, report, and transition to QA.
+- QA: the QA agent reviews the current SHA, runs every `required_checks` command in the task workspace, records evidence, and advances or returns the task. Missing or failed host checks cannot pass QA.
+- Review: the Review agent examines the QA-accepted SHA, records findings, and either requests changes or prepares the PR for human review.
 - Human Review: the PR is ready for a person; Symphony waits for a merge or a move back to Ready.
-- Blocked: intervention is required. Record the reason in the issue and workpad; after it is resolved, a human moves the issue to Ready.
+- Blocked: the phase agent records the reason in the issue and moves the Project item to Blocked. After it is resolved, a human moves the issue to Ready.
 - Done: the PR merge into the configured base branch has been confirmed.
 - Closed GitHub issue: terminal; stop.
 - Backlog: not dispatched.
@@ -103,7 +106,7 @@ Before planning, inspect the relevant skills under `.agents/skills` and `.codex/
 2. Stop only for a real external blocker such as missing tools, authentication, permissions, or secrets. Record the exact blocker in the workpad and final report.
 3. Work only in the checked-out target repository.
 4. Read the target repository's `AGENTS.md` and relevant domain docs before editing.
-5. Do not change the Project status manually. Symphony owns Building, Done, and Blocked transitions; a human requeues an open item by moving it to Ready.
+5. Use only GitHub tools exposed by the runtime. After issue #40, use them for issue, Project, and PR actions owned by your phase; verify each write and report its remote evidence, preserve human-authored text, and never bypass the merge gate. Until then, do not initiate GitHub writes yourself. A human requeues an open item by moving it to Ready.
 6. For meaningful out-of-scope work, create a separate issue in the same target repository and link it to the current issue.
 7. Final response must report completed work, validation, and blockers. Do not include speculative next steps.
 

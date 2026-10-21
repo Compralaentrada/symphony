@@ -127,8 +127,16 @@ defmodule SymphonyElixir.AgentRunner do
       send_codex_update(recipient, issue, message)
 
       case phase_delta(message) do
-        nil -> :ok
-        delta -> Process.put(message_key, [delta | Process.get(message_key, [])])
+        nil ->
+          :ok
+
+        {item_id, delta} ->
+          {_, deltas_by_item} = Process.get(message_key, {item_id, %{}})
+
+          Process.put(
+            message_key,
+            {item_id, Map.update(deltas_by_item, item_id, [delta], &[delta | &1])}
+          )
       end
     end
 
@@ -140,7 +148,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     try do
       with {:ok, _turn} <- AppServer.run_turn(session, prompt, issue, on_message: on_message),
-           {:ok, report} <- decode_phase_report(Process.get(message_key, []) |> Enum.reverse() |> Enum.join()) do
+           {:ok, report} <- decode_phase_report(phase_report_text(Process.get(message_key))) do
         {:phase_result, report}
       end
     after
@@ -155,6 +163,7 @@ defmodule SymphonyElixir.AgentRunner do
     Previously reported findings to address: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
     Do not create or update a pull request, change Project status, or comment on the issue; Symphony owns those writes.
     Finish with exactly one JSON object containing outcome (ready, no_changes, or blocked), summary, criteria, changes, checks, risks, next_step, reason when blocked or no_changes, and sha after pushing.
+    criteria, changes, checks, and risks must be JSON arrays, even when empty. Put each risk in its own string element.
     Use sha null only for no_changes or blocked.
     """
   end
@@ -178,9 +187,24 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
-  defp phase_delta(%{payload: %{"method" => "item/agentMessage/delta", "params" => %{"delta" => delta}}}) when is_binary(delta), do: delta
-  defp phase_delta(%{payload: %{"method" => "item/agentMessage/delta", "params" => %{"msg" => %{"delta" => delta}}}}) when is_binary(delta), do: delta
+  defp phase_delta(%{payload: %{"method" => "item/agentMessage/delta", "params" => params}})
+       when is_map(params) do
+    delta = Map.get(params, "delta") || get_in(params, ["msg", "delta"])
+    item_id = Map.get(params, "itemId") || get_in(params, ["msg", "itemId"])
+
+    if is_binary(item_id) and is_binary(delta), do: {item_id, delta}
+  end
+
   defp phase_delta(_message), do: nil
+
+  defp phase_report_text({item_id, deltas_by_item}) do
+    deltas_by_item
+    |> Map.get(item_id, [])
+    |> Enum.reverse()
+    |> Enum.join()
+  end
+
+  defp phase_report_text(_state), do: ""
 
   defp decode_phase_report(text) do
     json =
@@ -190,10 +214,15 @@ defmodule SymphonyElixir.AgentRunner do
       |> String.replace(~r/\s*```$/, "")
 
     case Jason.decode(json) do
-      {:ok, report} when is_map(report) -> {:ok, report}
+      {:ok, report} when is_map(report) -> {:ok, normalize_phase_report(report)}
       _ -> {:error, {:invalid_phase_report, String.slice(text, -500, 500)}}
     end
   end
+
+  defp normalize_phase_report(%{"risks" => risk} = report) when is_binary(risk),
+    do: Map.put(report, "risks", [risk])
+
+  defp normalize_phase_report(report), do: report
 
   defp ensure_skills_available(_workspace, _issue, worker_host) when is_binary(worker_host), do: :ok
 

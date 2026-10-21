@@ -39,7 +39,7 @@ defmodule SymphonyElixir.Workspace do
 
   defp ensure_workspace(workspace, nil) do
     cond do
-      File.dir?(workspace) ->
+      File.dir?(workspace) and File.ls!(workspace) != [] ->
         {:ok, workspace, false}
 
       File.exists?(workspace) ->
