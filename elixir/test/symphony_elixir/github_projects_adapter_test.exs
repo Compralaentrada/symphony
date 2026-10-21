@@ -90,7 +90,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
   test "Projects configuration requires auth, status-only routing, and requeue-safe terminal states" do
     settings = tracker_settings()
-    missing_token = tracker_settings(%{"token" => "$SYMPHONY_GH6_MISSING_TOKEN"})
+    missing_token = tracker_settings(%{"token" => ""})
 
     assert {:error, {:invalid_github_projects_settings, :missing_token}} =
              Client.validate_settings(missing_token)
