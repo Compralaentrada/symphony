@@ -56,8 +56,11 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     File.rm_rf!(Path.dirname(path))
   end
 
-  test "configured Project status names drive the full pipeline" do
-    statuses = %{
+  test "legacy issue status mappings do not remap the canonical pipeline" do
+    statuses = default_status_values()
+
+    legacy_statuses = %{
+      backlog: "Ideas",
       ready: "Queued",
       building: "Implementing",
       qa: "Verifying",
@@ -73,11 +76,11 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     issue = %{
       issue
       | state: statuses.ready,
-        native_ref: Map.merge(issue.native_ref, %{project_status: statuses.ready, status_values: Map.new(statuses, fn {key, value} -> {Atom.to_string(key), value} end)})
+        native_ref: Map.merge(issue.native_ref, %{project_status: statuses.ready, status_values: Map.new(legacy_statuses, fn {key, value} -> {Atom.to_string(key), value} end)})
     }
 
     table = start_board([issue], %{issue.id => %{build: [build("sha-nine")], qa: [qa("sha-nine")], review: [review("sha-nine")]}})
-    path = pipeline_database!(table, status_values: statuses)
+    path = pipeline_database!(table)
     orchestrator = start_orchestrator()
 
     assert await(fn -> project_state(table, issue.id) == statuses.human_review end)
@@ -343,7 +346,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     Application.put_env(:symphony_elixir, :github_projects_client_module, __MODULE__.FakeClient)
     Application.put_env(:symphony_elixir, :pipeline_database_path, path)
     Application.put_env(:symphony_elixir, :pipeline_test_workspace, workspace)
-    write_pipeline_workflow!(Keyword.get(opts, :retry_backoff_ms, 1), Keyword.get(opts, :status_values, default_status_values()))
+    write_pipeline_workflow!(Keyword.get(opts, :retry_backoff_ms, 1))
 
     on_exit(fn ->
       File.rm_rf(root)
@@ -358,22 +361,16 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     path
   end
 
-  defp write_pipeline_workflow!(retry_backoff_ms, statuses) do
-    active_states = Enum.map([:ready, :building, :qa, :review, :human_review], &Map.fetch!(statuses, &1))
-    terminal_states = ["closed", statuses.dropped]
-    status_values = Enum.map_join(statuses, ", ", fn {key, value} -> "#{key}: #{value}" end)
-
+  defp write_pipeline_workflow!(retry_backoff_ms) do
     File.write!(Workflow.workflow_file_path(), """
     ---
     tracker:
       kind: github_projects
-      active_states: [#{Enum.join(active_states, ", ")}]
-      terminal_states: [#{Enum.join(terminal_states, ", ")}]
+      active_states: [Ready, Building, QA, Review, Human Review]
+      terminal_states: [closed, Dropped]
       provider:
         owner: acme
         project_number: 1
-        status_field: Status
-        status_values: {#{status_values}}
         repositories:
           - repository: octo/app
             base_branch: main
@@ -398,7 +395,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
   end
 
   defp default_status_values do
-    %{ready: "Ready", building: "Building", qa: "QA", review: "Review", human_review: "Human Review", blocked: "Blocked", dropped: "Dropped", done: "Done"}
+    %{backlog: "Backlog", ready: "Ready", building: "Building", qa: "QA", review: "Review", human_review: "Human Review", blocked: "Blocked", dropped: "Dropped", done: "Done"}
   end
 
   defp start_orchestrator do
@@ -516,8 +513,8 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
   defp set_project_state(table, issue_id, status) do
     active_states = Config.settings!().tracker.active_states
-    ready_status = Config.settings!().tracker.provider["status_values"]["ready"]
-    blocked_status = Config.settings!().tracker.provider["status_values"]["blocked"]
+    ready_status = "Ready"
+    blocked_status = "Blocked"
     issue = fetch_issue(table, issue_id)
     dispatchable = status in active_states
 
@@ -634,6 +631,17 @@ end
 defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
   alias SymphonyElixir.Config
 
+  @statuses %{
+    ready: "Ready",
+    building: "Building",
+    qa: "QA",
+    review: "Review",
+    human_review: "Human Review",
+    blocked: "Blocked",
+    dropped: "Dropped",
+    done: "Done"
+  }
+
   def fetch_issues_by_states(states) do
     {:ok, issues() |> Enum.filter(&(&1.state in states))}
   end
@@ -646,15 +654,14 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
   def set_pipeline_status(issue, status, _reason \\ nil) do
     table = table()
     current = fetch_issue(table, issue.id)
-    provider = Config.settings!().tracker.provider
-    state = Map.fetch!(provider["status_values"], Atom.to_string(status))
+    state = Map.fetch!(@statuses, status)
 
     updated = %{
       current
       | state: state,
         dispatchable: state in Config.settings!().tracker.active_states,
-        requeueable: state == provider["status_values"]["ready"],
-        tracker_blocked: state == provider["status_values"]["blocked"],
+        requeueable: state == @statuses.ready,
+        tracker_blocked: state == @statuses.blocked,
         native_ref: Map.put(current.native_ref, :project_status, state)
     }
 

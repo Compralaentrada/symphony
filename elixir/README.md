@@ -17,8 +17,8 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
    GitHub Projects v2, Jira Cloud, Asana, and GitLab)
 2. Creates a workspace per issue and launches Codex in
    [App Server mode](https://developers.openai.com/codex/app-server/)
-3. Uses separate Build, QA, and autonomous Review sessions when GitHub Projects v2 has the pipeline
-   statuses configured; other tracker configurations keep the existing single-run behavior
+3. Uses separate Build, QA, and autonomous Review sessions for GitHub Projects v2; other tracker
+   configurations keep the existing single-run behavior
 4. Creates a draft PR after Build, marks it ready after QA and Review, then waits for a human decision
 
 Local runs discover repo-local Codex skills from `.agents/skills` in the workspace checkout. Symphony checks the selected skills before launching Codex and reports a missing `SKILL.md` path; pinned sources and fingerprints are listed in the repository's `.agents/skills/SOURCES.md`.
@@ -167,13 +167,13 @@ Notes:
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
-- GitHub Projects v2 uses Project status for routing and rejects `required_labels`. Its repository
-  profiles define the exact repositories Symphony may work in, the base branch, and a preparation
-  command for new workspaces. To enable the durable Build → QA → Review pipeline, configure the
-  `qa`, `review`, `human_review`, and `dropped` status values, include the active phase statuses in
-  `tracker.active_states`, include `Dropped` in `tracker.terminal_states`, and set nonempty
-  `required_checks` for each repository profile. The Symphony host also needs Git push credentials
-  for each profile; pipeline agents do not receive the tracker token.
+- GitHub Projects v2 uses the `Status` field and Symphony's canonical options: `Backlog`, `Ready`,
+  `Building`, `QA`, `Review`, `Human Review`, `Blocked`, `Done`, and `Dropped`. It rejects
+  `required_labels`. Repository profiles define the exact repositories Symphony may work in, the
+  base branch, and a preparation command for new workspaces. Include `Ready`, `Building`, `QA`,
+  `Review`, and `Human Review` in `tracker.active_states`; include `closed` and `Dropped` in
+  `tracker.terminal_states`; and set nonempty `required_checks` for each profile. The Symphony host
+  also needs Git push credentials for each profile; pipeline agents do not receive the tracker token.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
@@ -257,17 +257,11 @@ codex:
 tracker:
   kind: github_projects
   required_labels: []
-  active_states: [Ready, Building]
-  terminal_states: [closed]
+  active_states: [Ready, Building, QA, Review, Human Review]
+  terminal_states: [closed, Dropped]
   provider:
     owner: your-user-or-organization
     project_number: 12
-    status_field: Status
-    status_values:
-      ready: Ready
-      building: In Progress
-      blocked: Blocked
-      done: Done
     token: $GITHUB_TOKEN
     repositories:
       - repository: your-org/api
@@ -279,12 +273,12 @@ tracker:
           mise exec -- mix deps.get
 ```
 
-- `owner` and `project_number` identify a user or organization Project. `status_field` and the four
-  `status_values` must match a single-select Project field and its options.
+- `owner` and `project_number` identify a user or organization Project. Its single-select `Status`
+  field must contain Symphony's nine canonical options listed above.
 - `token` defaults to `GITHUB_TOKEN` and accepts `$ENV_VAR`; never put a literal token in
   `WORKFLOW.md`. The token needs access to read and update the Project and linked issues.
-- `active_states` must include the configured Ready and Building values. `terminal_states` must
-  include `closed` and must leave Done and Blocked requeueable.
+- `active_states` must include Ready, Building, QA, Review, and Human Review. `terminal_states` must
+  include `closed` and Dropped, and must leave Done and Blocked requeueable.
 - Only Ready Project items linked to native GitHub Issues with an exact repository profile are
   dispatched. Pull requests, draft issues, and unsupported item types are ignored. An unconfigured
   repository is moved to Blocked and receives a comment explaining the missing profile.
