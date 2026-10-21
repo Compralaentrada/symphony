@@ -116,6 +116,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
 
       assert length(prompts) == 2
       assert hd(prompts) =~ "Each finding must include the exact keys id, reproduction, and criterion as non-empty strings."
+      assert hd(prompts) =~ "Use the Humanizer guidance for report values"
       refute hd(prompts) =~ "- `code-review`"
       assert Enum.at(prompts, 1) =~ "The previous response did not match the pipeline's required phase report."
     after

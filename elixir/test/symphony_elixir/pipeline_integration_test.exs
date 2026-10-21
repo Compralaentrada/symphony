@@ -5,13 +5,14 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
   test "Build, QA and Review resume on the same PR and Done waits for a confirmed merge" do
     issue = issue("octo/app#1", 1)
+    issue = %{issue | description: "Implementa los criterios de aceptación de la issue."}
 
     table =
       start_board([issue], %{
         issue.id => %{
-          build: [build("sha-one"), build("sha-two")],
-          qa: [qa("sha-one"), qa("sha-two")],
-          review: [review("sha-one"), review("sha-two")]
+          build: [build_es("sha-one"), build_es("sha-two")],
+          qa: [qa_es("sha-one"), qa_es("sha-two")],
+          review: [review_es("sha-one"), review_es("sha-two")]
         }
       })
 
@@ -23,9 +24,34 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert %{number: pr_number, branch: branch, sha: ^first_sha, draft: false} = pull_request(table, issue.id)
     assert branch == issue.branch_name
     assert pull_request(table, issue.id).body =~ "Fixes octo/app#1"
-    assert pull_request(table, issue.id).body =~ "Acceptance criterion completed."
+    assert pull_request(table, issue.id).body =~ "Se cumple el criterio de aceptación."
     assert pull_request(table, issue.id).body =~ first_sha
     assert report_phases(table, issue.id) == [:build, :qa, :review]
+
+    build_report = lookup(table, {:report, issue.id, "build"})
+    assert build_report =~ "<!-- symphony:octo/app#1:1:build:1 -->"
+    assert build_report =~ "### Resumen\n\nImplementé los cambios solicitados."
+    assert build_report =~ "### Criterios de aceptación"
+    assert build_report =~ "### Cambios"
+    assert build_report =~ "### SHA\n\n`#{first_sha}`"
+    refute build_report =~ "### Pruebas"
+
+    qa_report = lookup(table, {:report, issue.id, "qa"})
+    assert qa_report =~ "<!-- symphony:octo/app#1:1:qa:1 -->"
+    assert qa_report =~ "### Pruebas"
+    assert qa_report =~ "`true`: superada"
+    assert qa_report =~ "Symphony ejecutó la comprobación configurada"
+
+    review_report = lookup(table, {:report, issue.id, "review"})
+    assert review_report =~ "<!-- symphony:octo/app#1:1:review:1 -->"
+    assert review_report =~ "No se encontraron defectos."
+    refute review_report =~ "### Hallazgos"
+    refute review_report =~ "### Resoluciones"
+
+    for report <- [build_report, qa_report, review_report] do
+      refute report =~ "\"outcome\""
+      refute report =~ "null"
+    end
 
     set_project_state(table, issue.id, "Done")
     send(orchestrator, :tick)
@@ -95,11 +121,11 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
   end
 
   test "no_changes waits for human confirmation, Blocked resumes, and transient failures retry" do
-    no_changes = issue("octo/app#2", 2)
-    blocked = issue("octo/app#3", 3)
+    no_changes = %{issue("octo/app#2", 2) | description: "Los criterios ya están satisfechos."}
+    blocked = %{issue("octo/app#3", 3) | description: "Falta acceso al entorno de pruebas."}
     transient = issue("octo/app#4", 4)
     missing_check = issue("octo/app#6", 6)
-    unavailable_check = issue("octo/app#10", 10)
+    unavailable_check = %{issue("octo/app#10", 10) | description: "Las comprobaciones requeridas deben pasar."}
 
     table =
       start_board([no_changes, blocked, transient, missing_check, unavailable_check], %{
@@ -129,16 +155,32 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
     assert await(fn -> project_state(table, no_changes.id) == "Blocked" end)
     assert report_phases(table, no_changes.id) == [:build]
+    no_changes_report = lookup(table, {:reports, no_changes.id})["<!-- symphony:octo/app#2:1:build:1 -->"]
+    assert no_changes_report =~ "### Motivo"
+    assert no_changes_report =~ "No hacen falta cambios de código."
+    refute no_changes_report =~ "### Pruebas"
+
+    assert await(fn -> project_state(table, blocked.id) == "Blocked" end)
+    blocked_report = lookup(table, {:report, blocked.id, "build"})
+    assert blocked_report =~ "### Bloqueo"
+    assert blocked_report =~ "### Pruebas"
+    assert blocked_report =~ "No se ejecutaron pruebas porque la fase quedó bloqueada."
+    refute blocked_report =~ "\"outcome\""
+
     set_project_state(table, no_changes.id, "Dropped")
 
     send(orchestrator, :tick)
     assert await(fn -> project_state(table, no_changes.id) == "Blocked" end)
 
-    set_issue_description(table, no_changes.id, no_changes.description <> "\n\nDrop reason: Human confirmed no changes are needed.")
+    set_issue_description(table, no_changes.id, no_changes.description <> "\n\nDrop reason: La persona confirmó que no hacen falta cambios.")
     send(orchestrator, :tick)
     assert await(fn -> project_state(table, no_changes.id) == "Dropped" end)
     assert report_phases(table, no_changes.id) == [:build, :build, :dropped]
-    assert lookup(table, {:report, no_changes.id, "dropped"}) =~ "Human confirmed no changes are needed."
+    dropped_report = lookup(table, {:report, no_changes.id, "dropped"})
+    assert dropped_report =~ "<!-- symphony:octo/app#2:1:dropped:0 -->"
+    assert dropped_report =~ "La persona confirmó que no hacen falta cambios."
+    assert dropped_report =~ "### Siguiente paso"
+    refute dropped_report =~ "\"outcome\""
     assert project_state(table, no_changes.id) == "Dropped"
 
     assert await(fn -> project_state(table, blocked.id) == "Blocked" end)
@@ -158,7 +200,15 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert await(fn -> project_state(table, unavailable_check.id) == "Blocked" end)
     assert agent_calls(table, unavailable_check.id) == 2
     assert report_phases(table, unavailable_check.id) == [:build, :qa]
-    assert lookup(table, {:report, unavailable_check.id, "qa"}) =~ "unavailable"
+    unavailable_report = lookup(table, {:report, unavailable_check.id, "qa"})
+    assert unavailable_report =~ "### Bloqueo"
+    assert unavailable_report =~ "### Pruebas"
+    assert unavailable_report =~ "no pudo ejecutar la comprobación requerida"
+
+    for report <- Map.values(lookup(table, {:reports, no_changes.id})) ++ Map.values(lookup(table, {:reports, blocked.id})) ++ Map.values(lookup(table, {:reports, unavailable_check.id})) do
+      refute report =~ "\"outcome\""
+      refute report =~ "null"
+    end
 
     stop_orchestrator(orchestrator)
     File.rm_rf!(Path.dirname(path))
@@ -288,6 +338,13 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert lookup(table, {:agent_prior_findings, issue.id, :review, 1}) == [finding]
     assert lookup(table, {:agent_prior_findings, issue.id, :review, 2}) == [finding]
 
+    qa_report = lookup(table, {:reports, issue.id})["<!-- symphony:octo/app#12:1:qa:1 -->"]
+    assert qa_report =~ "### Findings"
+    assert qa_report =~ "`QA-12-1`"
+    assert qa_report =~ "Reproduction: Run the failing scenario."
+    assert qa_report =~ "Criterion: The result matches the acceptance criterion."
+    refute qa_report =~ "\"reproduction\""
+
     stop_orchestrator(orchestrator)
     File.rm_rf!(Path.dirname(path))
   end
@@ -313,6 +370,13 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert report_phases(table, issue.id) == [:build, :qa, :review, :build, :qa, :review]
     assert lookup(table, {:agent_prior_findings, issue.id, :build, 2}) == [finding]
     assert lookup(table, {:agent_prior_findings, issue.id, :review, 2}) == [finding]
+
+    review_report = lookup(table, {:reports, issue.id})["<!-- symphony:octo/app#13:1:review:1 -->"]
+    assert review_report =~ "### Findings"
+    assert review_report =~ "`REV-13-1`"
+    assert review_report =~ "Reproduction: Run the affected path."
+    assert review_report =~ "Criterion: The implementation preserves the required behavior."
+    refute review_report =~ "\"reproduction\""
 
     stop_orchestrator(orchestrator)
     File.rm_rf!(Path.dirname(path))
@@ -444,6 +508,15 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     }
   end
 
+  defp build_es(sha) do
+    Map.merge(build(sha), %{
+      "summary" => "Implementé los cambios solicitados.",
+      "criteria" => ["Se cumple el criterio de aceptación."],
+      "changes" => ["Actualicé la implementación."],
+      "next_step" => "QA debe revisar el SHA actual."
+    })
+  end
+
   defp qa(sha) do
     %{
       "outcome" => "passed",
@@ -455,6 +528,15 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
       "next_step" => "Run autonomous review.",
       "sha" => sha
     }
+  end
+
+  defp qa_es(sha) do
+    Map.merge(qa(sha), %{
+      "summary" => "Pasaron las comprobaciones requeridas.",
+      "criteria" => ["La implementación cumple el criterio."],
+      "changes" => [],
+      "next_step" => "Review debe inspeccionar el SHA actual."
+    })
   end
 
   defp qa_missing_check(sha) do
@@ -472,16 +554,23 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     }
   end
 
+  defp review_es(sha) do
+    Map.merge(review(sha), %{
+      "summary" => "No se encontraron defectos.",
+      "next_step" => "Esperar la revisión humana."
+    })
+  end
+
   defp no_changes do
     %{
       "outcome" => "no_changes",
-      "summary" => "The requested behavior already exists.",
-      "reason" => "No code changes are needed.",
-      "criteria" => ["All criteria already satisfied."],
+      "summary" => "El comportamiento solicitado ya existe.",
+      "reason" => "No hacen falta cambios de código.",
+      "criteria" => ["Ya se cumplen todos los criterios."],
       "changes" => [],
       "checks" => [],
       "risks" => [],
-      "next_step" => "Wait for human confirmation.",
+      "next_step" => "Esperar la confirmación de una persona.",
       "sha" => nil
     }
   end
@@ -489,13 +578,13 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
   defp blocked do
     %{
       "outcome" => "blocked",
-      "summary" => "An operator must provide access to the test environment.",
-      "reason" => "Required test credentials are unavailable.",
+      "summary" => "Hace falta acceso al entorno de pruebas.",
+      "reason" => "No están disponibles las credenciales necesarias para las pruebas.",
       "criteria" => [],
       "changes" => [],
       "checks" => [],
-      "risks" => ["Cannot run the required environment."],
-      "next_step" => "Resolve the missing access and move the item to Ready.",
+      "risks" => ["No se puede ejecutar el entorno requerido."],
+      "next_step" => "Resuelve el acceso y mueve la tarea a Ready.",
       "sha" => nil
     }
   end

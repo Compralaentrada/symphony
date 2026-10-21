@@ -23,6 +23,17 @@ defmodule SymphonyElixir.Pipeline do
     tracker.kind == "github_projects" and Enum.all?(~w(qa review human_review dropped), &Map.has_key?(values, &1))
   end
 
+  @spec report_locale(Issue.t()) :: :en | :es
+  def report_locale(%Issue{description: description}) do
+    # shortcut: detects Spanish and defaults to English; add a locale when another language is used.
+    description = if is_binary(description), do: String.downcase(description), else: ""
+
+    if Regex.match?(~r/[áéíóúñ¿¡]/u, description) or
+         Regex.match?(~r/\b(?:aceptacion|bloqueo|cambios|comprobaciones|criterios|hallazgos|objetivo|pruebas|riesgos|siguiente paso|tarea)\b/u, description),
+       do: :es,
+       else: :en
+  end
+
   @spec reconcile() :: :ok | {:error, term()}
   def reconcile do
     with {:ok, tasks} <- Store.tasks() do
@@ -64,16 +75,19 @@ defmodule SymphonyElixir.Pipeline do
 
   @spec block_phase(Issue.t(), map(), String.t(), pos_integer(), String.t()) :: :ok | {:error, term()}
   def block_phase(%Issue{} = issue, task, phase, attempt, reason) do
+    locale = report_locale(issue)
+
     result = %{
       "outcome" => "blocked",
-      "summary" => "An operator must resolve an intervention before this phase can continue.",
+      "summary" => report_text(locale, "A person must resolve this blocker before the phase can continue.", "Hace falta resolver este bloqueo para continuar con la fase."),
       "reason" => reason,
-      "next_step" => "Resolve the blocker and move the Project item to Ready.",
+      "next_step" => report_text(locale, "Resolve the blocker and move the Project item to Ready.", "Resuelve el bloqueo y mueve la tarea a Ready."),
+      "checks" => [],
       "sha" => task["current_sha"]
     }
 
     next = task |> Map.put("phase", phase) |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
-    operations = report_ops(next, phase, attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
+    operations = report_ops(issue, next, phase, attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
     commit(issue, next, phase, attempt, result, operations)
   end
 
@@ -204,7 +218,7 @@ defmodule SymphonyElixir.Pipeline do
   defp finish_valid_phase(issue, task, "build", attempt, %{"outcome" => outcome, "reason" => reason} = result)
        when outcome in ["no_changes", "blocked"] do
     next = task |> Map.put("phase", "build") |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
-    ops = report_ops(next, "build", attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
+    ops = report_ops(issue, next, "build", attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
     commit(issue, next, "build", attempt, result, ops)
   end
 
@@ -212,7 +226,7 @@ defmodule SymphonyElixir.Pipeline do
        when phase in ["qa", "review"] do
     reason = result["reason"] || result["summary"] || "Agent requires operator intervention."
     next = task |> Map.put("phase", phase) |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
-    operations = report_ops(next, phase, attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
+    operations = report_ops(issue, next, phase, attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
     commit(issue, next, phase, attempt, result, operations)
   end
 
@@ -228,7 +242,7 @@ defmodule SymphonyElixir.Pipeline do
           "sha" => sha,
           "body" => pull_request_body(issue, result)
         }),
-        report_op(next, "build", attempt, result),
+        report_op(issue, next, "build", attempt, result),
         status_op(next, :qa, nil, attempt)
       ]
 
@@ -241,13 +255,13 @@ defmodule SymphonyElixir.Pipeline do
     with :ok <- ensure_current_sha(task, sha),
          :ok <- validate_required_checks(task["required_checks"], result["checks"] || []) do
       next = %{task | "phase" => "review", "status" => "review"}
-      operations = report_ops(next, "qa", attempt, result) ++ [status_op(next, :review, nil, attempt)]
+      operations = report_ops(issue, next, "qa", attempt, result) ++ [status_op(next, :review, nil, attempt)]
       commit(issue, next, "qa", attempt, result, operations)
     else
       {:error, reason} ->
         result = Map.merge(result, %{"outcome" => "changes_requested", "validation_error" => inspect(reason)})
         next = %{task | "phase" => "build", "status" => "building"}
-        operations = report_ops(next, "qa", attempt, result) ++ [status_op(next, :building, nil, attempt)]
+        operations = report_ops(issue, next, "qa", attempt, result) ++ [status_op(next, :building, nil, attempt)]
         commit(issue, next, "qa", attempt, result, operations)
     end
   end
@@ -263,7 +277,7 @@ defmodule SymphonyElixir.Pipeline do
             |> Map.put("prior_findings", [])
 
           ops =
-            report_ops(next, "review", attempt, result) ++
+            report_ops(issue, next, "review", attempt, result) ++
               [
                 operation(next, "pr_stage", %{"stage" => "ready"}),
                 status_op(next, :human_review, nil, attempt)
@@ -275,9 +289,9 @@ defmodule SymphonyElixir.Pipeline do
           result =
             Map.merge(result, %{
               "outcome" => "changes_requested",
-              "summary" => "Autonomous Review did not resolve all prior findings.",
+              "summary" => report_text(report_locale(issue), "Autonomous Review did not resolve all prior findings.", "La revisión automática dejó hallazgos pendientes."),
               "findings" => findings,
-              "next_step" => "Fix the remaining findings and submit a new Build delivery."
+              "next_step" => report_text(report_locale(issue), "Fix the remaining findings and submit a new Build delivery.", "Corrige los hallazgos y vuelve a entregar el trabajo en Build.")
             })
 
           rework_phase(issue, task, "review", attempt, result)
@@ -299,7 +313,7 @@ defmodule SymphonyElixir.Pipeline do
       |> Map.put("status", "building")
       |> Map.put("prior_findings", pending_findings(task, result))
 
-    operations = report_ops(next, phase, attempt, result) ++ [status_op(next, :building, nil, attempt, phase)]
+    operations = report_ops(issue, next, phase, attempt, result) ++ [status_op(next, :building, nil, attempt, phase)]
     commit(issue, next, phase, attempt, result, operations)
   end
 
@@ -432,52 +446,63 @@ defmodule SymphonyElixir.Pipeline do
   defp ensure_pull_request_sha(_pr, _sha), do: {:error, :pull_request_head_sha_mismatch}
 
   defp pull_request_body(issue, result) do
-    """
-    <!-- symphony:delivery -->
+    locale = report_locale(issue)
+    labels = report_labels(locale)
 
-    Fixes #{issue.id}
+    body =
+      [
+        "Fixes #{issue.id}",
+        report_section(labels.summary, result["summary"]),
+        report_list_section(labels.criteria, result["criteria"], locale),
+        report_list_section(labels.changes, result["changes"], locale),
+        report_checks_section(labels.checks, result["checks"], result["outcome"], locale),
+        report_section(labels.sha, inline_code(result["sha"])),
+        report_list_section(labels.risks, result["risks"], locale),
+        report_section(labels.next_step, result["next_step"])
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join("\n\n")
 
-    ## Summary
-
-    #{result["summary"]}
-
-    ## Acceptance criteria
-
-    #{markdown_items(result["criteria"])}
-
-    ## Changes
-
-    #{markdown_items(result["changes"])}
-
-    ## Checks
-
-    #{markdown_items(result["checks"])}
-
-    ## Evidence
-
-    - Build SHA: `#{result["sha"]}`
-
-    ## Risks and limitations
-
-    #{markdown_items(result["risks"])}
-
-    ## Next step
-
-    #{result["next_step"]}
-    """
-    |> String.trim()
+    "<!-- symphony:delivery -->\n\n" <> body
   end
 
-  defp markdown_items(items) when is_list(items) do
-    case items do
-      [] -> "- None reported."
-      items -> Enum.map_join(items, "\n", &("- " <> markdown_item(&1)))
+  defp report_section(label, content) when is_binary(content) do
+    case String.trim(content) do
+      "" -> nil
+      content -> "### #{label}\n\n#{content}"
     end
   end
 
-  defp markdown_items(_items), do: "- None reported."
-  defp markdown_item(item) when is_binary(item), do: item
-  defp markdown_item(item), do: Jason.encode!(item)
+  defp report_section(_label, _content), do: nil
+
+  defp report_list_section(label, items, locale) do
+    case markdown_items(items, locale) do
+      "" -> nil
+      content -> "### #{label}\n\n#{content}"
+    end
+  end
+
+  defp markdown_items(items, locale) when is_list(items) do
+    items
+    |> Enum.map(&markdown_item(&1, locale))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  defp markdown_items(_items, _locale), do: ""
+
+  defp markdown_item(item, _locale) when is_binary(item) do
+    case String.trim(item) do
+      "" -> nil
+      item -> "- #{item}"
+    end
+  end
+
+  defp markdown_item(item, _locale) when is_number(item), do: "- #{item}"
+  defp markdown_item(_item, _locale), do: nil
+
+  defp inline_code(value) when is_binary(value) and value != "", do: "`#{value}`"
+  defp inline_code(_value), do: nil
 
   defp persist_status(issue, task, status, salt) do
     with :ok <- Store.save_task_with_operations(task, [status_op(task, status, nil, salt)]) do
@@ -512,15 +537,17 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp drop_task(issue, task, reason) do
+    locale = report_locale(issue)
+
     report = %{
       "outcome" => "dropped",
       "reason" => reason,
-      "summary" => "Work was dropped without a merged pull request.",
-      "next_step" => "Create a new issue if this work should be started again."
+      "summary" => report_text(locale, "Work was dropped without a merged pull request.", "El trabajo se descartó sin fusionar una pull request."),
+      "next_step" => report_text(locale, "Create a new issue if this work should be started again.", "Crea una issue nueva si hay que retomar este trabajo.")
     }
 
     next = task |> Map.put("status", "dropped") |> Map.put("blocked_reason", reason) |> Map.put("drop_pending", false)
-    operations = [report_op(next, "dropped", 0, report), status_op(next, :dropped, nil, "drop")]
+    operations = [report_op(issue, next, "dropped", 0, report), status_op(next, :dropped, nil, "drop")]
     commit(issue, next, task["phase"], 0, report, operations)
   end
 
@@ -532,17 +559,29 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp require_drop_reason(issue, task) do
-    reason = "Add a human-authored `Drop reason: <reason>` line to the issue body to confirm this discard."
+    locale = report_locale(issue)
+
+    reason =
+      report_text(
+        locale,
+        "Add a human-authored `Drop reason: <reason>` line to the issue body to confirm this discard.",
+        "Añade a la descripción de la issue una línea escrita por una persona con el formato `Drop reason: <motivo>` para confirmar el descarte."
+      )
 
     result = %{
       "outcome" => "blocked",
-      "summary" => "A human reason is required before this work can be dropped.",
+      "summary" => report_text(locale, "A human-authored reason is required before this work can be dropped.", "Hace falta un motivo escrito por una persona para descartar este trabajo."),
       "reason" => reason,
-      "next_step" => "Edit the issue body with the drop reason; Symphony will then mark the task Dropped."
+      "next_step" =>
+        report_text(
+          locale,
+          "Add the drop reason to the issue body. Symphony will then mark the task Dropped.",
+          "Añade el motivo de descarte a la descripción de la issue. Symphony marcará la tarea como Dropped."
+        )
     }
 
     next = task |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason) |> Map.put("drop_pending", true)
-    operations = [report_op(next, task["phase"], 0, result), status_op(next, :blocked, reason, "drop_reason_required")]
+    operations = [report_op(issue, next, task["phase"], 0, result), status_op(next, :blocked, reason, "drop_reason_required")]
     commit(issue, next, task["phase"], 0, result, operations)
   end
 
@@ -562,7 +601,12 @@ defmodule SymphonyElixir.Pipeline do
 
       :error ->
         state_reason = profile_value(issue.native_ref || %{}, :issue_state_reason)
-        if is_binary(state_reason) and state_reason != "", do: "GitHub issue closed with reason #{state_reason} before the PR merged.", else: "GitHub issue closed by a human before the PR merged."
+
+        report_text(
+          report_locale(issue),
+          "GitHub issue closed#{if is_binary(state_reason) and state_reason != "", do: " with reason #{state_reason}", else: " by a human"} before the PR merged.",
+          "La issue de GitHub se cerró#{if is_binary(state_reason) and state_reason != "", do: " con el motivo #{state_reason}", else: " por decisión humana"} antes de fusionar la pull request."
+        )
     end
   end
 
@@ -574,13 +618,248 @@ defmodule SymphonyElixir.Pipeline do
   defp expected_status("building"), do: :building
   defp expected_status(_status), do: nil
 
-  defp report_ops(task, phase, attempt, result), do: [report_op(task, phase, attempt, result)]
+  defp report_ops(issue, task, phase, attempt, result), do: [report_op(issue, task, phase, attempt, result)]
 
-  defp report_op(task, phase, attempt, result) do
+  defp report_op(issue, task, phase, attempt, result) do
     marker = "<!-- symphony:#{task["issue_id"]}:#{task["generation"]}:#{phase}:#{attempt} -->"
-    body = marker <> "\n\n## Symphony #{String.capitalize(phase)} report\n\n" <> Jason.encode!(result, pretty: true)
+    body = report_body(issue, marker, phase, result)
     operation(task, "report", %{"marker" => marker, "body" => body, "phase" => phase})
   end
+
+  defp report_body(issue, marker, phase, result) do
+    locale = report_locale(issue)
+    labels = report_labels(locale)
+    reason_label = if result["outcome"] == "blocked", do: labels.blocker, else: labels.reason
+
+    body =
+      [
+        report_header(phase, result["outcome"], locale, labels),
+        report_section(labels.summary, result["summary"]),
+        report_list_section(labels.criteria, result["criteria"], locale),
+        report_list_section(labels.changes, result["changes"], locale),
+        report_checks_section(labels.checks, result["checks"], result["outcome"], locale),
+        report_findings_section(labels.findings, result["findings"], locale),
+        report_list_section(labels.resolutions, result["resolutions"], locale),
+        report_list_section(labels.risks, result["risks"], locale),
+        report_section(labels.sha, inline_code(result["sha"])),
+        report_section(labels.validation, validation_error(result["validation_error"], locale)),
+        report_section(reason_label, report_reason(result["reason"], result["outcome"], locale)),
+        report_section(labels.next_step, result["next_step"])
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join("\n\n")
+
+    marker <> "\n\n" <> body
+  end
+
+  defp report_header(phase, outcome, :es, labels),
+    do: "## Informe de Symphony: #{phase_title(phase)} (#{Map.get(labels.outcomes, outcome, outcome)})"
+
+  defp report_header(phase, outcome, _locale, labels),
+    do: "## Symphony #{phase_title(phase)} report (#{Map.get(labels.outcomes, outcome, outcome)})"
+
+  defp phase_title("qa"), do: "QA"
+  defp phase_title("dropped"), do: "Dropped"
+  defp phase_title(phase), do: String.capitalize(phase)
+
+  defp report_checks_section(label, [], "blocked", locale) do
+    report_section(label, report_labels(locale).no_checks)
+  end
+
+  defp report_checks_section(label, checks, "blocked", locale) when not is_list(checks) do
+    report_section(label, report_labels(locale).no_check_results)
+  end
+
+  defp report_checks_section(label, checks, _outcome, locale) when is_list(checks) do
+    labels = report_labels(locale)
+
+    checks
+    |> Enum.map(&report_check(&1, labels, locale))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+    |> then(&report_section(label, &1))
+  end
+
+  defp report_checks_section(_label, _checks, _outcome, _locale), do: nil
+
+  defp report_check(check, labels, locale) when is_map(check) do
+    name = if is_binary(check["name"]) and check["name"] != "", do: "`#{check["name"]}`"
+    status = report_check_status(check["status"], labels)
+    evidence = localize_check_evidence(check["evidence"], locale)
+    details = Enum.reject([status, evidence], &blank?/1)
+
+    if is_nil(name) and details == [] do
+      nil
+    else
+      "- " <> (name || labels.check) <> if(details == [], do: "", else: ": " <> Enum.join(details, "; "))
+    end
+  end
+
+  defp report_check(check, _labels, _locale) when is_binary(check), do: markdown_item(check, :en)
+  defp report_check(_check, _labels, _locale), do: nil
+
+  defp report_check_status(status, labels) when is_binary(status),
+    do: Map.get(labels.check_statuses, status) || status
+
+  defp report_check_status(_status, _labels), do: nil
+
+  defp localize_check_evidence(evidence, :es) when is_binary(evidence) do
+    case Regex.run(~r/^Symphony ran the configured check at SHA (.+); host exit status (\d+)\.$/, evidence) do
+      [_, sha, status] -> "Symphony ejecutó la comprobación configurada en SHA #{sha}; código de salida del host: #{status}."
+      _ -> localize_other_check_evidence(evidence)
+    end
+  end
+
+  defp localize_check_evidence(evidence, _locale) when is_binary(evidence), do: evidence
+  defp localize_check_evidence(_evidence, _locale), do: nil
+
+  defp localize_other_check_evidence("Symphony could not execute the required check."),
+    do: "Symphony no pudo ejecutar la comprobación requerida."
+
+  defp localize_other_check_evidence("Symphony did not run the check because workspace HEAD or files differed from accepted SHA " <> rest),
+    do: "Symphony no ejecutó la comprobación porque el HEAD o los archivos del workspace no coincidían con el SHA aceptado " <> rest
+
+  defp localize_other_check_evidence(evidence), do: evidence
+
+  defp report_findings_section(label, findings, locale) when is_list(findings) do
+    labels = report_labels(locale)
+
+    findings
+    |> Enum.map(&report_finding(&1, labels, locale))
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join("\n")
+    |> then(&report_section(label, &1))
+  end
+
+  defp report_findings_section(_label, _findings, _locale), do: nil
+
+  defp report_finding(finding, labels, locale) when is_map(finding) do
+    id = if is_binary(finding["id"]) and finding["id"] != "", do: "- `#{finding["id"]}`"
+    reproduction = finding_field(labels.reproduction, finding["reproduction"], locale)
+    criterion = finding_field(labels.criterion, finding["criterion"], locale)
+
+    [id, reproduction, criterion] |> Enum.reject(&is_nil/1) |> Enum.join("\n")
+  end
+
+  defp report_finding(_finding, _labels, _locale), do: nil
+
+  defp finding_field(label, value, locale) when is_binary(value) and value != "" do
+    value = if label == report_labels(locale).reproduction, do: localize_check_evidence(value, locale), else: value
+    "  - #{label}: #{value}"
+  end
+
+  defp finding_field(_label, _value, _locale), do: nil
+
+  defp report_labels(:es) do
+    %{
+      summary: "Resumen",
+      criteria: "Criterios de aceptación",
+      changes: "Cambios",
+      checks: "Pruebas",
+      check: "Comprobación",
+      findings: "Hallazgos",
+      resolutions: "Resoluciones",
+      risks: "Riesgos",
+      sha: "SHA",
+      validation: "Validación",
+      reason: "Motivo",
+      blocker: "Bloqueo",
+      next_step: "Siguiente paso",
+      reproduction: "Reproducción",
+      criterion: "Criterio",
+      no_checks: "No se ejecutaron pruebas porque la fase quedó bloqueada.",
+      no_check_results: "No se informaron resultados de pruebas para esta fase bloqueada.",
+      check_statuses: %{"passed" => "superada", "failed" => "fallida", "unavailable" => "no disponible"},
+      outcomes: %{
+        "ready" => "listo",
+        "no_changes" => "sin cambios",
+        "blocked" => "bloqueado",
+        "passed" => "aprobado",
+        "changes_requested" => "requiere cambios",
+        "failed" => "falló",
+        "defects_found" => "se encontraron defectos",
+        "dropped" => "descartado"
+      }
+    }
+  end
+
+  defp report_labels(_locale) do
+    %{
+      summary: "Summary",
+      criteria: "Acceptance criteria",
+      changes: "Changes",
+      checks: "Checks",
+      check: "Check",
+      findings: "Findings",
+      resolutions: "Resolutions",
+      risks: "Risks",
+      sha: "SHA",
+      validation: "Pipeline validation",
+      reason: "Reason",
+      blocker: "Blocker",
+      next_step: "Next step",
+      reproduction: "Reproduction",
+      criterion: "Criterion",
+      no_checks: "No checks were run because the phase became blocked.",
+      no_check_results: "No test results were reported for this blocked phase.",
+      check_statuses: %{"passed" => "passed", "failed" => "failed", "unavailable" => "unavailable"},
+      outcomes: %{
+        "ready" => "ready",
+        "no_changes" => "no changes",
+        "blocked" => "blocked",
+        "passed" => "passed",
+        "changes_requested" => "changes requested",
+        "failed" => "failed",
+        "defects_found" => "defects found",
+        "dropped" => "dropped"
+      }
+    }
+  end
+
+  defp report_text(:es, _english, spanish), do: spanish
+  defp report_text(_locale, english, _spanish), do: english
+
+  defp report_reason(reason, "blocked", :es) when is_binary(reason) do
+    case reason do
+      "Codex requires operator input" ->
+        "Codex necesita que una persona intervenga."
+
+      "codex turn requires operator input" ->
+        "Codex necesita que una persona intervenga."
+
+      "codex turn requires approval" ->
+        "Codex necesita aprobación para continuar."
+
+      "codex MCP elicitation requires operator input" ->
+        "Codex necesita que una persona responda a una solicitud MCP."
+
+      _ ->
+        case Regex.run(~r/^stalled for (\d+)ms after Codex requested operator input$/, reason) do
+          [_, milliseconds] -> "Codex solicitó intervención y la fase se detuvo tras #{milliseconds} ms."
+          _ -> reason
+        end
+    end
+  end
+
+  defp report_reason(reason, _outcome, _locale), do: reason
+
+  defp validation_error(":required_checks_missing_or_unavailable", :es),
+    do: "Faltan comprobaciones requeridas o no hay evidencia de que hayan pasado."
+
+  defp validation_error(":phase_sha_mismatch", :es),
+    do: "QA revisó un SHA distinto del aceptado por Build."
+
+  defp validation_error(":required_checks_missing_or_unavailable", _locale),
+    do: "Required checks are missing or lack passing evidence."
+
+  defp validation_error(":phase_sha_mismatch", _locale),
+    do: "QA reviewed a SHA other than the one accepted by Build."
+
+  defp validation_error(_reason, _locale), do: nil
+
+  defp blank?(nil), do: true
+  defp blank?(value) when is_binary(value), do: String.trim(value) == ""
+  defp blank?(_value), do: false
 
   defp status_op(task, status, reason, attempt, source_phase \\ nil),
     do:

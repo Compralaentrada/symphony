@@ -201,6 +201,7 @@ defmodule SymphonyElixir.AgentRunner do
     Pipeline phase: Build.
     Implement the issue, preserve the configured branch #{Keyword.get(opts, :branch)}, and push your work to origin.
     Previously reported findings to address: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
+    Use the Humanizer guidance for report values: write in the issue description's language, keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details.
     Do not create or update a pull request, change Project status, or comment on the issue; Symphony owns those writes.
     Finish with exactly one JSON object containing outcome (ready, no_changes, or blocked), summary, criteria, changes, checks, risks, next_step, reason when blocked or no_changes, and sha after pushing.
     criteria, changes, checks, and risks must be JSON arrays, even when empty. Put each risk in its own string element.
@@ -214,6 +215,7 @@ defmodule SymphonyElixir.AgentRunner do
     Prior findings to recheck after Build: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
     Required checks: #{Enum.join(Keyword.get(opts, :required_checks, []), ", ")}.
     Symphony runs these configured checks on the workspace after your review. Do not claim their result or evidence; return an empty checks list. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings.
+    Use the Humanizer guidance for report values: write in the issue description's language, keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details.
     Do not modify files or write to GitHub. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end
@@ -223,6 +225,7 @@ defmodule SymphonyElixir.AgentRunner do
     Pipeline phase: autonomous code review. Inspect the diff and accepted commit #{Keyword.get(opts, :sha)} on branch #{Keyword.get(opts, :branch)}.
     Prior finding IDs to resolve explicitly: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
     Do not modify files or write to GitHub. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
+    Use the Humanizer guidance for report values: write in the issue description's language, keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details.
     Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end
