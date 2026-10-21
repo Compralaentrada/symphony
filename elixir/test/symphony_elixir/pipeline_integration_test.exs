@@ -1,11 +1,24 @@
 defmodule SymphonyElixir.PipelineIntegrationTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.Config
+  alias SymphonyElixir.{Config, Pipeline}
+
+  test "report locale recognizes ASCII-only Spanish issue descriptions" do
+    for description <- [
+          "Implementar soporte para nuevas salas",
+          "Permitir crear salas privadas",
+          "Actualizar modulo principal"
+        ] do
+      assert Pipeline.report_locale(%{issue("octo/app#42", 42) | description: description}) == :es
+    end
+
+    assert Pipeline.report_locale(%{issue("octo/app#42", 42) | description: "Add support for private rooms"}) == :en
+    assert Pipeline.report_locale(%{issue("octo/app#42", 42) | description: "Implement login for usuarios"}) == :en
+  end
 
   test "Build, QA and Review resume on the same PR and Done waits for a confirmed merge" do
     issue = issue("octo/app#1", 1)
-    issue = %{issue | description: "Implementar soporte para nuevas salas"}
+    issue = %{issue | description: "Actualizar modulo principal"}
 
     table =
       start_board([issue], %{

@@ -25,16 +25,18 @@ defmodule SymphonyElixir.Pipeline do
 
   @spec report_locale(Issue.t()) :: :en | :es
   def report_locale(%Issue{description: description}) do
-    # shortcut: detects Spanish and defaults to English; add a locale when another language is used.
     description = if is_binary(description), do: String.downcase(description), else: ""
 
-    if Regex.match?(~r/[áéíóúñ¿¡]/u, description) or
-         Regex.match?(
-           ~r/\b(?:aceptacion|al|bloqueo|cambios|como|comprobaciones|con|cuando|de|del|desde|donde|el|en|es|esta|este|estos|estas|hasta|hallazgos|la|las|lo|los|objetivo|para|pero|por|pruebas|que|riesgos|se|sin|sobre|siguiente paso|su|sus|tarea|un|una|unas|unos|y)\b/u,
-           description
-         ),
-       do: :es,
-       else: :en
+    case Tongue.detect(description) do
+      [] ->
+        :en
+
+      detections ->
+        case Enum.max_by(detections, &elem(&1, 1)) do
+          {:es, _confidence} -> :es
+          _ -> :en
+        end
+    end
   end
 
   @spec reconcile() :: :ok | {:error, term()}
