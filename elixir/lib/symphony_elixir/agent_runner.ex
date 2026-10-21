@@ -18,7 +18,7 @@ defmodule SymphonyElixir.AgentRunner do
     continue_with_issue?(issue, issue_state_fetcher)
   end
 
-  @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
+  @spec run(map(), pid() | nil, keyword()) :: :ok | map() | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
     worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
