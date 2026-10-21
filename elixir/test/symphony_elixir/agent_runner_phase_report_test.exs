@@ -266,16 +266,12 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
           3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"structured-phase-report-thread"}}}' ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"structured-phase-report-turn"}}}'
-            if printf '%s' "$line" | grep -q '"outputSchema"'; then
-              printf '%s\\n' '#{report_delta}'
-            else
-              printf '%s\\n' '#{prose_delta}'
-            fi
+            printf '%s\\n' '#{prose_delta}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
           5)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"structured-phase-report-retry"}}}'
-            printf '%s\\n' '#{prose_delta}'
+            printf '%s\\n' '#{report_delta}'
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;
@@ -311,20 +307,25 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
 
       assert %{"outcome" => "passed", "summary" => "Review passed"} = result
 
-      turn_params =
+      turn_starts =
         trace_file
         |> File.read!()
         |> String.split("\n", trim: true)
         |> Enum.map(&String.trim_leading(&1, "JSON:"))
         |> Enum.map(&Jason.decode!/1)
-        |> Enum.find(&(&1["method"] == "turn/start"))
-        |> Map.fetch!("params")
+        |> Enum.filter(&(&1["method"] == "turn/start"))
 
-      schema = Map.fetch!(turn_params, "outputSchema")
+      assert length(turn_starts) == 2
+      [initial_turn, correction_turn] = turn_starts
+      assert get_in(initial_turn, ["params", "input", Access.at(0), "text"]) =~ "Do not invoke the repository's `code-review` skill or its Markdown report format"
+      assert get_in(correction_turn, ["params", "input", Access.at(0), "text"]) =~ "Do not include headings, bullets, Markdown, code fences, or text outside the JSON object."
+
+      schema = get_in(initial_turn, ["params", "outputSchema"])
       assert schema["type"] == "object"
       assert "outcome" in schema["required"]
       assert "findings" in schema["required"]
       assert get_in(schema, ["properties", "findings", "items", "required"]) == ["id", "reproduction", "criterion"]
+      assert is_map(get_in(correction_turn, ["params", "outputSchema"]))
     after
       File.rm_rf(test_root)
     end
