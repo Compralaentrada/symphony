@@ -375,7 +375,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         id: "issue-qa-phase-report",
         identifier: "MT-QA-PHASE-REPORT",
         title: "Return a QA phase report",
-        description: "Review the accepted change and return the QA phase report.",
+        description: "Examiner la modification acceptée et fournir le rapport QA.",
         state: "QA",
         url: "https://example.org/issues/MT-QA-PHASE-REPORT",
         labels: ["backend"]
@@ -403,6 +403,8 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
 
       assert length(prompts) == 2
       assert hd(prompts) =~ "Each finding must include the exact keys id, reproduction, and criterion as non-empty strings."
+      assert hd(prompts) =~ "Use the Humanizer guidance for report values"
+      assert hd(prompts) =~ "Write report values in English"
       refute hd(prompts) =~ "- `code-review`"
       assert Enum.at(prompts, 1) =~ "The previous response did not match the pipeline's required phase report."
       assert Enum.all?(turn_starts, &is_map(get_in(&1, ["params", "outputSchema"])))

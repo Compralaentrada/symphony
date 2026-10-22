@@ -323,6 +323,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp verify_required_pipeline_checks(%{pipeline_phase: "qa"} = entry, result) when is_map(result) do
     task = entry.pipeline_task
+    locale = Pipeline.report_locale(entry.issue)
 
     checks =
       Enum.map(task["required_checks"] || [], &run_pipeline_required_check(entry, task, &1))
@@ -334,7 +335,7 @@ defmodule SymphonyElixir.Orchestrator do
         %{
           "id" => check["finding_id"] || "required-check:" <> check["name"],
           "reproduction" => check["evidence"],
-          "criterion" => "All required checks must pass on accepted SHA #{task["current_sha"]}."
+          "criterion" => required_check_criterion(locale, task["current_sha"])
         }
       end)
 
@@ -347,19 +348,10 @@ defmodule SymphonyElixir.Orchestrator do
 
     cond do
       Enum.any?(checks, &(&1["status"] == "unavailable")) ->
-        Map.merge(result, %{
-          "outcome" => "blocked",
-          "summary" => "A required host check was unavailable.",
-          "reason" => "Symphony could not execute every configured required check.",
-          "next_step" => "Resolve the host check issue before moving the item to Ready."
-        })
+        Map.merge(result, required_checks_result(locale, :unavailable))
 
       Enum.any?(checks, &(&1["status"] == "failed")) ->
-        Map.merge(result, %{
-          "outcome" => "changes_requested",
-          "summary" => "One or more required host checks failed or the workspace did not match the accepted SHA.",
-          "next_step" => "Fix the findings and submit a new Build delivery."
-        })
+        Map.merge(result, required_checks_result(locale, :failed))
 
       true ->
         result
@@ -367,6 +359,43 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp verify_required_pipeline_checks(_entry, result), do: result
+
+  defp required_check_criterion(:es, sha), do: "Todas las comprobaciones requeridas deben pasar en el SHA aceptado #{sha}."
+  defp required_check_criterion(_locale, sha), do: "All required checks must pass on accepted SHA #{sha}."
+
+  defp required_checks_result(:es, :unavailable) do
+    %{
+      "outcome" => "blocked",
+      "summary" => "No se pudo ejecutar una comprobación requerida en el host.",
+      "reason" => "Symphony no pudo ejecutar todas las comprobaciones requeridas configuradas.",
+      "next_step" => "Resuelve el problema de la comprobación antes de mover la tarea a Ready."
+    }
+  end
+
+  defp required_checks_result(_locale, :unavailable) do
+    %{
+      "outcome" => "blocked",
+      "summary" => "A required host check was unavailable.",
+      "reason" => "Symphony could not execute every configured required check.",
+      "next_step" => "Resolve the host check issue before moving the item to Ready."
+    }
+  end
+
+  defp required_checks_result(:es, :failed) do
+    %{
+      "outcome" => "changes_requested",
+      "summary" => "Falló una o más comprobaciones requeridas o el workspace no coincide con el SHA aceptado.",
+      "next_step" => "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
+    }
+  end
+
+  defp required_checks_result(_locale, :failed) do
+    %{
+      "outcome" => "changes_requested",
+      "summary" => "One or more required host checks failed or the workspace did not match the accepted SHA.",
+      "next_step" => "Fix the findings and submit a new Build delivery."
+    }
+  end
 
   defp run_pipeline_required_check(entry, task, command) do
     case Workspace.run_required_check(

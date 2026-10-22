@@ -9,6 +9,7 @@ correspondiente y ejecuta las fases necesarias con Codex.
 - Coordina varios repositorios desde un único GitHub Project v2 mediante perfiles de repositorio.
 - Ejecuta Build, QA y Review en sesiones separadas y comprueba los comandos `required_checks` del
   repositorio durante QA.
+- Publica informes Markdown en español para issues en español y en inglés para el resto.
 - Guarda checkpoints del pipeline en SQLite para reanudar el trabajo tras un reinicio.
 - Expone el estado operativo en un dashboard y una API JSON.
 - Espera una fusión humana y solo marca una tarea como Done tras confirmar la fusión.

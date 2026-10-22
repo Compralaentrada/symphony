@@ -55,6 +55,10 @@ item back to Ready requests corrections on the same branch and PR. To move unmer
 add a human-authored `Drop reason: <reason>` line to the issue body; after a `no_changes` result,
 this line confirms the decision to discard the work.
 
+Pipeline phase reports use Markdown in Spanish when the issue is Spanish, and English for English,
+unsupported, or ambiguous issue languages. Reports omit empty sections and distinguish blocked
+phases from checks that did not run.
+
 ## Prerequisites
 
 Use [mise](https://mise.jdx.dev/) for Elixir/Erlang and install Codex CLI with App Server support.
