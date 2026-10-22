@@ -458,22 +458,31 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     context = %{issue: issue, lane: :individual, generation: 1, attempt: 1, lease_token: "follow-up-agent"}
     assert :ok = Store.begin_agent_lease(issue.id, context.lease_token)
 
-    {:ok, remote} = Agent.start_link(fn -> %{follow_up: nil, linked?: false, project_added?: false} end)
+    {:ok, remote} =
+      Agent.start_link(fn ->
+        %{follow_up: nil, linked?: false, project_added?: false, creates: 0, links: 0, project_adds: 0}
+      end)
 
     github_rest = fn method, path, params, body, _settings ->
       Agent.get_and_update(remote, fn data ->
         case {method, path} do
           {"GET", "/search/issues"} ->
             query = params["q"]
-            assert query =~ "repo:octo/app in:body <!-- symphony:follow-up:octo/app#42:1:individual:1:"
+            assert query =~ "repo:octo/app in:body <!-- symphony:follow-up:octo/app#42:1:individual:"
             refute query =~ "%"
-            items = if data.follow_up, do: [data.follow_up], else: []
+            [marker] = Regex.run(~r/<!-- symphony:follow-up:[^>]+-->/, query)
+
+            items =
+              if data.follow_up && marker && String.contains?(data.follow_up["body"], marker),
+                do: [data.follow_up],
+                else: []
+
             {{:ok, %{status: 200, body: %{"items" => items}}}, data}
 
           {"POST", "/repos/octo/app/issues"} ->
             follow_up = %{
               "id" => 77,
-              "node_id" => "I_follow_up",
+              "node_id" => "I_issue_43",
               "number" => 43,
               "html_url" => "https://github.com/octo/app/issues/43",
               "url" => "https://api.github.com/repos/octo/app/issues/43",
@@ -481,14 +490,14 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
               "body" => body["body"]
             }
 
-            {{:error, :timeout}, %{data | follow_up: follow_up}}
+            {{:error, :timeout}, %{data | follow_up: follow_up, creates: data.creates + 1}}
 
           {"GET", "/repos/octo/app/issues/42/sub_issues"} ->
             linked = if data.linked?, do: [data.follow_up], else: []
             {{:ok, %{status: 200, body: linked}}, data}
 
           {"POST", "/repos/octo/app/issues/42/sub_issues"} ->
-            {{:ok, %{status: 201, body: data.follow_up}}, %{data | linked?: true}}
+            {{:ok, %{status: 201, body: data.follow_up}}, %{data | linked?: true, links: data.links + 1}}
         end
       end)
     end
@@ -497,9 +506,11 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       Agent.get_and_update(remote, fn data ->
         cond do
           query =~ "addProjectV2ItemById" ->
-            assert variables["contentId"] == "I_follow_up"
+            assert variables["contentId"] == "I_issue_43"
             item = %{"id" => "PVTI_follow_up"}
-            {{:ok, %{status: 200, body: %{"data" => %{"addProjectV2ItemById" => %{"item" => item}}}}}, %{data | project_added?: true}}
+            response = %{status: 200, body: %{"data" => %{"addProjectV2ItemById" => %{"item" => item}}}}
+            updated = %{data | project_added?: true, project_adds: data.project_adds + 1}
+            {{:ok, response}, updated}
 
           query =~ "SymphonyProject(" ->
             items = if data.project_added?, do: [issue_item("octo/app", 43, "Ready")], else: []
@@ -522,11 +533,26 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
                projects_request: projects_request
              )
 
+    assert {:ok, retried_evidence} =
+             Client.agent_operation(
+               issue,
+               %{context | attempt: 2},
+               "create_follow_up_issue",
+               %{"title" => "Track follow-up", "body" => "Follow-up details"},
+               tracker_settings: tracker_settings(),
+               github_rest: github_rest,
+               projects_request: projects_request
+             )
+
     assert evidence["id"] == "octo/app#43"
     assert evidence["linked"]
     assert evidence["project_item"] == %{"id" => "PVTI_43", "status" => "Ready"}
+    assert retried_evidence == evidence
     assert Agent.get(remote, & &1.linked?)
     assert Agent.get(remote, & &1.project_added?)
+    assert Agent.get(remote, & &1.creates) == 1
+    assert Agent.get(remote, & &1.links) == 1
+    assert Agent.get(remote, & &1.project_adds) == 1
     assert :ok = Store.end_agent_lease(issue.id, context.lease_token)
   end
 

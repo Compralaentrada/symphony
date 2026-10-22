@@ -215,16 +215,22 @@ defmodule SymphonyElixir.GitHubAgentWorkflowTest do
     {:ok, state} = Agent.start_link(fn -> %{follow_up: nil, linked?: false, creates: 0, links: 0} end)
     child = fn body -> %{"id" => 77, "number" => 43, "html_url" => "https://github.com/octo/app/issues/43", "body" => body} end
 
-    github_rest = fn method, path, _params, body, _settings ->
+    github_rest = fn method, path, params, body, _settings ->
       Agent.get_and_update(state, fn data ->
         case {method, path} do
           {"GET", "/search/issues"} ->
-            items = if data.follow_up, do: [data.follow_up], else: []
+            [marker] = Regex.run(~r/<!-- symphony:follow-up:[^>]+-->/, params["q"])
+
+            items =
+              if data.follow_up && marker && String.contains?(data.follow_up["body"], marker),
+                do: [data.follow_up],
+                else: []
+
             {{:ok, %{status: 200, body: %{"items" => items}}}, data}
 
           {"POST", "/repos/octo/app/issues"} ->
             issue = child.(body["body"])
-            {{:ok, %{status: 201, body: issue}}, %{data | follow_up: issue, creates: data.creates + 1}}
+            {{:error, :timeout}, %{data | follow_up: issue, creates: data.creates + 1}}
 
           {"GET", "/repos/octo/app/issues/42/sub_issues"} ->
             issues = if data.linked?, do: [data.follow_up], else: []
@@ -255,7 +261,7 @@ defmodule SymphonyElixir.GitHubAgentWorkflowTest do
     args = %{"operation" => "create_follow_up_issue", "title" => "Track follow-up", "body" => "Follow-up details"}
 
     first = AgentTool.execute("github_workflow", args, opts)
-    second = AgentTool.execute("github_workflow", args, opts)
+    second = AgentTool.execute("github_workflow", args, Keyword.put(opts, :agent_context, %{context | attempt: 2}))
 
     assert first["success"], first["output"]
     assert second["success"], second["output"]

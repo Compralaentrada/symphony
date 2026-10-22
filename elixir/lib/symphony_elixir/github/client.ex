@@ -793,7 +793,7 @@ defmodule SymphonyElixir.GitHub.Client do
     title = normalize_string(arguments["title"])
     body = normalize_string(arguments["body"])
     digest = :crypto.hash(:sha256, (title || "") <> "\n" <> (body || "")) |> Base.encode16(case: :lower)
-    marker = "<!-- symphony:follow-up:#{issue.id}:#{context[:generation] || 0}:#{context[:lane]}:#{context[:attempt] || 0}:#{digest} -->"
+    marker = "<!-- symphony:follow-up:#{issue.id}:#{context[:generation] || 0}:#{context[:lane]}:#{digest} -->"
 
     with title when is_binary(title) and byte_size(title) <= 256 <- title,
          body when is_binary(body) and byte_size(body) <= 60_000 <- body,

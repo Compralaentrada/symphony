@@ -1535,7 +1535,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp follow_up_marker(issue, context, title, body) do
     digest = :crypto.hash(:sha256, title <> "\n" <> body) |> Base.encode16(case: :lower)
-    "<!-- symphony:follow-up:#{issue.id}:#{context[:generation] || 0}:#{context[:lane]}:#{context[:attempt] || 0}:#{digest} -->"
+    "<!-- symphony:follow-up:#{issue.id}:#{context[:generation] || 0}:#{context[:lane]}:#{digest} -->"
   end
 
   defp find_follow_up_issue(repository, marker, settings, rest_fun) do
