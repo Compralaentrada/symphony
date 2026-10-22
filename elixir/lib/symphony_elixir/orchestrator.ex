@@ -512,6 +512,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec retry_candidate_issue_for_test(Issue.t()) :: boolean()
+  def retry_candidate_issue_for_test(%Issue{} = issue),
+    do: retry_candidate_issue?(issue, terminal_state_set())
+
+  @doc false
   @spec revalidate_issue_for_dispatch_for_test(Issue.t(), ([String.t()] -> term())) ::
           {:ok, Issue.t()} | {:skip, Issue.t() | :missing} | {:error, term()}
   def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
@@ -968,6 +973,7 @@ defmodule SymphonyElixir.Orchestrator do
          terminal_states
        ) do
     (candidate_issue?(issue, active_states, terminal_states) or pending_finalization_issue?(issue)) and
+      project_dependencies_allow_dispatch?(issue) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
@@ -1011,7 +1017,7 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
     Enum.all?([id, identifier, title, state_name], &present_string?/1) and
       issue_routable?(issue) and
-      project_dependencies_resolved?(issue) and
+      project_dependencies_allow_dispatch?(issue) and
       active_issue_state?(state_name, active_states) and
       !terminal_issue_state?(state_name, terminal_states)
   end
@@ -1022,9 +1028,9 @@ defmodule SymphonyElixir.Orchestrator do
     Issue.routable?(issue, Config.settings!().tracker.required_labels)
   end
 
-  defp project_dependencies_resolved?(%Issue{dependency_error: error}) when is_binary(error), do: true
+  defp project_dependencies_allow_dispatch?(%Issue{dependency_error: error}) when is_binary(error), do: true
 
-  defp project_dependencies_resolved?(%Issue{blocked_by: blockers}) do
+  defp project_dependencies_allow_dispatch?(%Issue{blocked_by: blockers}) do
     not Pipeline.enabled?() or
       (is_list(blockers) and Enum.all?(blockers, &closed_project_blocker?/1))
   end
@@ -2029,7 +2035,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
-    candidate_issue?(issue, active_state_set(), terminal_states) or pending_finalization_issue?(issue)
+    (candidate_issue?(issue, active_state_set(), terminal_states) or pending_finalization_issue?(issue)) and
+      project_dependencies_allow_dispatch?(issue)
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do

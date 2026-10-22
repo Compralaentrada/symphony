@@ -480,7 +480,7 @@ defmodule SymphonyElixir.AgentRunner do
           "\nThe phase report JSON contract overrides any skill's preferred presentation format."
       )
 
-    output_schema = phase_report_schema(phase)
+    output_schema = phase_report_schema(phase, Keyword.get(opts, :diagnostic, false))
 
     case run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema, report_locale) do
       {:ok, report} ->
@@ -814,6 +814,16 @@ defmodule SymphonyElixir.AgentRunner do
     report_schema(Map.merge(properties, phase_properties))
   end
 
+  defp phase_report_schema(:diagnostic) do
+    report_schema(%{
+      "outcome" => %{"type" => "string", "enum" => ["blocked"]},
+      "summary" => %{"type" => "string"},
+      "reason" => %{"type" => "string"},
+      "sha" => %{"type" => ["string", "null"]},
+      "next_step" => %{"type" => "string"}
+    })
+  end
+
   defp report_schema(properties) do
     %{
       "type" => "object",
@@ -822,6 +832,13 @@ defmodule SymphonyElixir.AgentRunner do
       "additionalProperties" => false
     }
   end
+
+  @doc false
+  @spec phase_report_schema_for_test(atom(), boolean()) :: map()
+  def phase_report_schema_for_test(phase, diagnostic?), do: phase_report_schema(phase, diagnostic?)
+
+  defp phase_report_schema(:finalize, true), do: phase_report_schema(:diagnostic)
+  defp phase_report_schema(phase, _diagnostic?), do: phase_report_schema(phase)
 
   defp string_array_schema, do: %{"type" => "array", "items" => %{"type" => "string"}}
 

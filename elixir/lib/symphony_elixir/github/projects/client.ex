@@ -1087,8 +1087,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
         "build" -> [settings.statuses.building]
         "qa" -> [settings.statuses.qa]
         "review" -> if(target == settings.statuses.done, do: [settings.statuses.review, settings.statuses.human_review], else: [settings.statuses.review])
-        "diagnostic" -> Enum.map([:ready, :building, :qa, :review], &Map.fetch!(settings.statuses, &1))
-        "finalize" -> [settings.statuses.human_review]
+        "diagnostic" -> Enum.map([:ready, :building, :qa, :review, :human_review], &Map.fetch!(settings.statuses, &1))
+        "finalize" -> [settings.statuses.human_review, settings.statuses.ready]
         "individual" -> [project_status(current)]
         _ -> []
       end
