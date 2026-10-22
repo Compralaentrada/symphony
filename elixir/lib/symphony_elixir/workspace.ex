@@ -21,6 +21,7 @@ defmodule SymphonyElixir.Workspace do
     issue_context =
       issue_context(issue_or_identifier)
       |> Map.put(:require_existing_project_branch, Keyword.get(opts, :require_existing_project_branch, false))
+      |> Map.put(:create_project_branch, Keyword.get(opts, :create_project_branch, true))
 
     refresh_project_branch? = Keyword.get(opts, :refresh_project_branch, false)
 
@@ -761,7 +762,8 @@ defmodule SymphonyElixir.Workspace do
   defp project_branch_command(%{
          branch_name: branch_name,
          base_branch: base_branch,
-         require_existing_project_branch: require_existing_project_branch?
+         require_existing_project_branch: require_existing_project_branch?,
+         create_project_branch: create_project_branch?
        }) do
     work_ref = "refs/remotes/origin/#{branch_name}"
     local_work_ref = "refs/heads/#{branch_name}"
@@ -777,6 +779,15 @@ defmodule SymphonyElixir.Workspace do
       "elif [ #{require_existing_project_branch?} = true ]; then",
       "  printf '%s\\n' 'SYMPHONY_PROJECT_BRANCH_MISSING' >&2",
       "  exit #{@project_branch_missing_status}",
+      "elif [ #{create_project_branch?} = false ]; then",
+      "  if git show-ref --verify --quiet #{shell_escape(base_ref)}; then",
+      "    git switch --quiet --detach #{shell_escape("origin/" <> base_branch)}",
+      "  elif git show-ref --verify --quiet #{shell_escape(local_base_ref)}; then",
+      "    git switch --quiet --detach #{shell_escape(base_branch)}",
+      "  else",
+      "    printf '%s\\n' #{shell_escape("Configured base branch not found: " <> base_branch)} >&2",
+      "    exit 1",
+      "  fi",
       "elif git show-ref --verify --quiet #{shell_escape(base_ref)}; then",
       "  git switch --quiet --force-create #{shell_escape(branch_name)} #{shell_escape("origin/" <> base_branch)}",
       "elif git show-ref --verify --quiet #{shell_escape(local_base_ref)}; then",

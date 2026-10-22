@@ -162,6 +162,37 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "diagnostic workspace does not recreate a missing Projects issue branch" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-project-diagnostic-workspace-#{System.unique_integer([:positive])}")
+    source_repo = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+
+    try do
+      File.mkdir_p!(source_repo)
+      git!(source_repo, ["init", "-b", "main"])
+      git!(source_repo, ["config", "user.name", "Test User"])
+      git!(source_repo, ["config", "user.email", "test@example.com"])
+      File.write!(Path.join(source_repo, "README.md"), "base branch\n")
+      git!(source_repo, ["add", "README.md"])
+      git!(source_repo, ["commit", "-m", "main"])
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      issue = project_workspace_issue("octo/app#13", source_repo, "main")
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue, nil, create_project_branch: false)
+      assert git!(workspace, ["branch", "--show-current"]) == ""
+      assert git!(workspace, ["rev-parse", "HEAD"]) == git!(source_repo, ["rev-parse", "HEAD"])
+      refute issue.branch_name in String.split(git!(workspace, ["branch", "--format=%(refname:short)"]), "\n", trim: true)
+
+      assert {:error, :project_branch_missing} =
+               Workspace.create_for_issue(issue, nil, refresh_project_branch: true)
+
+      refute issue.branch_name in String.split(git!(workspace, ["branch", "--format=%(refname:short)"]), "\n", trim: true)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "Projects workspace preparation failures remove the partial workspace" do
     workspace_root = Path.join(System.tmp_dir!(), "symphony-project-workspace-fail-#{System.unique_integer([:positive])}")
 

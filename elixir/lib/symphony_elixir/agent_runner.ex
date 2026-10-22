@@ -48,6 +48,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     workspace_opts = [
       require_existing_project_branch: has_pull_request? and not diagnostic?,
+      create_project_branch: not diagnostic?,
       refresh_project_branch: refresh_project_branch?
     ]
 
