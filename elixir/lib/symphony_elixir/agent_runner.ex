@@ -403,6 +403,7 @@ defmodule SymphonyElixir.AgentRunner do
     phase = Keyword.fetch!(opts, :phase)
     message_key = {__MODULE__, make_ref()}
     evidence_key = {message_key, :remote_evidence}
+    workflow_errors_key = {message_key, :workflow_errors}
 
     on_message = fn message ->
       send_codex_update(recipient, issue, message)
@@ -411,6 +412,9 @@ defmodule SymphonyElixir.AgentRunner do
         %{event: :tool_call_completed, result: %{"evidence" => evidence}}
         when is_map(evidence) ->
           Process.put(evidence_key, [evidence | Process.get(evidence_key, [])])
+
+        %{event: :tool_call_failed} ->
+          capture_workflow_error(message, workflow_errors_key)
 
         _ ->
           :ok
@@ -435,11 +439,33 @@ defmodule SymphonyElixir.AgentRunner do
     after
       Process.delete(message_key)
       Process.delete(evidence_key)
+      Process.delete(workflow_errors_key)
     end
   end
 
+  defp capture_workflow_error(
+         %{
+           payload: %{"params" => %{"tool" => "github_workflow", "arguments" => arguments}},
+           result: %{"output" => output}
+         },
+         key
+       )
+       when is_map(arguments) and is_binary(output) do
+    case Jason.decode(output) do
+      {:ok, %{"error" => %{"reason" => reason}}} when is_binary(reason) ->
+        error = %{"operation" => arguments["operation"], "reason" => reason}
+        Process.put(key, [error | Process.get(key, [])])
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp capture_workflow_error(_message, _key), do: :ok
+
   defp run_pipeline_turn(session, issue, on_message, message_key, phase, opts) do
     evidence_key = {message_key, :remote_evidence}
+    workflow_errors_key = {message_key, :workflow_errors}
     report_locale = Keyword.get(opts, :report_locale, Pipeline.report_locale(issue))
     report_language = report_language_name(report_locale)
 
@@ -458,7 +484,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     case run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema, report_locale) do
       {:ok, report} ->
-        phase_result(report, phase, opts, evidence_key)
+        phase_result(report, phase, opts, evidence_key, workflow_errors_key)
 
       {:error, {:invalid_phase_report, _details}} ->
         Process.delete(message_key)
@@ -473,7 +499,7 @@ defmodule SymphonyElixir.AgentRunner do
                output_schema,
                report_locale
              ) do
-          {:ok, report} -> phase_result(report, phase, opts, evidence_key)
+          {:ok, report} -> phase_result(report, phase, opts, evidence_key, workflow_errors_key)
           error -> error
         end
 
@@ -510,10 +536,18 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp phase_result(report, phase, opts, evidence_key) do
+  defp phase_result(report, phase, opts, evidence_key, workflow_errors_key) do
     evidence = evidence_key |> Process.get([]) |> Enum.reverse()
+    workflow_errors = workflow_errors_key |> Process.get([]) |> Enum.reverse()
     report = if phase == :qa, do: Map.put(report, "checks", Keyword.get(opts, :host_checks, [])), else: report
-    {:phase_result, report |> Map.put("_remote_evidence", evidence) |> Map.put("_host_checks", Keyword.get(opts, :host_checks, []))}
+
+    report =
+      report
+      |> Map.put("_remote_evidence", evidence)
+      |> Map.put("_host_checks", Keyword.get(opts, :host_checks, []))
+
+    report = if workflow_errors == [], do: report, else: Map.put(report, "_workflow_errors", workflow_errors)
+    {:phase_result, report}
   end
 
   defp phase_report_correction_prompt(report_language) do
@@ -531,10 +565,10 @@ defmodule SymphonyElixir.AgentRunner do
   defp pipeline_phase_instructions(:build, _opts) do
     """
     Pipeline phase: Build.
-    Read the issue's workpad and current-generation phase reports with `github_workflow` operation `read_workpad` before editing. Use those task records for prior findings and decisions. Work on the branch already checked out for this task and push your work to origin.
+    Before any other GitHub write or code edit, call `github_workflow` with operation `claim`; stop if the claim is rejected. This claims an item dispatched from Ready by moving it to Building.
+    Then read the issue's workpad and current-generation phase reports with `github_workflow` operation `read_workpad` before editing. Use those task records for prior findings and decisions. Work on the branch already checked out for this task and push your work to origin.
     Implement the issue using the accepted task context recorded on the issue. The host records the branch, base branch, required checks, and pushed SHA in the Build report for later phases.
     Before editing, create or update the persistent issue workpad with `github_workflow` operation `workpad` and record the plan.
-    Before editing, call `github_workflow` with operation `claim` and stop if the claim is rejected.
     After pushing, call `github_workflow` with operation `handoff`, outcome `ready`, and your complete report; the host verifies the SHA, creates or updates the draft PR, posts your report, and moves the Project item to QA.
     For `no_changes` or `blocked`, hand off that result with a concise reason. Never merge a PR.
     Finish with exactly one JSON object containing outcome (ready, no_changes, or blocked), summary, criteria, changes, checks, risks, next_step, reason when blocked or no_changes, and sha after pushing.

@@ -221,7 +221,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         identifier: "MT-BUILD-FOREIGN-TURN",
         title: "Return the Build report",
         description: "Implement the change and return the Build phase report.",
-        state: "Building",
+        state: "Ready",
         url: "https://example.org/issues/MT-BUILD-FOREIGN-TURN",
         labels: ["backend"]
       }
@@ -243,6 +243,8 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert length(turn_starts) == 1
       prompt = get_in(hd(turn_starts), ["params", "input", Access.at(0), "text"])
       assert prompt =~ "read_workpad"
+      assert prompt =~ "Before any other GitHub write or code edit"
+      assert prompt =~ "claims an item dispatched from Ready by moving it to Building"
       refute prompt =~ "symphony/mt-build-foreign-turn"
     after
       File.rm_rf(test_root)

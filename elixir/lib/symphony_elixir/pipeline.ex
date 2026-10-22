@@ -765,7 +765,7 @@ defmodule SymphonyElixir.Pipeline do
   defp validate_agent_handoff_evidence(phase, result) do
     handoff = remote_handoff(result)
 
-    with :ok <- validate_handoff_comment(handoff),
+    with :ok <- validate_handoff_comment(handoff, result),
          :ok <- validate_handoff_outcome(handoff, result),
          :ok <- validate_phase_pull_request(phase, handoff, result),
          :ok <- validate_merge_evidence(phase, handoff, result) do
@@ -773,11 +773,27 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp validate_handoff_comment(%{"comment" => %{"id" => id, "url" => url}})
+  defp validate_handoff_comment(%{"comment" => %{"id" => id, "url" => url}}, _result)
        when is_binary(id) and is_binary(url),
        do: :ok
 
-  defp validate_handoff_comment(_handoff), do: {:error, :github_handoff_comment_evidence_missing}
+  defp validate_handoff_comment(_handoff, %{"_workflow_errors" => errors}) when is_list(errors) and errors != [] do
+    case List.last(errors) do
+      %{"reason" => ":stale_agent_lease"} ->
+        {:error, :stale_agent_lease}
+
+      %{"operation" => operation, "reason" => reason} when is_binary(operation) and is_binary(reason) ->
+        {:error, {:github_workflow_failed, operation, reason}}
+
+      %{"reason" => reason} when is_binary(reason) ->
+        {:error, {:github_workflow_failed, reason}}
+
+      _ ->
+        {:error, :github_handoff_comment_evidence_missing}
+    end
+  end
+
+  defp validate_handoff_comment(_handoff, _result), do: {:error, :github_handoff_comment_evidence_missing}
 
   defp validate_handoff_outcome(%{"outcome" => outcome}, %{"outcome" => outcome}), do: :ok
   defp validate_handoff_outcome(_handoff, _result), do: {:error, :github_handoff_outcome_mismatch}

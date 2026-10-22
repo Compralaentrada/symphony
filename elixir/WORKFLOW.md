@@ -34,7 +34,7 @@ hooks:
       cd elixir && mise exec -- mix workspace.before_remove
     fi
 agent:
-  max_concurrent_agents: 5
+  max_concurrent_agents: 3
   max_turns: 20
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-6-luna"' --config model_reasoning_effort=max app-server
@@ -50,7 +50,7 @@ You are working on a GitHub issue dispatched from the configured GitHub Projects
 Follow-up context:
 
 - This is follow-up attempt #{{ attempt }}. Resume from the existing workspace, branch, pull request, and workpad.
-- Continue only while the issue is open and its Project status is Building.
+- Continue only while the issue is open and its Project status is Ready or Building. If it is Ready, follow the Build claim step below before edits.
 - A human requeues an open issue by moving it to Ready. A closed issue is terminal.
 {% endif %}
 
@@ -122,14 +122,15 @@ Before planning, inspect the relevant skills under `.agents/skills` and `.codex/
 ## Step 0: Confirm the work
 
 1. Parse the repository and issue number from `{{ issue.identifier }}`, then fetch the issue with `gh issue view <number> --repo <owner/repository>`.
-2. If the GitHub issue is closed, stop. If the Project status is not Building, do not edit code or tracker content.
+2. If the GitHub issue is closed, stop. Continue only when the Project status is Ready or Building.
 3. Read the issue body, comments, and any linked PR feedback. Treat actionable review feedback as part of the acceptance criteria.
-4. Find or create the persistent workpad comment with `github_workflow` operation `workpad` before implementation.
-5. Record an environment stamp in the workpad:
+4. Before any other tracker write or code edit, claim the issue with `github_workflow` operation `claim`; stop if it is rejected and confirm the Project status is Building.
+5. Find or create the persistent workpad comment with `github_workflow` operation `workpad` before implementation.
+6. Record an environment stamp in the workpad:
    - Format: <host>:<absolute-workspace-path>@<short-sha>
    - Do not repeat the issue ID, branch, or PR URL already visible in GitHub.
-6. Record a reproduction signal and a short plan with acceptance and validation checklists.
-7. Verify the checked-out repository, task branch, working tree, and configured base branch. Sync the base branch before edits using the repository's applicable `pull` workflow; do not hard-code `main`.
+7. Record a reproduction signal and a short plan with acceptance and validation checklists.
+8. Verify the checked-out repository, task branch, working tree, and configured base branch. Sync the base branch before edits using the repository's applicable `pull` workflow; do not hard-code `main`.
 
 ## Step 1: Implement
 
@@ -137,7 +138,7 @@ Before planning, inspect the relevant skills under `.agents/skills` and `.codex/
 2. Use the repository's existing patterns and keep changes within the issue scope.
 3. Run the issue's required validation before each push. Record exact commands and results in the workpad.
 4. If validation or a required dependency is blocked, record what failed and why; do not claim it passed.
-5. For issue comments, labels, and closure, use `gh` with the target repository or the injected `github_api` tool. Do not use labels for Symphony routing.
+5. For issue comments, labels, and closure, use the lane-authorized `github_workflow` tool. `github_api` is read-only; do not use `gh` or shell commands for GitHub writes. Do not use labels for Symphony routing.
 
 ## Step 2: Prepare a human handoff
 
