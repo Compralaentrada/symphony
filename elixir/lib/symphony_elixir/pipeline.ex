@@ -171,7 +171,7 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp prepare_task(%{"status" => "blocked"} = task, %Issue{} = issue) do
-    if issue.state == status_value(task, :ready), do: resume_blocked_task(task), else: :ignore
+    if issue.state == status_value(task, :ready), do: resume_blocked_task(task, issue), else: :ignore
   end
 
   defp prepare_task(%{"status" => "human_review"} = task, %Issue{} = issue) do
@@ -200,6 +200,31 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp prepare_task(_task, _issue), do: :ignore
+
+  defp resume_blocked_task(%{"phase" => "review", "current_sha" => current_sha} = task, issue)
+       when is_binary(current_sha) do
+    case Tracker.pull_request(issue) do
+      {:ok, %{sha: ^current_sha}} ->
+        resume_blocked_task(task)
+
+      {:ok, %{sha: pr_sha}} when is_binary(pr_sha) ->
+        task |> Map.put("phase", "build") |> Map.put("current_sha", nil) |> resume_blocked_task()
+
+      {:ok, _pr} ->
+        {:error, :blocked_review_pr_head_unavailable}
+
+      :ignore ->
+        {:error, :blocked_review_pr_head_unavailable}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp resume_blocked_task(%{"phase" => "review"}, _issue),
+    do: {:error, :blocked_review_checkpoint_missing_sha}
+
+  defp resume_blocked_task(task, _issue), do: resume_blocked_task(task)
 
   defp resume_blocked_task(task) do
     task = Map.put(task, "status", "building")

@@ -155,6 +155,38 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     File.rm_rf!(Path.dirname(path))
   end
 
+  test "Blocked Review reruns Build and QA when the pull request head changes" do
+    issue = issue("octo/app#14", 14)
+
+    table =
+      start_board([issue], %{
+        issue.id => %{
+          build: [build("sha-fourteen-old"), build("sha-fourteen-new")],
+          qa: [qa("sha-fourteen-old"), qa("sha-fourteen-new")],
+          review: [blocked(), review("sha-fourteen-new")]
+        }
+      })
+
+    path = pipeline_database!(table)
+    orchestrator = start_orchestrator()
+
+    assert await(fn -> project_state(table, issue.id) == "Blocked" end)
+    accepted_sha = lookup(table, {:remote_sha, issue.id})
+    pr = pull_request(table, issue.id)
+    assert pr.sha == accepted_sha
+
+    :ets.insert(table, {{:pull_request, issue.id}, %{pr | sha: "external-head-update"}})
+    set_project_state(table, issue.id, "Ready")
+
+    assert await(fn -> project_state(table, issue.id) == "Human Review" end)
+    assert agent_calls(table, issue.id) == 6
+    assert report_phases(table, issue.id) == [:build, :qa, :review, :build, :qa, :review]
+    assert pull_request(table, issue.id).sha == lookup(table, {:remote_sha, issue.id})
+
+    stop_orchestrator(orchestrator)
+    File.rm_rf!(Path.dirname(path))
+  end
+
   test "no_changes waits for human confirmation, Blocked resumes, and transient failures retry" do
     no_changes = issue("octo/app#2", 2)
     blocked = issue("octo/app#3", 3)

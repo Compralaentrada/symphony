@@ -78,7 +78,7 @@ The configured Project status is the source of dispatch:
 - QA: the QA agent independently reviews the current SHA. Symphony runs every `required_checks` command in the task workspace and attaches command evidence to the QA report before handoff. Missing or failed host checks cannot pass QA.
 - Review: the Review agent reads all current-generation QA reports from the issue, verifies the latest report's SHA and required-check evidence, and uses earlier reports to carry forward findings before preparing the PR for human review or requesting changes. Symphony's host-run checks are evidenced in the report, so Review does not require a separate GitHub status context.
 - Human Review: the PR is ready for a person; Symphony waits for a merge or a move back to Ready.
-- Blocked: the phase agent records the reason in the issue and moves the Project item to Blocked. After it is resolved, a human moves the issue to Ready.
+- Blocked: the phase agent records the reason in the issue and moves the Project item to Blocked. After it is resolved, a human moves the issue to Ready. If Review was blocked and the PR head SHA changed, Symphony restarts at Build and repeats QA and Review.
 - Done: the PR merge into the configured base branch has been confirmed.
 - Closed GitHub issue: terminal; stop.
 - Backlog: not dispatched.
