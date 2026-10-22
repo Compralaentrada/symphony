@@ -280,7 +280,7 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp finish_valid_phase(issue, task, phase, attempt, %{"outcome" => "blocked"} = result)
-       when phase in ["qa", "review"] do
+       when phase in ["qa", "review", "finalize"] do
     reason = result["reason"] || result["summary"] || "Agent requires operator intervention."
     next = task |> Map.put("phase", phase) |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
     operations = report_ops(next, phase, attempt, result) ++ [status_op(next, :blocked, reason, attempt)]

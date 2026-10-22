@@ -512,6 +512,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec retry_candidate_issue_for_test(Issue.t()) :: boolean()
+  def retry_candidate_issue_for_test(%Issue{} = issue),
+    do: retry_candidate_issue?(issue, terminal_state_set())
+
+  @doc false
   @spec revalidate_issue_for_dispatch_for_test(Issue.t(), ([String.t()] -> term())) ::
           {:ok, Issue.t()} | {:skip, Issue.t() | :missing} | {:error, term()}
   def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
@@ -968,6 +973,7 @@ defmodule SymphonyElixir.Orchestrator do
          terminal_states
        ) do
     (candidate_issue?(issue, active_states, terminal_states) or pending_finalization_issue?(issue)) and
+      project_dependencies_allow_dispatch?(issue) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
@@ -1011,6 +1017,7 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
     Enum.all?([id, identifier, title, state_name], &present_string?/1) and
       issue_routable?(issue) and
+      project_dependencies_allow_dispatch?(issue) and
       active_issue_state?(state_name, active_states) and
       !terminal_issue_state?(state_name, terminal_states)
   end
@@ -1020,6 +1027,20 @@ defmodule SymphonyElixir.Orchestrator do
   defp issue_routable?(%Issue{} = issue) do
     Issue.routable?(issue, Config.settings!().tracker.required_labels)
   end
+
+  defp project_dependencies_allow_dispatch?(%Issue{dependency_error: error}) when is_binary(error), do: true
+
+  defp project_dependencies_allow_dispatch?(%Issue{blocked_by: blockers}) do
+    not Pipeline.enabled?() or
+      (is_list(blockers) and Enum.all?(blockers, &closed_project_blocker?/1))
+  end
+
+  defp closed_project_blocker?(blocker) when is_map(blocker) do
+    state = Map.get(blocker, :state) || Map.get(blocker, "state")
+    is_binary(state) and normalize_issue_state(state) == "closed"
+  end
+
+  defp closed_project_blocker?(_blocker), do: false
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
     MapSet.member?(terminal_states, normalize_issue_state(state_name))
@@ -1235,8 +1256,14 @@ defmodule SymphonyElixir.Orchestrator do
       prior_findings: task["prior_findings"] || []
     ]
 
-    result = runner.run(issue, recipient, opts)
-    result = diagnose_system_blocker(runner, issue, recipient, opts, result)
+    result =
+      if is_binary(issue.dependency_error) do
+        diagnostic_opts = Keyword.put(opts, :diagnostic_reason, issue.dependency_error)
+        runner.run(issue, recipient, Keyword.put(diagnostic_opts, :diagnostic, true))
+      else
+        runner.run(issue, recipient, opts)
+        |> then(&diagnose_system_blocker(runner, issue, recipient, opts, &1))
+      end
 
     send(recipient, {:pipeline_phase_result, issue.id, task["generation"], phase, phase_attempt, result})
   end
@@ -2008,7 +2035,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
-    candidate_issue?(issue, active_state_set(), terminal_states) or pending_finalization_issue?(issue)
+    (candidate_issue?(issue, active_state_set(), terminal_states) or pending_finalization_issue?(issue)) and
+      project_dependencies_allow_dispatch?(issue)
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do
