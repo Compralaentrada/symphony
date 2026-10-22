@@ -385,7 +385,8 @@ defmodule SymphonyElixir.Orchestrator do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
          true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+      finalization_issues = if Pipeline.enabled?(), do: pending_finalization_issues(), else: []
+      choose_issues(issues ++ finalization_issues, state)
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Tracker API token missing in WORKFLOW.md")
@@ -543,15 +544,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
     cond do
-      terminal_issue_state?(issue.state, terminal_states) ->
+      terminal_issue_state?(issue.state, terminal_states) and not pending_finalization_issue?(issue) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
         terminate_running_issue(state, issue.id, true)
 
-      !issue_routable?(issue) ->
+      !issue_routable?(issue) and not pending_finalization_issue?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
         terminate_running_issue(state, issue.id, false)
+
+      pending_finalization_issue?(issue) ->
+        refresh_running_issue_state(state, issue)
 
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
@@ -926,6 +930,7 @@ defmodule SymphonyElixir.Orchestrator do
     terminal_states = terminal_state_set()
 
     issues
+    |> Enum.uniq_by(& &1.id)
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
       if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
@@ -962,7 +967,7 @@ defmodule SymphonyElixir.Orchestrator do
          active_states,
          terminal_states
        ) do
-    candidate_issue?(issue, active_states, terminal_states) and
+    (candidate_issue?(issue, active_states, terminal_states) or pending_finalization_issue?(issue)) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
@@ -1059,6 +1064,41 @@ defmodule SymphonyElixir.Orchestrator do
         state
     end
   end
+
+  defp pending_finalization_issues do
+    case Pipeline.Store.tasks() do
+      {:ok, tasks} ->
+        issue_ids =
+          for %{"issue_id" => issue_id, "status" => "finalize"} <- tasks,
+              do: issue_id
+
+        fetch_pending_finalization_issues(issue_ids)
+
+      {:error, reason} ->
+        Logger.warning("Unable to read pending Finalize tasks: #{inspect(reason)}")
+        []
+    end
+  end
+
+  defp fetch_pending_finalization_issues([]), do: []
+
+  defp fetch_pending_finalization_issues(issue_ids) do
+    case Tracker.fetch_issues_by_ids(issue_ids) do
+      {:ok, issues} ->
+        issues
+
+      {:error, reason} ->
+        Logger.warning("Unable to fetch pending Finalize issues: #{inspect(reason)}")
+        []
+    end
+  end
+
+  defp pending_finalization_issue?(%Issue{id: issue_id}) when is_binary(issue_id) do
+    Pipeline.enabled?() and
+      match?({:ok, %{"status" => "finalize"}}, Pipeline.Store.get_task(issue_id))
+  end
+
+  defp pending_finalization_issue?(_issue), do: false
 
   defp refresh_issue_for_dispatch(issue) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issues_by_ids/1, terminal_state_set()) do
@@ -1483,19 +1523,18 @@ defmodule SymphonyElixir.Orchestrator do
   defp run_terminal_workspace_cleanup do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
       {:ok, issues} ->
-        issues
-        |> Enum.each(fn
-          %Issue{} = issue ->
-            cleanup_issue_workspace(issue)
-
-          _ ->
-            :ok
-        end)
+        Enum.each(issues, &cleanup_terminal_workspace/1)
 
       {:error, reason} ->
         Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
     end
   end
+
+  defp cleanup_terminal_workspace(%Issue{} = issue) do
+    if pending_finalization_issue?(issue), do: :ok, else: cleanup_issue_workspace(issue)
+  end
+
+  defp cleanup_terminal_workspace(_issue), do: :ok
 
   defp notify_dashboard do
     StatusDashboard.notify_update()
@@ -1963,7 +2002,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
-    candidate_issue?(issue, active_state_set(), terminal_states)
+    candidate_issue?(issue, active_state_set(), terminal_states) or pending_finalization_issue?(issue)
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do

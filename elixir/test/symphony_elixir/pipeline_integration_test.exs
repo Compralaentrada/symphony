@@ -2,6 +2,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Config
+  alias SymphonyElixir.Pipeline.Store
 
   test "Build, QA and Review resume on the same PR and Done waits for a confirmed merge" do
     issue = issue("octo/app#1", 1)
@@ -191,6 +192,107 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert agent_calls(table, issue.id) == 5
 
     stop_orchestrator(orchestrator)
+    File.rm_rf!(Path.dirname(path))
+  end
+
+  test "closed merged work resumes Finalize after a lost report response and restart" do
+    issue = issue("octo/app#13", 13)
+    sha = "sha-thirteen"
+
+    issue = %{
+      issue
+      | state: "closed",
+        dispatchable: false,
+        native_ref: Map.merge(issue.native_ref, %{project_status: "Human Review", issue_state: "closed"})
+    }
+
+    table = start_board([issue], %{})
+    path = pipeline_database!(table, retry_backoff_ms: 300_000)
+
+    task = %{
+      "issue_id" => issue.id,
+      "repository" => "octo/app",
+      "branch" => issue.branch_name,
+      "base_branch" => "main",
+      "required_checks" => ["true"],
+      "generation" => 1,
+      "phase" => "review",
+      "status" => "human_review",
+      "attempts" => %{"build" => 1, "qa" => 1, "review" => 1},
+      "prior_findings" => [],
+      "current_sha" => sha,
+      "pr_number" => 113
+    }
+
+    assert :ok = Store.save_task(task)
+
+    :ets.insert(table, {{:remote_sha, issue.id}, sha})
+
+    :ets.insert(table, {
+      {:pull_request, issue.id},
+      %{
+        number: 113,
+        branch: issue.branch_name,
+        base: "main",
+        sha: sha,
+        draft: false,
+        merged: true,
+        body: "delivery",
+        url: "https://github.com/octo/app/pull/113"
+      }
+    })
+
+    :ets.insert(table, {:uncertain_report_once, true})
+
+    orchestrator = start_orchestrator()
+
+    assert await(fn ->
+             agent_calls(table, issue.id, :finalize) == 1 and
+               lookup(table, :uncertain_report_once) == nil and
+               not Store.agent_lease_active?(issue.id, 1, "finalize", 1)
+           end)
+
+    assert project_state(table, issue.id) == "Human Review"
+    stop_orchestrator(orchestrator)
+
+    orchestrator = start_orchestrator()
+
+    assert await(fn ->
+             project_state(table, issue.id) == "Done" and
+               match?({:ok, %{"status" => "done"}}, Store.get_task(issue.id)) and
+               not Store.agent_lease_active?(issue.id, 1, "finalize", 2)
+           end)
+
+    assert agent_calls(table, issue.id, :finalize) == 2
+    stop_orchestrator(orchestrator)
+
+    assert [["complete", run_result]] =
+             sqlite_rows(
+               path,
+               "SELECT status, result FROM pipeline_runs WHERE issue_id = ? AND generation = 1 AND phase = 'finalize' AND attempt = 2",
+               [issue.id]
+             )
+
+    assert Jason.decode!(run_result)["outcome"] == "merged"
+    assert Jason.decode!(run_result)["_remote_evidence"] != []
+
+    assert [["merged", ^sha, phase_result]] =
+             sqlite_rows(
+               path,
+               "SELECT status, sha, result FROM pipeline_phases WHERE issue_id = ? AND generation = 1 AND phase = 'finalize' AND attempt = 2",
+               [issue.id]
+             )
+
+    assert Jason.decode!(phase_result)["outcome"] == "merged"
+
+    assert [[checkpoint]] =
+             sqlite_rows(
+               path,
+               "SELECT evidence FROM pipeline_checkpoints WHERE issue_id = ? AND generation = 1 AND phase = 'finalize' AND sha = ?",
+               [issue.id, sha]
+             )
+
+    assert Jason.decode!(checkpoint)["_remote_evidence"] != []
     File.rm_rf!(Path.dirname(path))
   end
 
@@ -555,6 +657,18 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     case :ets.lookup(table, key) do
       [{_, value}] -> value
       [] -> nil
+    end
+  end
+
+  defp sqlite_rows(path, query, params) do
+    {:ok, connection} = Exqlite.Basic.open(path)
+
+    try do
+      {:ok, _statement, _result, _connection} = result = Exqlite.Basic.exec(connection, query, params)
+      {:ok, rows, _columns} = Exqlite.Basic.rows(result)
+      rows
+    after
+      Exqlite.Basic.close(connection)
     end
   end
 

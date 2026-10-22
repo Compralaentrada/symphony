@@ -549,4 +549,114 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       File.rm_rf(test_root)
     end
   end
+
+  test "Finalize phase accepts a merged report with its schema" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-finalize-phase-report-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-input.trace")
+      File.mkdir_p!(test_root)
+
+      report = %{
+        "outcome" => "merged",
+        "summary" => "The merged pull request is confirmed.",
+        "sha" => String.duplicate("c", 40),
+        "next_step" => "Done."
+      }
+
+      report_delta =
+        Jason.encode!(%{
+          "method" => "item/agentMessage/delta",
+          "params" => %{
+            "threadId" => "finalize-report-thread",
+            "turnId" => "finalize-report-turn",
+            "itemId" => "finalize-report",
+            "delta" => Jason.encode!(report)
+          }
+        })
+
+      turn_completion =
+        Jason.encode!(%{
+          "method" => "turn/completed",
+          "params" => %{
+            "threadId" => "finalize-report-thread",
+            "turn" => %{
+              "id" => "finalize-report-turn",
+              "status" => "completed",
+              "items" => []
+            }
+          }
+        })
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> '#{trace_file}'
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"finalize-report-thread"}}}' ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"finalize-report-turn"}}}'
+            printf '%s\\n' '#{report_delta}'
+            printf '%s\\n' '#{turn_completion}'
+            exit 0
+            ;;
+          *) ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: required_skill_fixture_hook(),
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "octo/app#107",
+        identifier: "octo/app#107",
+        title: "Confirm merged delivery",
+        description: "Verify the human-merged pull request.",
+        state: "closed",
+        url: "https://github.com/octo/app/issues/107",
+        labels: ["backend"]
+      }
+
+      assert %{"outcome" => "merged", "sha" => sha} =
+               AgentRunner.run(issue, nil,
+                 phase: :finalize,
+                 branch: "symphony/octo-app-107",
+                 base_branch: "main",
+                 pr_number: 107,
+                 sha: report["sha"]
+               )
+
+      assert sha == report["sha"]
+
+      turn_start =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.find(&(&1["method"] == "turn/start"))
+
+      schema = get_in(turn_start, ["params", "outputSchema"])
+      assert Enum.sort(schema["required"]) == Enum.sort(["outcome", "summary", "sha", "next_step"])
+      assert get_in(schema, ["properties", "outcome", "enum"]) == ["merged"]
+    after
+      File.rm_rf(test_root)
+    end
+  end
 end

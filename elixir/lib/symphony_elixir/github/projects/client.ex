@@ -950,6 +950,13 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       not required_checks_passed?(required, checks) ->
         report |> Map.put("outcome", "changes_requested") |> Map.put("summary", "One or more required host checks failed or were missing.")
 
+      report["outcome"] == "passed" and report["findings"] not in [nil, []] ->
+        Map.merge(report, %{
+          "outcome" => "changes_requested",
+          "summary" => "QA reported findings that need correction.",
+          "next_step" => "Fix the findings and submit a new Build delivery."
+        })
+
       true ->
         report
     end
@@ -1532,9 +1539,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp find_follow_up_issue(repository, marker, settings, rest_fun) do
     query = "repo:#{repository.owner}/#{repository.name} in:body #{marker}"
-    encoded = URI.encode(query, &URI.char_unreserved?/1)
 
-    case rest_fun.("GET", "/search/issues", %{"q" => encoded, "per_page" => 10}, nil, settings) do
+    case rest_fun.("GET", "/search/issues", %{"q" => query, "per_page" => 10}, nil, settings) do
       {:ok, %{status: status, body: %{"items" => items}}} when status in 200..299 ->
         case Enum.find(items, &String.contains?(&1["body"] || "", marker)) do
           nil -> {:ok, nil}
@@ -1572,7 +1578,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     request_fun = Keyword.get(opts, :projects_request, &perform_request/3)
 
     with {:ok, project, metadata} <- project_for_link(settings, request_fun),
-         :ok <- add_project_item_once(project, metadata, follow_up["id"], settings, request_fun) do
+         :ok <- add_project_item_once(project, metadata, follow_up["node_id"], settings, request_fun) do
       with {:ok, issue} <- fetch_follow_up_project_issue(follow_up, tracker_settings, request_fun) do
         {:ok, %{"id" => ref_value(issue.native_ref, :project_item_id), "status" => project_status(issue)}}
       end

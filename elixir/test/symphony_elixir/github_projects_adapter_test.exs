@@ -3,6 +3,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
   alias SymphonyElixir.GitHub.Projects.{Adapter, Client}
   alias SymphonyElixir.GitHubProjectsAdapterTest.FakeGitHubProjectsClient
+  alias SymphonyElixir.Pipeline.Store
 
   test "tracker selects the GitHub Projects adapter" do
     assert {:ok, Adapter} =
@@ -291,6 +292,125 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     assert %{"outcome" => "passed", "findings" => []} =
              Client.normalize_agent_report_for_test(%{report | "resolutions" => [finding["id"]]}, "review", context)
+  end
+
+  test "QA findings turn a passed report into a correction handoff" do
+    finding = %{"id" => "QA-2", "reproduction" => "Run the failing check.", "criterion" => "The acceptance criterion passes."}
+
+    report = %{
+      "outcome" => "passed",
+      "summary" => "QA passed.",
+      "findings" => [finding],
+      "next_step" => "Continue to Review."
+    }
+
+    context = %{
+      task: %{"required_checks" => ["mix test"]},
+      host_checks: [%{"name" => "mix test", "status" => "passed", "evidence" => "exit status 0"}]
+    }
+
+    assert %{
+             "outcome" => "changes_requested",
+             "summary" => "QA reported findings that need correction.",
+             "next_step" => "Fix the findings and submit a new Build delivery.",
+             "findings" => [^finding]
+           } = Client.normalize_agent_report_for_test(report, "qa", context)
+  end
+
+  test "uncertain follow-up creation searches with the raw marker before linking the existing issue" do
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    root = Path.join(System.tmp_dir!(), "symphony-project-follow-up-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    issue = %Issue{
+      id: "octo/app#42",
+      identifier: "octo/app#42",
+      url: "https://github.com/octo/app/issues/42",
+      native_ref: %{repository: "octo/app", issue_node_id: "I_parent"}
+    }
+
+    context = %{issue: issue, lane: :individual, generation: 1, attempt: 1, lease_token: "follow-up-agent"}
+    assert :ok = Store.begin_agent_lease(issue.id, context.lease_token)
+
+    {:ok, remote} = Agent.start_link(fn -> %{follow_up: nil, linked?: false, project_added?: false} end)
+
+    github_rest = fn method, path, params, body, _settings ->
+      Agent.get_and_update(remote, fn data ->
+        case {method, path} do
+          {"GET", "/search/issues"} ->
+            query = params["q"]
+            assert query =~ "repo:octo/app in:body <!-- symphony:follow-up:octo/app#42:1:individual:1:"
+            refute query =~ "%"
+            items = if data.follow_up, do: [data.follow_up], else: []
+            {{:ok, %{status: 200, body: %{"items" => items}}}, data}
+
+          {"POST", "/repos/octo/app/issues"} ->
+            follow_up = %{
+              "id" => 77,
+              "node_id" => "I_follow_up",
+              "number" => 43,
+              "html_url" => "https://github.com/octo/app/issues/43",
+              "url" => "https://api.github.com/repos/octo/app/issues/43",
+              "repository" => %{"nameWithOwner" => "octo/app"},
+              "body" => body["body"]
+            }
+
+            {{:error, :timeout}, %{data | follow_up: follow_up}}
+
+          {"GET", "/repos/octo/app/issues/42/sub_issues"} ->
+            linked = if data.linked?, do: [data.follow_up], else: []
+            {{:ok, %{status: 200, body: linked}}, data}
+
+          {"POST", "/repos/octo/app/issues/42/sub_issues"} ->
+            {{:ok, %{status: 201, body: data.follow_up}}, %{data | linked?: true}}
+        end
+      end)
+    end
+
+    projects_request = fn query, variables, _settings ->
+      Agent.get_and_update(remote, fn data ->
+        cond do
+          query =~ "addProjectV2ItemById" ->
+            assert variables["contentId"] == "I_follow_up"
+            item = %{"id" => "PVTI_follow_up"}
+            {{:ok, %{status: 200, body: %{"data" => %{"addProjectV2ItemById" => %{"item" => item}}}}}, %{data | project_added?: true}}
+
+          query =~ "SymphonyProject(" ->
+            items = if data.project_added?, do: [issue_item("octo/app", 43, "Ready")], else: []
+            {{:ok, %{status: 200, body: project_response(items)}}, data}
+
+          true ->
+            flunk("unexpected GitHub Projects query: #{query}")
+        end
+      end)
+    end
+
+    assert {:ok, evidence} =
+             Client.agent_operation(
+               issue,
+               context,
+               "create_follow_up_issue",
+               %{"title" => "Track follow-up", "body" => "Follow-up details"},
+               tracker_settings: tracker_settings(),
+               github_rest: github_rest,
+               projects_request: projects_request
+             )
+
+    assert evidence["id"] == "octo/app#43"
+    assert evidence["linked"]
+    assert evidence["project_item"] == %{"id" => "PVTI_43", "status" => "Ready"}
+    assert Agent.get(remote, & &1.linked?)
+    assert Agent.get(remote, & &1.project_added?)
+    assert :ok = Store.end_agent_lease(issue.id, context.lease_token)
   end
 
   test "Projects configuration reports missing owner without exposing a token" do

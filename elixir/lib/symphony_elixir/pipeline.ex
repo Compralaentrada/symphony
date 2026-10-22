@@ -169,7 +169,7 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp prepare_task(%{"status" => "finalize"} = task, %Issue{} = issue) do
-    if issue.state in [status_value(task, :human_review), status_value(task, :building)],
+    if issue.state in [status_value(task, :human_review), status_value(task, :building), status_value(task, :done), "closed"],
       do: {:ok, task, "finalize"},
       else: :ignore
   end
@@ -298,15 +298,15 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp finish_valid_phase(_issue, task, "review", _attempt, %{"outcome" => "merged", "sha" => sha}) do
+  defp finish_valid_phase(issue, task, "review", attempt, %{"outcome" => "merged", "sha" => sha} = result) do
     with :ok <- ensure_current_sha(task, sha) do
-      Store.save_task(Map.put(task, "status", "done"))
+      commit(issue, Map.put(task, "status", "done"), "review", attempt, result, [])
     end
   end
 
-  defp finish_valid_phase(_issue, task, "finalize", _attempt, %{"outcome" => "merged", "sha" => sha}) do
+  defp finish_valid_phase(issue, task, "finalize", attempt, %{"outcome" => "merged", "sha" => sha} = result) do
     with :ok <- ensure_current_sha(task, sha) do
-      Store.save_task(Map.put(task, "status", "done"))
+      commit(issue, Map.put(task, "status", "done"), "finalize", attempt, result, [])
     end
   end
 

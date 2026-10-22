@@ -482,6 +482,15 @@ defmodule SymphonyElixir.AgentRunner do
     })
   end
 
+  defp phase_report_schema(:finalize) do
+    report_schema(%{
+      "outcome" => %{"type" => "string", "enum" => ["merged"]},
+      "summary" => %{"type" => "string"},
+      "sha" => %{"type" => "string"},
+      "next_step" => %{"type" => "string"}
+    })
+  end
+
   defp phase_report_schema(phase) when phase in [:qa, :review] do
     properties = %{
       "outcome" => %{
