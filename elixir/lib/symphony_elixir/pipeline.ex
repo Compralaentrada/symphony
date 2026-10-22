@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Pipeline do
   @moduledoc false
 
-  alias SymphonyElixir.{Config, Pipeline.Store, Tracker}
+  alias SymphonyElixir.{Config, Pipeline.Findings, Pipeline.Store, Tracker}
   alias SymphonyElixir.Tracker.Issue
 
   @phases ~w(build qa review finalize)
@@ -329,12 +329,12 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp pending_findings(task, result) do
-    resolved_ids = MapSet.new(Map.get(result, "resolutions") || [])
+    resolutions = Map.get(result, "resolutions") || []
 
     (Map.get(task, "prior_findings") || [])
     |> Kernel.++(Map.get(result, "findings") || [])
     |> Enum.uniq_by(& &1["id"])
-    |> Enum.reject(&MapSet.member?(resolved_ids, &1["id"]))
+    |> Enum.reject(&Findings.resolved?(&1["id"], resolutions))
   end
 
   defp commit(issue, task, phase, attempt, result, operations) do

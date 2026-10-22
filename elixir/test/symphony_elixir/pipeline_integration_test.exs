@@ -377,7 +377,10 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
         issue.id => %{
           build: [build("first"), build("fixed"), build("fixed-two")],
           qa: [qa_with_finding, qa("fixed"), qa("fixed-two")],
-          review: [review("fixed"), Map.put(review("fixed-two"), "resolutions", [finding["id"]])]
+          review: [
+            review("fixed"),
+            Map.put(review("fixed-two"), "resolutions", [finding["id"] <> " — resolved: confirmed in review."])
+          ]
         }
       })
 
@@ -882,6 +885,7 @@ end
 
 defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
   alias SymphonyElixir.Config
+  alias SymphonyElixir.Pipeline.Findings
   alias SymphonyElixir.Pipeline.Store
 
   @statuses %{
@@ -1065,8 +1069,8 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
   end
 
   defp normalize_agent_report(report, %{lane: :review, task: task}) do
-    resolved = MapSet.new(report["resolutions"] || [])
-    pending = Enum.reject(task["prior_findings"] || [], &MapSet.member?(resolved, &1["id"]))
+    resolutions = report["resolutions"] || []
+    pending = Enum.reject(task["prior_findings"] || [], &Findings.resolved?(&1["id"], resolutions))
     findings = Enum.uniq_by((report["findings"] || []) ++ pending, & &1["id"])
     report = Map.put(report, "findings", findings)
 

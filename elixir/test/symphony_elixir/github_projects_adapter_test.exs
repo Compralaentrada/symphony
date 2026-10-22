@@ -292,6 +292,13 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     assert %{"outcome" => "passed", "findings" => []} =
              Client.normalize_agent_report_for_test(%{report | "resolutions" => [finding["id"]]}, "review", context)
+
+    assert %{"outcome" => "passed", "findings" => []} =
+             Client.normalize_agent_report_for_test(
+               %{report | "resolutions" => [finding["id"] <> " — resolved: the check passed after the fix."]},
+               "review",
+               context
+             )
   end
 
   test "QA findings turn a passed report into a correction handoff" do

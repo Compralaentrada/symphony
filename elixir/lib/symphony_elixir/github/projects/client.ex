@@ -4,6 +4,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   """
 
   alias SymphonyElixir.Config
+  alias SymphonyElixir.Pipeline.Findings
   alias SymphonyElixir.Pipeline.Store
   alias SymphonyElixir.Tracker.Issue
 
@@ -963,9 +964,9 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp normalize_agent_report(report, "review", context) do
-    resolved = MapSet.new(report["resolutions"] || [])
+    resolutions = report["resolutions"] || []
     prior_findings = get_in(context, [:task, "prior_findings"]) || []
-    pending_findings = Enum.reject(prior_findings, &MapSet.member?(resolved, &1["id"]))
+    pending_findings = Enum.reject(prior_findings, &Findings.resolved?(&1["id"], resolutions))
     findings = Enum.uniq_by((report["findings"] || []) ++ pending_findings, & &1["id"])
     report = Map.put(report, "findings", findings)
 
