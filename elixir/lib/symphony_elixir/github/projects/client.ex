@@ -927,7 +927,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp handoff_status("build", %{"outcome" => "ready"}, settings), do: {:ok, settings.statuses.qa}
   defp handoff_status("build", %{"outcome" => outcome}, settings) when outcome in ["blocked", "no_changes"], do: {:ok, settings.statuses.blocked}
   defp handoff_status("qa", %{"outcome" => "passed"}, settings), do: {:ok, settings.statuses.review}
-  defp handoff_status("qa", %{"outcome" => outcome}, settings) when outcome in ["changes_requested", "failed"], do: {:ok, settings.statuses.building}
+  defp handoff_status("qa", %{"outcome" => outcome}, settings) when outcome in ["changes_requested", "failed", "defects_found"], do: {:ok, settings.statuses.building}
   defp handoff_status("qa", %{"outcome" => "blocked"}, settings), do: {:ok, settings.statuses.blocked}
   defp handoff_status("review", %{"outcome" => "passed", "findings" => []}, settings), do: {:ok, settings.statuses.human_review}
   defp handoff_status("review", %{"outcome" => "merged"}, settings), do: {:ok, settings.statuses.done}
