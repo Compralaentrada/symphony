@@ -1138,6 +1138,67 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert issue.labels == ["bug"]
   end
 
+  test "Project readiness rejects a missing Status field without writing to GitHub" do
+    response = project_response([issue_item("octo/app", 7, "Ready")])
+    response = update_in(response, ["data", "organization", "projectV2", "fields", "nodes"], fn _ -> [] end)
+    owner = self()
+
+    assert {:error, {:github_projects_configuration_error, message}} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn query, _variables, _settings ->
+               send(owner, {:projects_readiness_query, query})
+               {:ok, %{status: 200, body: response}}
+             end)
+
+    assert message =~ "Project status field \"Status\" was not found"
+    assert_received {:projects_readiness_query, query}
+    assert query =~ "query SymphonyProject"
+    refute query =~ "mutation"
+    refute_received {:projects_readiness_query, _query}
+  end
+
+  test "Project readiness reports each missing canonical option without writing to GitHub" do
+    canonical_options = ["Backlog", "Ready", "Building", "QA", "Review", "Human Review", "Blocked", "Done", "Dropped"]
+    owner = self()
+
+    for missing_option <- canonical_options do
+      response =
+        project_response([issue_item("octo/app", 7, "Ready")])
+        |> update_in(
+          ["data", "organization", "projectV2", "fields", "nodes", Access.at(0), "options"],
+          &Enum.reject(&1, fn option -> option["name"] == missing_option end)
+        )
+
+      assert {:error, {:github_projects_configuration_error, message}} =
+               Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn query, _variables, _settings ->
+                 send(owner, {:projects_readiness_query, query})
+                 {:ok, %{status: 200, body: response}}
+               end)
+
+      assert message == "Project status field \"Status\" is missing canonical options: #{missing_option}."
+      assert_received {:projects_readiness_query, query}
+      assert query =~ "query SymphonyProject"
+      refute query =~ "mutation"
+      refute_received {:projects_readiness_query, _query}
+    end
+  end
+
+  test "incomplete GitHub Project responses fail readiness without returning issues or writing" do
+    response = %{"errors" => [%{"message" => "GitHub returned an incomplete Project response."}]}
+    owner = self()
+
+    assert {:error, {:github_projects_api_error, message}} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn query, _variables, _settings ->
+               send(owner, {:projects_readiness_query, query})
+               {:ok, %{status: 200, body: response}}
+             end)
+
+    assert message == "GitHub returned an incomplete Project response."
+    assert_received {:projects_readiness_query, query}
+    assert query =~ "query SymphonyProject"
+    refute query =~ "mutation"
+    refute_received {:projects_readiness_query, _query}
+  end
+
   test "pipeline Projects polling returns QA, Review, and Human Review items as dispatchable" do
     statuses = %{
       "backlog" => "Backlog",
