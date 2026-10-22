@@ -388,7 +388,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
   end
 
   test "uncertain PR and report responses reconcile after orchestrator restarts without duplicates" do
-    issue = issue("octo/app#5", 5)
+    issue = %{issue("octo/app#5", 5) | description: "Add support for private rooms"}
     table = start_board([issue], %{issue.id => %{build: [build("sha-five")], qa: [qa("sha-five")], review: [review("sha-five")]}})
     path = pipeline_database!(table, retry_backoff_ms: 300_000)
     :ets.insert(table, {:uncertain_pr_once, true})
@@ -402,6 +402,10 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     orchestrator = start_orchestrator()
     assert await(fn -> report_phases(table, issue.id) == [:build] end)
     assert await(fn -> :ets.lookup(table, :uncertain_report_once) == [] end)
+    build_report = lookup(table, {:reports, issue.id})["<!-- symphony:octo/app#5:1:build:1 -->"]
+    assert build_report =~ "## Symphony Build report (ready)"
+    assert build_report =~ "### Summary\n\nImplemented the task."
+    refute build_report =~ "## Informe de Symphony"
     stop_orchestrator(orchestrator)
 
     orchestrator = start_orchestrator()
