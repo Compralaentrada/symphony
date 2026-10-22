@@ -362,6 +362,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp required_check_criterion(:es, sha), do: "Todas las comprobaciones requeridas deben pasar en el SHA aceptado #{sha}."
   defp required_check_criterion(:fr, sha), do: "Toutes les vérifications requises doivent réussir pour le SHA accepté #{sha}."
+  defp required_check_criterion(:de, sha), do: "Alle erforderlichen Prüfungen müssen für den akzeptierten SHA #{sha} bestehen."
   defp required_check_criterion(_locale, sha), do: "All required checks must pass on accepted SHA #{sha}."
 
   defp required_checks_result(:es, :unavailable) do
@@ -379,6 +380,15 @@ defmodule SymphonyElixir.Orchestrator do
       "summary" => "Une vérification requise n’était pas disponible sur l’hôte.",
       "reason" => "Symphony n’a pas pu exécuter toutes les vérifications requises configurées.",
       "next_step" => "Résous le problème de vérification avant de déplacer l’élément vers Ready."
+    }
+  end
+
+  defp required_checks_result(:de, :unavailable) do
+    %{
+      "outcome" => "blocked",
+      "summary" => "Eine erforderliche Prüfung war auf dem Host nicht verfügbar.",
+      "reason" => "Symphony konnte nicht alle konfigurierten erforderlichen Prüfungen ausführen.",
+      "next_step" => "Behebe das Problem mit der Host-Prüfung, bevor du den Eintrag auf Ready setzt."
     }
   end
 
@@ -404,6 +414,14 @@ defmodule SymphonyElixir.Orchestrator do
       "outcome" => "changes_requested",
       "summary" => "Une ou plusieurs vérifications requises ont échoué, ou l’espace de travail ne correspondait pas au SHA accepté.",
       "next_step" => "Corrige les constats et soumets une nouvelle livraison Build."
+    }
+  end
+
+  defp required_checks_result(:de, :failed) do
+    %{
+      "outcome" => "changes_requested",
+      "summary" => "Mindestens eine erforderliche Host-Prüfung ist fehlgeschlagen oder der Workspace entsprach nicht dem akzeptierten SHA.",
+      "next_step" => "Behebe die Befunde und übergib die Arbeit erneut an Build."
     }
   end
 
