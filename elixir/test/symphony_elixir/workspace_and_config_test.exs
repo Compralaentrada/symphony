@@ -59,8 +59,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
       issue = project_workspace_issue("octo/app#11", source_repo, "release")
+      issue = %{issue | native_ref: Map.merge(issue.native_ref, %{project_id: "PVT_project", project_item_id: "PVTI_11", issue_number: 11})}
+
+      assert {:ok, original_workspace} = Workspace.create_for_issue(issue)
+      legacy_workspace = Path.join(workspace_root, Workspace.workspace_key(issue.identifier))
+      assert :ok = File.rename(original_workspace, legacy_workspace)
+      File.write!(Path.join(legacy_workspace, "preserved.txt"), "keep this workspace")
 
       assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert workspace == original_workspace
+      assert File.read!(Path.join(workspace, "preserved.txt")) == "keep this workspace"
+      File.rm!(Path.join(workspace, "preserved.txt"))
       assert git!(workspace, ["branch", "--show-current"]) == issue.branch_name
       assert File.read!(Path.join(workspace, "BASE")) == "release"
 
