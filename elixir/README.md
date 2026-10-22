@@ -42,6 +42,9 @@ permissions are restricted by repository, issue, lane, lease, and operation.
 If a claimed issue moves to a configured terminal state, Symphony stops the active agent and cleans
 up its workspace. In GitHub Projects mode, closing the linked GitHub Issue is terminal; Project
 items in Done or Blocked keep their workspace so moving them back to Ready can resume prior work.
+When resuming a Blocked item from Review, Symphony compares the PR head with the saved SHA. A
+changed head clears the accepted SHA and restarts at Build to rerun QA and Review. If it cannot read
+the PR head, Symphony does not dispatch Review.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. For the durable

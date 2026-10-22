@@ -17,7 +17,9 @@ correspondiente y ejecuta las fases necesarias con Codex.
 En el pipeline de Projects, el estado visible del Project determina el despacho. El flujo normal es
 `Ready → Building → QA → Review → Human Review → Done`; las tareas que requieren intervención
 pueden pasar a `Blocked`. Mover una tarea de `Human Review` a `Ready` solicita correcciones sobre la
-misma rama y PR.
+misma rama y PR. Si una tarea bloqueada en `Review` vuelve de `Blocked` a `Ready`, Symphony
+compara el `head SHA` del PR con el checkpoint. Si cambió, vuelve a `Build` y repite `QA` y
+`Review`.
 
 El tablero usa el campo `Status` y las opciones canónicas de Symphony: `Backlog`, `Ready`, `Building`,
 `QA`, `Review`, `Human Review`, `Blocked`, `Done` y `Dropped`.
