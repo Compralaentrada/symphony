@@ -36,6 +36,8 @@ El pipeline y la recuperación durable están implementados. En ejecuciones desd
 GitHub Projects, el agente de cada tarea es propietario de sus escrituras de issue y PR. En el
 pipeline Projects, Build, QA y Review gestionan las operaciones de su lane mediante herramientas del
 host; Symphony conserva la lectura, el scheduling, los leases, los checkpoints y la reconciliación.
+Una lectura exitosa que omite una issue activa conserva su agente en el primer refresh; una segunda
+omisión consecutiva confirma la ausencia y lo detiene sin borrar el workspace.
 
 ## Empezar en local
 
