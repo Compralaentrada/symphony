@@ -194,27 +194,45 @@ Si no hacen falta cambios, el agente deja una explicación con evidencias y espe
 
 ### QA
 
-QA comienza en una sesión nueva y recibe el código identificado por SHA, los criterios y los artefactos de Build. Reproduce los checks aplicables, revisa huecos de pruebas y recoge evidencia de UI cuando la tarea la requiera.
+QA es el lane de Tester para una issue concreta. No es el crawler autónomo `/super-qa`: recibe una tarea y su entrega, verifica esa entrega y deja evidencia para que otra sesión pueda desafiarla. La tarjeta `qa` entra por este mismo lane sin ejecutar Build; una tarjeta `bug` o `feature` llega desde Build. [SB1], [SB8]
 
-Al terminar, QA publica el resultado en la issue y PR, incluyendo comprobaciones y cambios, evidencia relevante, SHA y siguiente paso. Si acepta el SHA vigente, mueve el Project a Review; si encuentra un defecto de producto, registra el hallazgo y devuelve la tarea a Building.
+**Entradas:** criterios de aceptación observables; issue y PR vinculadas; repo, branch y `head_sha` aceptado; informe y cambios de Build si existen; hallazgos anteriores aún abiertos; instrucciones y comandos de verificación del repo; checks requeridos por el perfil. QA no puede declarar que un SHA distinto del aceptado es el que probó.
 
-El perfil distingue fallos, resultados inestables, pruebas omitidas justificadas y comprobaciones no disponibles. Una comprobación obligatoria no ejecutada no pasa a verde. La deuda previa se separa de regresiones relacionadas con el cambio mediante evidencia reproducible; no basta atribuir un fallo a que «ya estaba».
+**Trabajo:**
 
-Los defectos se devuelven a Build con IDs estables, reproducción y criterio incumplido. Cuando Build cambia el código se genera una nueva entrega y QA valida ese nuevo SHA. Las pruebas añadidas en QA también forman parte de la entrega y actualizan su identidad.
+1. Ejecutar la verificación local aplicable y cubrir cada criterio con una observación o test identificable. Elegir la capa adecuada (unit, component o E2E) al comportamiento que se quiere probar; un mock que no comprueba comportamiento observable no cuenta como cobertura del criterio.
+2. Revisar los huecos de tests por criterio: aserción, ruta cubierta, límites y errores pertinentes, determinismo y si el test fallaría ante el defecto que pretende detectar. No convertir mejoras de cobertura de bajo riesgo en bloqueos.
+3. Para un hueco de alto riesgo, añadir primero el test que reproduce el problema y completar la cobertura con TDD. QA puede modificar y publicar tests y artefactos de evidencia en la branch de la issue; no implementa cambios de producto. Si el test demuestra un defecto de producto, o cubrir el criterio exige cambiar producto, registra el defecto y lo devuelve a Build.
+4. Cuando un criterio sea visual, probar la UI y guardar capturas en los viewports pertinentes. Si la issue no tiene superficie visual, omitir capturas con esa razón.
+5. Separar defectos de producto de fallos del ejecutor. Un error de entorno, acceso o herramienta registra comando/recurso afectado y solución; bloquea la tarea sin mandar al Builder a cambiar código.
 
-El análisis de huecos relaciona criterios con aserciones concretas y rutas de prueba. Considera casos de error, permisos, dinero, límites, concurrencia y estados de UI cuando apliquen. Un test que solo confirma su propio mock no demuestra el comportamiento del producto. Los huecos de severidad alta deben justificarse con un escenario concreto; los de menor riesgo se registran sin convertir toda mejora posible en un bloqueo. [SB8]
+**Entrega:** publicar un informe vinculado al SHA final de QA. Para cada criterio, incluir estado, test o procedimiento, evidencia y cualquier omisión justificada. Registrar comandos exactos, resultado, duración cuando esté disponible, pruebas/capturas añadidas, cambios de QA, checks del host, hallazgos con IDs estables y siguiente paso. Los checks obligatorios ejecutados por Symphony se registran como evidencia del host, separados de lo que afirma el agente. Si QA añade tests, esos cambios forman parte de la branch y el `head_sha` entregado a Review debe incluirlos.
+
+**Salida:** pasar a Review solo si todos los criterios están verificados, el informe corresponde al SHA actual y los checks obligatorios están aprobados. Un defecto de producto o un hueco que requiera cambios de producto vuelve a Building con reproducción y criterio incumplido; un fallo de entorno/acceso va a Blocked. Los tests de QA que fallen por un error del propio test se corrigen dentro del lane antes de entregar. Un check requerido omitido, inestable, fallido o no disponible nunca se presenta como aprobado. [SB8]
 
 ### Review
 
-El Reviewer usa otra sesión y comienza por criterios y diff para formular sus hipótesis. Después contrasta los informes previos, revisa los hallazgos abiertos y comprueba si las correcciones están presentes.
+Review es una verificación independiente del informe de QA y el gate autónomo previo a la espera humana. No vuelve a hacer el trabajo de Tester: decide si el diff, los criterios y la evidencia sostienen la entrega y si la PR puede avanzar. Usa una sesión nueva. [SB9]
 
-Review publica su resultado y hallazgos en la issue y PR. Si QA o Review solicitan cambios, el agente registra los hallazgos y mueve el Project a Building; el ciclo continúa sobre la misma rama y PR. La nueva entrega invalida evidencias del SHA anterior que hayan quedado afectadas.
+**Entradas:** issue y PR; criterios; branch, `head_sha` y base; diff bruto; informe QA completo, sus tests/comandos/evidencias y resultado de checks del host; informe de Build si existe; hallazgos anteriores con su historial. El agente formula hipótesis desde criterios y diff antes de usar las conclusiones de Build/QA para reducir el arrastre de contexto.
 
-Los hallazgos conservan identidad, severidad, ruta o líneas y evidencia. Cada pasada declara cuáles se resolvieron, siguen pendientes o dejaron de aplicar. No se sobrescriben hallazgos sin conservar su resolución.
+**Trabajo:**
 
-El pase adversarial de Super Board se conserva para tareas de mayor riesgo o reglas definidas por perfil. Varias pasadas del mismo modelo no se presentan como garantía de independencia. La separación de sesiones reduce el arrastre de contexto y no sustituye los checks del host.
+1. Inspeccionar los criterios y el diff de forma independiente, luego contrastar cada criterio con el informe y la evidencia QA. En una entrega `bug`/`feature`, revisar código de producto y tests modificados. En una tarjeta `qa`, revisar el informe y el diff de tests/evidencia; no inventar una revisión de código de producto que no forma parte de esa entrega.
+2. Volver a ejecutar exactamente el comando de tests local que QA dejó en su informe, en el mismo checkout y SHA. Registrar comando y resultado. Si SHA cambió, el comando no está disponible o no puede reproducirse, no aprobar con la evidencia vieja: devolver a QA o bloquear por causa operativa.
+3. Revisar correcciones de hallazgos previos. Mantener el ID estable y declarar cada uno como resuelto con prueba, aún abierto o ya no aplicable con motivo. Un hallazgo abierto no desaparece por no repetirse en el informe nuevo.
+4. No modificar el producto ni los tests durante Review. Registrar hallazgos accionables con tipo, severidad, ubicación, reproducción, criterio afectado e ID estable. La severidad describe impacto o criterio incumplido; una preferencia de estilo aislada no bloquea.
+5. Aplicar el pase adversarial adicional solo al umbral de riesgo configurado. Repetir el mismo modelo no se presenta como independencia; el gate determinista del host sigue comprobando SHA, base, checks, permisos y política de merge.
 
-Las categorías de hallazgo incluyen bug, criterio sin cubrir, verificación omitida, desviación de alcance y complejidad innecesaria. Una preferencia de estilo arquitectónico no provoca por sí sola un rebote indefinido. La severidad debe vincularse al impacto o al criterio incumplido. [SB9]
+**Entrega y salida:** publicar el informe, resoluciones y SHA revisado. Hallazgos de producto vuelven a Building; defectos en tests, comando o evidencia vuelven a QA; fallos de entorno/acceso van a Blocked. Si no quedan hallazgos bloqueantes, el SHA está vigente y todos los gates pasan, Review deja la PR lista para revisión humana y mueve el Project a `Human Review`. Con `merge_policy: auto`, Review solo solicita el merge al gate del host; no fusiona por decisión libre del modelo y solo marca `Done` cuando el merge está confirmado en la base. [SB9]
+
+El solapamiento con QA es deliberado y acotado: QA produce tests, resultados y evidencia; Review los desafía desde una sesión nueva y repite el comando de tests reportado. QA responde «¿está probado cada criterio y qué evidencia lo demuestra?»; Review responde «¿puedo confiar en esa prueba y en este diff para entregar el SHA?». Ese doble control no elimina la obligación de asignar cada hallazgo a la fase que puede corregirlo. [SB8], [SB9]
+
+### Brecha de implementación actual
+
+El diseño anterior es el objetivo; el pipeline implementado aún no lo cumple. `AgentRunner` prohíbe cambios de archivos tanto en QA como en Review y el contrato QA actual no exige matriz de criterios, comando repetible ni evidencia de pruebas creada por el agente. El orquestador entrega a Review el SHA y los hallazgos previos, pero no el informe QA completo. Finalmente, `Pipeline` envía cualquier resultado con cambios solicitados de QA o Review a Building. Las tareas nuevas del roadmap deben cerrar estas tres brechas: QA como productor de pruebas/evidencia, Review como validador independiente de esa entrega y routing por responsable del hallazgo.
+
+La diferencia con el comando autónomo `/super-qa` es intencional. Este pipeline no añade crawling BFS, diez iteraciones exploratorias ni commits directos en una branch sin issue; cubre solo el lane de Tester vinculado a la tarea. [SB8]
 
 ### Entrega y cierre
 
@@ -233,7 +251,11 @@ Una persona puede fusionar la PR o pedir cambios. Si pide cambios, mueve la tare
 | Ready | Admisión; lease local y claim visibles confirmados | Building o QA para tipo `qa` | Orquestador y agente |
 | Building | Entrega y contexto de código válidos | QA | Agente Build; Symphony valida |
 | QA | Checks y criterios aceptados | Review autónoma | Agente QA; Symphony coordina |
-| QA o Review | Defecto de implementación | Building con hallazgos abiertos | Agente de fase |
+| QA | Defecto de producto o cobertura que requiere cambio de producto | Building con reproducción, criterio e IDs abiertos | Agente QA |
+| QA | Criterios verificados en el SHA final; checks requeridos aprobados | Review con informe, tests y evidencia | Agente QA |
+| Review | Hallazgo de producto | Building; la nueva entrega vuelve a QA | Agente Review |
+| Review | Defecto en tests, comando o evidencia QA | QA; conserva los hallazgos y el diff actual | Agente Review |
+| QA o Review | Fallo de entorno, acceso o herramienta | Blocked con recurso/comando y acción | Agente de fase |
 | Cualquier fase activa | Falta información o acceso | Blocked con motivo persistido | Agente de fase |
 | Human Review | La persona pide cambios | Ready; misma rama y PR, PR a draft, después Building | Persona y agente Build |
 | Review | QA y Review aceptadas; PR lista para revisión | Human Review | Agente Review |
@@ -269,6 +291,8 @@ Cada rol entrega un resultado que el host valida contra un esquema versionado. E
 ```
 
 Resultados admitidos: `passed`, `changes_requested`, `needs_input` y `blocked`. Una respuesta malformada es un error de contrato, con corrección acotada; no una aprobación. Los checks e IDs de evidencia deben provenir del host, y un resultado aprobado debe cubrir los requisitos del rol. Las preguntas, los hallazgos y el resumen tienen límites de tamaño. Un resultado por sí solo no cambia el Project ni cierra una issue: esas operaciones deben ejecutarse mediante herramientas autorizadas y quedar verificadas en GitHub.
+
+El contrato de QA incluye por criterio el estado, las pruebas/procedimientos, los comandos exactos y referencias de evidencia; los checks ejecutados por el host quedan identificados como tales. El contrato de Review incluye el SHA/base revisados, el comando QA repetido y su resultado, más resoluciones explícitas de cada hallazgo previo. Ambos informes deben ser legibles por la siguiente fase sin depender del texto de una conversación anterior.
 
 ## 8 Skills y herramientas de Super Board
 
@@ -476,6 +500,8 @@ Usar estados y skills definidos por Symphony, verificar el Project en onboarding
 
 Aceptación: la ruta `qa` nunca ejecuta Build; las dependencias se resuelven por identidad repo/issue, no por número local; una tarea con dependencia pendiente permanece en `Ready` sin ocupar slot; ningún estado o skill depende de un mapping configurado por instalación.
 
+El routing directo definido por [#15](https://github.com/Compralaentrada/symphony/issues/15) no completa por sí solo el comportamiento de Tester y Reviewer. Las tareas [#56](https://github.com/Compralaentrada/symphony/issues/56) y [#57](https://github.com/Compralaentrada/symphony/issues/57) definen el informe de cobertura y permiten que QA añada tests a la entrega; [#58](https://github.com/Compralaentrada/symphony/issues/58) hace que Review valide ese informe y repita el comando de QA; [#59](https://github.com/Compralaentrada/symphony/issues/59) devuelve cada hallazgo a su fase responsable. Las cuatro son subtareas de #10 y tienen bloqueos nativos por #40 y sus dependencias anteriores.
+
 ### Hito 2 — Despachar por slots
 
 Añadir un límite global `max_active_tasks`, configurable y con valor inicial 5. Cada tarea activa conserva un slot durante sus fases automáticas; el scheduler llena slots libres con las tareas Ready elegibles más antiguas. No adopta waves, prioridad por fase, workers por lane ni límites específicos por repo. Las esperas en Human Review o Blocked liberan el slot.
@@ -536,6 +562,12 @@ El documento define las comprobaciones que habrá que construir y ejecutar al im
 | Proceso viejo entrega resultado | Se rechaza si perdió su token de propiedad. |
 | QA falla por un defecto del producto | Devuelve un hallazgo reproducible a Build. |
 | QA falla por entorno o acceso | Diagnóstico operativo sin bucle de cambios de producto. |
+| QA entrega el resultado | Cada criterio tiene test/procedimiento y evidencia; el informe distingue checks del agente y del host y corresponde al SHA probado. |
+| QA cubre un hueco de alto riesgo | Añade el test primero, entrega la branch/PR y actualiza el SHA antes de Review. |
+| Review recibe el informe QA | Repite el comando permitido exacto del informe en el mismo SHA y conserva las resoluciones de hallazgos anteriores. |
+| Review detecta un fallo solo en tests/comando/evidencia | Devuelve a QA conservando branch, PR e ID del hallazgo. |
+| Review detecta un defecto de producto o falla el entorno | Producto vuelve a Building; entorno/acceso va a Blocked, sin rework incorrecto. |
+| Review revisa una tarea `qa` | Inspecciona informe y diff de tests/evidencia; no supone que haya diff de producto. |
 | La persona pide cambios en Human Review | Vuelve a Ready y Build conserva rama/PR; QA y Review validan la nueva entrega. |
 | Tras Build | PR queda en draft hasta que QA y Review acepten el mismo SHA. |
 | QA y Review aceptan | El agente Review marca la PR lista para revisión y mueve la tarea a Human Review. |

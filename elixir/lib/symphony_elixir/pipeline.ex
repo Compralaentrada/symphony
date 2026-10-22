@@ -36,7 +36,7 @@ defmodule SymphonyElixir.Pipeline do
   @spec reconcile() :: :ok | {:error, term()}
   def reconcile do
     with {:ok, tasks} <- Store.tasks() do
-      Enum.each(tasks, &reconcile_task/1)
+      reconcile_tasks(tasks)
     end
   end
 
@@ -360,9 +360,22 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp reconcile_task(%{"issue_id" => issue_id} = task) do
-    case Tracker.fetch_issues_by_ids([issue_id]) do
-      {:ok, [issue | _]} ->
+  defp reconcile_tasks([]), do: :ok
+
+  defp reconcile_tasks(tasks) do
+    case Tracker.fetch_issues_by_ids(Enum.map(tasks, & &1["issue_id"])) do
+      {:ok, issues} ->
+        issues_by_id = Map.new(issues, &{&1.id, &1})
+        Enum.each(tasks, &reconcile_task(&1, issues_by_id))
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp reconcile_task(%{"issue_id" => issue_id} = task, issues_by_id) do
+    case Map.get(issues_by_id, issue_id) do
+      %Issue{} = issue ->
         _ = execute_pending(issue)
         reconcile_task_issue(issue, task)
 
