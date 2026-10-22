@@ -932,7 +932,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp handoff_status("qa", %{"outcome" => "blocked"}, settings), do: {:ok, settings.statuses.blocked}
   defp handoff_status("review", %{"outcome" => "passed", "findings" => []}, settings), do: {:ok, settings.statuses.human_review}
   defp handoff_status("review", %{"outcome" => "merged"}, settings), do: {:ok, settings.statuses.done}
-  defp handoff_status("review", %{"outcome" => outcome}, settings) when outcome in ["changes_requested", "failed"], do: {:ok, settings.statuses.building}
+  defp handoff_status("review", %{"outcome" => outcome}, settings) when outcome in ["changes_requested", "failed", "defects_found"], do: {:ok, settings.statuses.building}
   defp handoff_status("review", %{"outcome" => "blocked"}, settings), do: {:ok, settings.statuses.blocked}
   defp handoff_status("diagnostic", %{"outcome" => "blocked"}, settings), do: {:ok, settings.statuses.blocked}
   defp handoff_status("finalize", %{"outcome" => "merged"}, settings), do: {:ok, settings.statuses.done}
@@ -1060,7 +1060,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp maybe_set_review_stage(issue, "review", %{"outcome" => outcome}, _pr, target, settings, tracker_settings, request_fun)
-       when outcome in ["passed", "changes_requested", "failed"] do
+       when outcome in ["passed", "changes_requested", "failed", "defects_found"] do
     stage = if outcome == "passed", do: :ready, else: :draft
 
     with {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
@@ -1478,7 +1478,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp request_rest(method, path, params, body, settings) do
     request_opts = [
       method: method,
-      url: "https://api.github.com" <> path,
+      url: github_rest_url(settings.graphql_url) <> path,
       headers: [
         {"Accept", "application/vnd.github+json"},
         {"Authorization", "Bearer #{settings.token}"},
@@ -1495,6 +1495,12 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       {:ok, response} -> {:ok, %{status: response.status, body: response.body}}
       {:error, reason} -> {:error, {:github_api_request, reason}}
     end
+  end
+
+  defp github_rest_url(graphql_url) do
+    uri = URI.parse(graphql_url)
+    path = if uri.path == "/graphql", do: "", else: String.replace_suffix(uri.path, "/graphql", "/v3")
+    URI.to_string(%{uri | path: path, query: nil, fragment: nil})
   end
 
   defp create_follow_up_issue(issue, context, arguments, tracker_settings, settings, opts) do

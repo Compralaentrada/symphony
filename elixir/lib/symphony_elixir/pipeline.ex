@@ -5,6 +5,9 @@ defmodule SymphonyElixir.Pipeline do
   alias SymphonyElixir.Tracker.Issue
 
   @phases ~w(build qa review finalize)
+  # shortcut: 30 randomized Tongue samples smooth locale scores; revisit if locale coverage or accuracy needs change.
+  @report_locale_samples 30
+  @report_locale_confidence 0.75
   @statuses %{
     backlog: "Backlog",
     ready: "Ready",
@@ -21,6 +24,13 @@ defmodule SymphonyElixir.Pipeline do
   def enabled? do
     tracker = Config.settings!().tracker
     tracker.kind == "github_projects"
+  end
+
+  @spec report_locale(Issue.t()) :: :en | :es
+  def report_locale(%Issue{description: description}) do
+    description = if is_binary(description), do: String.downcase(description), else: ""
+    confidence = Enum.reduce(1..@report_locale_samples, 0.0, fn _, total -> total + Keyword.get(Tongue.detect(description), :es, 0.0) end) / @report_locale_samples
+    if confidence >= @report_locale_confidence, do: :es, else: :en
   end
 
   @spec reconcile() :: :ok | {:error, term()}
@@ -52,7 +62,7 @@ defmodule SymphonyElixir.Pipeline do
 
   @spec finish_phase(Issue.t(), map(), String.t(), pos_integer(), term()) :: :ok | {:error, term()}
   def finish_phase(%Issue{} = issue, task, phase, attempt, result) do
-    case normalize_phase_result(result, phase) do
+    case normalize_phase_result(result, phase, report_locale(issue)) do
       {:ok, result} ->
         with :ok <- validate_remote_handoff(phase, result) do
           finish_valid_phase(issue, task, phase, attempt, result)
@@ -589,7 +599,10 @@ defmodule SymphonyElixir.Pipeline do
 
   @doc false
   @spec normalize_phase_result(term(), String.t()) :: {:ok, map()} | {:error, term()}
-  def normalize_phase_result(result, phase) when is_map(result) do
+  def normalize_phase_result(result, phase), do: normalize_phase_result(result, phase, :en)
+
+  @spec normalize_phase_result(term(), String.t(), :en | :es) :: {:ok, map()} | {:error, term()}
+  def normalize_phase_result(result, phase, locale) when is_map(result) do
     result = Map.new(result, fn {key, value} -> {to_string(key), value} end)
     result = normalize_remote_result(result, phase)
 
@@ -598,8 +611,8 @@ defmodule SymphonyElixir.Pipeline do
         do:
           Map.merge(result, %{
             "outcome" => "changes_requested",
-            "summary" => "#{String.upcase(phase)} reported findings that need correction.",
-            "next_step" => "Fix the findings and submit a new Build delivery."
+            "summary" => findings_summary(locale, phase),
+            "next_step" => findings_next_step(locale)
           }),
         else: result
 
@@ -608,8 +621,16 @@ defmodule SymphonyElixir.Pipeline do
       else: {:error, {:invalid_phase_report, invalid_report_details(phase, result)}}
   end
 
-  def normalize_phase_result(_result, phase),
+  def normalize_phase_result(_result, phase, _locale),
     do: {:error, {:invalid_phase_report, %{phase: phase, report_type: :not_an_object}}}
+
+  defp findings_summary(:es, "qa"), do: "QA encontró hallazgos que requieren corrección."
+  defp findings_summary(:es, _phase), do: "La revisión encontró hallazgos que requieren corrección."
+  defp findings_summary(_locale, "qa"), do: "QA reported findings that need correction."
+  defp findings_summary(_locale, _phase), do: "Review reported findings that need correction."
+
+  defp findings_next_step(:es), do: "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
+  defp findings_next_step(_locale), do: "Fix the findings and submit a new Build delivery."
 
   defp invalid_report_details(phase, result) do
     finding_keys =

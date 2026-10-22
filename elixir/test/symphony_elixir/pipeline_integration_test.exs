@@ -2,7 +2,39 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Config
+  alias SymphonyElixir.Pipeline
   alias SymphonyElixir.Pipeline.Store
+
+  test "phase report normalization follows Spanish issue language and defaults other languages to English" do
+    spanish_issue = %{issue("octo/app#40", 40) | description: "Implementar soporte para nuevas salas"}
+    french_issue = %{issue("octo/app#41", 41) | description: "Créer des salles privées"}
+
+    assert Pipeline.report_locale(spanish_issue) == :es
+    assert Pipeline.report_locale(french_issue) == :en
+
+    finding = %{"id" => "QA-40", "reproduction" => "Ejecuta la ruta afectada.", "criterion" => "Se cumple el criterio."}
+
+    assert {:ok,
+            %{
+              "outcome" => "changes_requested",
+              "summary" => "QA encontró hallazgos que requieren corrección.",
+              "next_step" => "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
+            }} =
+             Pipeline.normalize_phase_result(
+               %{
+                 "outcome" => "passed",
+                 "summary" => "QA pasó.",
+                 "sha" => String.duplicate("a", 40),
+                 "criteria" => [],
+                 "changes" => [],
+                 "checks" => [],
+                 "findings" => [finding],
+                 "next_step" => "Continúa con Review."
+               },
+               "qa",
+               Pipeline.report_locale(spanish_issue)
+             )
+  end
 
   test "Build, QA and Review resume on the same PR and Done waits for a confirmed merge" do
     issue = issue("octo/app#1", 1)

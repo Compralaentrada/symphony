@@ -222,6 +222,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_pipeline_turn(session, issue, on_message, message_key, phase, opts) do
     evidence_key = {message_key, :remote_evidence}
+    report_language = report_language_name(Pipeline.report_locale(issue))
 
     prompt =
       issue
@@ -230,6 +231,7 @@ defmodule SymphonyElixir.AgentRunner do
       |> Kernel.<>(
         "\n\n" <>
           pipeline_phase_instructions(phase, opts) <>
+          "\nUse the Humanizer guidance for report values. Write report values in #{report_language} (Spanish only for Spanish issues; English otherwise). Keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details." <>
           "\nThe phase report JSON contract overrides any skill's preferred presentation format."
       )
 
@@ -244,7 +246,7 @@ defmodule SymphonyElixir.AgentRunner do
 
         case run_phase_turn(
                session,
-               phase_report_correction_prompt(),
+               phase_report_correction_prompt(report_language),
                issue,
                on_message,
                message_key,
@@ -267,7 +269,7 @@ defmodule SymphonyElixir.AgentRunner do
          ) do
       {:ok, _turn} ->
         with {:ok, report} <- decode_phase_report(phase_report_text(Process.get(message_key))) do
-          Pipeline.normalize_phase_result(report, Atom.to_string(phase))
+          Pipeline.normalize_phase_result(report, Atom.to_string(phase), Pipeline.report_locale(issue))
         end
 
       error ->
@@ -281,13 +283,17 @@ defmodule SymphonyElixir.AgentRunner do
     {:phase_result, report |> Map.put("_remote_evidence", evidence) |> Map.put("_host_checks", Keyword.get(opts, :host_checks, []))}
   end
 
-  defp phase_report_correction_prompt do
+  defp phase_report_correction_prompt(report_language) do
     """
     The previous response did not match the pipeline's required phase report. Return exactly one JSON object using the fields and allowed outcome from the preceding phase instructions, including the exact key names required for each finding. Preserve its findings and conclusions; do not repeat the work. The pipeline's JSON report contract overrides any skill's preferred prose format.
+    Write report values in #{report_language} (Spanish only for Spanish issues; English otherwise). Preserve every fact, result, and evidence item without inventing details.
     The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
     Do not include headings, bullets, Markdown, code fences, or text outside the JSON object.
     """
   end
+
+  defp report_language_name(:es), do: "Spanish"
+  defp report_language_name(_locale), do: "English"
 
   defp pipeline_phase_instructions(:build, opts) do
     """
