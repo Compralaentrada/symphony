@@ -286,9 +286,11 @@ defmodule SymphonyElixir.GitHub.Client do
       else: {:error, :stale_agent_lease}
   end
 
-  defp validate_agent_lease(%{issue: %Issue{id: issue_id}, lane: lane, generation: generation, attempt: attempt})
+  defp validate_agent_lease(%{issue: %Issue{id: issue_id}, lane: lane, generation: generation, attempt: attempt} = context)
        when is_integer(generation) and is_integer(attempt) do
-    if Store.agent_lease_active?(issue_id, generation, to_string(lane), attempt),
+    lease_phase = Map.get(context, :lease_phase) || lane
+
+    if Store.agent_lease_active?(issue_id, generation, to_string(lease_phase), attempt),
       do: :ok,
       else: {:error, :stale_agent_lease}
   end

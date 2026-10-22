@@ -490,7 +490,7 @@ Aceptación del pipeline base: la ejecución se recupera tras reiniciar; el esta
 
 ### Hito 0.1 — Delegar las escrituras de GitHub a los agentes (completado: issue #40)
 
-En todas las ejecuciones iniciadas desde GitHub Issues o GitHub Projects, el agente gestiona las escrituras de su issue y PR. Dentro del pipeline Projects, Build, QA y Review se reparten las escrituras por lane. Symphony queda como lector y coordinador, conserva leases, slots, journal y recuperación, y verifica los efectos remotos. Build crea la draft PR; Review prepara la revisión humana o invoca el gate determinista cuando auto-merge está activado. Esta decisión está registrada en ADR-0002 y sigue el contrato de lanes de Super Board [SB1], [SB17].
+En todas las ejecuciones iniciadas desde GitHub Issues o GitHub Projects, el agente gestiona las escrituras de su issue y PR. Dentro del pipeline Projects, Build, QA y Review se reparten las escrituras por lane; el lane `diagnostic` registra bloqueos que impiden iniciar una de esas fases. Symphony queda como lector y coordinador, conserva leases, slots, journal y recuperación, y verifica los efectos remotos. Build crea la draft PR; Review prepara la revisión humana o invoca el gate determinista cuando auto-merge está activado. Esta decisión está registrada en ADR-0002 y sigue el contrato de lanes de Super Board [SB1], [SB17].
 
 Aceptación: los agentes ejecutan y verifican claim/liberación, informes y transiciones; el coordinador no escribe en GitHub; los permisos son por repo y rol; los efectos inciertos se reconcilian sin duplicados; texto humano, decisiones más recientes y el merge humano por defecto se conservan.
 

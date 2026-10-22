@@ -1088,7 +1088,10 @@ defmodule SymphonyElixir.Orchestrator do
         issues
 
       {:error, reason} ->
-        Logger.warning("Unable to fetch pending Finalize issues: #{inspect(reason)}")
+        Enum.each(issue_ids, fn issue_id ->
+          Logger.warning("Unable to fetch pending Finalize issue issue_id=#{issue_id} issue_identifier=#{issue_id}: #{inspect(reason)}")
+        end)
+
         []
     end
   end
@@ -1222,19 +1225,27 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp run_pipeline_phase(runner, recipient, issue, task, phase, phase_attempt, retry_attempt, worker_host) do
-    result =
-      runner.run(issue, recipient,
-        attempt: retry_attempt,
-        worker_host: worker_host,
-        phase: String.to_existing_atom(phase),
-        pipeline_task: task,
-        generation: task["generation"],
-        phase_attempt: phase_attempt,
-        prior_findings: task["prior_findings"] || []
-      )
+    opts = [
+      attempt: retry_attempt,
+      worker_host: worker_host,
+      phase: String.to_existing_atom(phase),
+      pipeline_task: task,
+      generation: task["generation"],
+      phase_attempt: phase_attempt,
+      prior_findings: task["prior_findings"] || []
+    ]
+
+    result = runner.run(issue, recipient, opts)
+    result = diagnose_system_blocker(runner, issue, recipient, opts, result)
 
     send(recipient, {:pipeline_phase_result, issue.id, task["generation"], phase, phase_attempt, result})
   end
+
+  defp diagnose_system_blocker(runner, issue, recipient, opts, {:phase_result, {:system_blocker, _report}} = blocker) do
+    if Pipeline.enabled?(), do: runner.run(issue, recipient, Keyword.put(opts, :diagnostic, true)), else: blocker
+  end
+
+  defp diagnose_system_blocker(_runner, _issue, _recipient, _opts, result), do: result
 
   defp pipeline_running_entry(issue, task, phase, phase_attempt, retry_attempt, worker_host, pid, ref) do
     %{

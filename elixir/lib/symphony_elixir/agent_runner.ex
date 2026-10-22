@@ -41,12 +41,13 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
-    refresh_project_branch? = refresh_project_branch?(opts)
+    diagnostic? = Keyword.get(opts, :diagnostic, false)
+    refresh_project_branch? = not diagnostic? and refresh_project_branch?(opts)
     task = Keyword.get(opts, :pipeline_task, %{})
     has_pull_request? = is_map(task) and not is_nil(Map.get(task, "pr_number"))
 
     workspace_opts = [
-      require_existing_project_branch: has_pull_request?,
+      require_existing_project_branch: has_pull_request? and not diagnostic?,
       refresh_project_branch: refresh_project_branch?
     ]
 
@@ -69,17 +70,24 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp workspace_creation_error(reason, issue, opts, has_pull_request?, refresh_project_branch?) do
-    is_missing_pr_branch? = has_pull_request? and phase_with_pr?(opts) and reason == :project_branch_missing
-    refresh_blocked? = refresh_project_branch? and reason in @workspace_refresh_blockers
+    if Keyword.get(opts, :diagnostic, false) do
+      {:error, reason}
+    else
+      is_missing_pr_branch? = has_pull_request? and phase_with_pr?(opts) and reason == :project_branch_missing
+      refresh_blocked? = refresh_project_branch? and reason in @workspace_refresh_blockers
 
-    if refresh_blocked? or is_missing_pr_branch?,
-      do: {:phase_result, {:system_blocker, blocked_workspace_report(reason, issue)}},
-      else: {:error, reason}
+      if refresh_blocked? or is_missing_pr_branch?,
+        do: {:phase_result, {:system_blocker, blocked_workspace_report(reason, issue)}},
+        else: {:error, reason}
+    end
   end
 
   defp verify_pipeline_workspace_sha(workspace, issue, opts, worker_host) do
-    case {Keyword.get(opts, :phase), Keyword.get(opts, :pipeline_task)} do
-      {phase, task} when phase in [:qa, :review] and is_map(task) ->
+    case {Keyword.get(opts, :diagnostic, false), Keyword.get(opts, :phase), Keyword.get(opts, :pipeline_task)} do
+      {true, _, _} ->
+        :ok
+
+      {false, phase, task} when phase in [:qa, :review] and is_map(task) ->
         case Map.get(task, "current_sha") do
           sha when is_binary(sha) and sha != "" ->
             verify_pipeline_workspace_sha_at_sha(workspace, issue, sha, worker_host)
@@ -295,7 +303,14 @@ defmodule SymphonyElixir.AgentRunner do
       end
 
     opts = Keyword.put(opts, :selected_repo_skills, selected_repo_skills)
-    opts = Keyword.put_new(opts, :host_checks, run_pipeline_host_checks(workspace, issue, opts, worker_host))
+
+    opts =
+      Keyword.put_new(
+        opts,
+        :host_checks,
+        if(Keyword.get(opts, :diagnostic, false), do: [], else: run_pipeline_host_checks(workspace, issue, opts, worker_host))
+      )
+
     opts = Keyword.put(opts, :report_locale, Pipeline.report_locale(issue))
     agent_context = github_agent_context(issue, opts)
 
@@ -365,13 +380,16 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp github_agent_context(issue, opts) do
     tracker = Config.settings!().tracker
+    phase = Keyword.get(opts, :phase, :individual)
+    diagnostic? = Keyword.get(opts, :diagnostic, false)
 
     %{
       issue: issue,
-      lane: Keyword.get(opts, :phase, :individual),
+      lane: if(diagnostic?, do: :diagnostic, else: phase),
       task: Keyword.get(opts, :pipeline_task),
       generation: Keyword.get(opts, :generation),
       attempt: Keyword.get(opts, :phase_attempt),
+      lease_phase: if(diagnostic?, do: phase),
       lease_token: Keyword.get(opts, :github_lease_token),
       host_checks: Keyword.get(opts, :host_checks, []),
       report_locale: Keyword.get(opts, :report_locale, Pipeline.report_locale(issue)),
@@ -430,7 +448,7 @@ defmodule SymphonyElixir.AgentRunner do
       |> append_selected_skills(Keyword.get(opts, :selected_repo_skills), 1)
       |> Kernel.<>(
         "\n\n" <>
-          pipeline_phase_instructions(phase, opts) <>
+          phase_instructions(phase, opts) <>
           "\nUse the Humanizer guidance for report values. Write report values in #{report_language} (Spanish only for Spanish issues; English otherwise). Keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details." <>
           "\nThe phase report JSON contract overrides any skill's preferred presentation format."
       )
@@ -461,6 +479,19 @@ defmodule SymphonyElixir.AgentRunner do
       error ->
         error
     end
+  end
+
+  defp phase_instructions(phase, opts) do
+    if Keyword.get(opts, :diagnostic, false), do: diagnostic_phase_instructions(phase), else: pipeline_phase_instructions(phase, opts)
+  end
+
+  defp diagnostic_phase_instructions(phase) do
+    """
+    Pipeline lane: Diagnostic for #{phase}.
+    Read the issue workpad and current-generation phase reports with `github_workflow` operation `read_workpad`. Independently inspect the task workspace and the repository's current pull request using read-only commands and GitHub reads. Diagnose why the normal phase cannot safely continue, using only saved task records and observed facts.
+    Record the diagnosis and recovery step in the persistent workpad with `github_workflow` operation `workpad`, then use `github_workflow` operation `handoff`, outcome `blocked`, with the complete report matching the #{phase} JSON schema. The host verifies and checkpoints your report.
+    Do not edit files, push, merge, or change the pull request. Do not guess at missing evidence.
+    """
   end
 
   defp run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema, report_locale) do

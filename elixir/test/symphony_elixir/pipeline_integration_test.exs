@@ -35,57 +35,15 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     end
   end
 
-  test "system-generated Build blockers persist without agent handoff evidence" do
+  test "system-generated QA blockers require a diagnostic agent handoff" do
     issue = issue("octo/app#40", 40)
     table = start_board([issue], %{})
     pipeline_database!(table)
 
     assert {:ok, task, "build"} = Pipeline.prepare(issue)
-    assert {:ok, task, attempt} = Pipeline.begin_phase(issue, task, "build")
-
-    result = %{
-      "outcome" => "blocked",
-      "summary" => "The saved workspace branch diverges from the updated PR branch.",
-      "reason" => "The saved workspace branch diverges from the updated PR branch.",
-      "next_step" => "Reconcile the branch and move the issue to Ready."
-    }
-
-    assert :ok = Pipeline.finish_phase(issue, task, "build", attempt, {:system_blocker, result})
-    assert project_state(table, issue.id) == "Blocked"
-    assert {:ok, %{"status" => "blocked", "blocked_reason" => reason}} = Store.get_task(issue.id)
-    assert reason == result["reason"]
-    report = table |> lookup({:reports, issue.id}) |> Map.values() |> hd()
-    assert report =~ result["reason"]
-    assert report =~ result["next_step"]
-  end
-
-  test "system-generated blockers skip remote persistence for other trackers" do
-    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
-
-    assert :ignore =
-             Tracker.persist_system_block(
-               issue("octo/app#41", 41),
-               "marker",
-               "blocked report",
-               "build",
-               "branch missing"
-             )
-  end
-
-  test "system-generated QA blockers persist without agent handoff evidence" do
-    issue = issue("octo/app#42", 42)
-    table = start_board([issue], %{})
-    pipeline_database!(table)
-
-    assert {:ok, task, "build"} = Pipeline.prepare(issue)
-
-    task =
-      Map.merge(task, %{
-        "phase" => "qa",
-        "status" => "qa",
-        "current_sha" => String.duplicate("a", 40)
-      })
-
+    issue = %{issue | state: "QA", native_ref: Map.put(issue.native_ref, :project_status, "QA")}
+    :ets.insert(table, {{:issue, issue.id}, issue})
+    task = Map.merge(task, %{"phase" => "qa", "status" => "qa", "current_sha" => String.duplicate("a", 40)})
     assert :ok = Store.save_task(task)
     assert {:ok, task, attempt} = Pipeline.begin_phase(issue, task, "qa")
 
@@ -96,12 +54,52 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
       "next_step" => "Restore the accepted workspace and move the issue to Ready."
     }
 
-    assert :ok = Pipeline.finish_phase(issue, task, "qa", attempt, {:system_blocker, result})
-    assert project_state(table, issue.id) == "Blocked"
-    assert {:ok, %{"status" => "blocked", "blocked_reason" => reason}} = Store.get_task(issue.id)
-    assert reason == result["reason"]
-    report = table |> lookup({:reports, issue.id}) |> Map.values() |> hd()
-    assert report =~ result["reason"]
+    assert {:error, :diagnostic_handoff_required} =
+             Pipeline.finish_phase(issue, task, "qa", attempt, {:system_blocker, result})
+
+    assert project_state(table, issue.id) == "QA"
+    assert lookup(table, {:reports, issue.id}) == nil
+  end
+
+  test "orchestrator retries a preflight blocker through the diagnostic lane" do
+    issue = issue("octo/app#45", 45)
+    issue = %{issue | state: "QA", native_ref: Map.put(issue.native_ref, :project_status, "QA")}
+    table = start_board([issue], %{})
+    pipeline_database!(table, retry_backoff_ms: 300_000)
+
+    assert :ok =
+             Store.save_task(%{
+               "issue_id" => issue.id,
+               "repository" => "octo/app",
+               "branch" => issue.branch_name,
+               "base_branch" => "main",
+               "required_checks" => ["true"],
+               "generation" => 1,
+               "phase" => "qa",
+               "status" => "qa",
+               "attempts" => %{},
+               "prior_findings" => [],
+               "current_sha" => String.duplicate("a", 40),
+               "pr_number" => 145
+             })
+
+    orchestrator = start_orchestrator(SymphonyElixir.PipelineIntegrationTest.DiagnosticAgent)
+    Process.sleep(100)
+
+    assert await(fn -> lookup(table, {:diagnostic_runner_calls, issue.id}) != nil end)
+    assert await(fn -> lookup(table, :diagnostic_opts) != nil end)
+
+    assert await(fn ->
+             project_state(table, issue.id) == "Blocked" and
+               match?({:ok, %{"status" => "blocked"}}, Store.get_task(issue.id))
+           end)
+
+    assert {:diagnostic_opts, opts} = :ets.lookup(table, :diagnostic_opts) |> List.last()
+    assert Keyword.get(opts, :diagnostic) == true
+    refute Keyword.has_key?(opts, :blocker_report)
+    assert Map.has_key?(lookup(table, {:reports, issue.id}), "octo/app#45:1:diagnostic")
+
+    stop_orchestrator(orchestrator)
   end
 
   test "Review blocks when the PR head advances after the Build SHA was accepted" do
@@ -789,9 +787,9 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     %{backlog: "Backlog", ready: "Ready", building: "Building", qa: "QA", review: "Review", human_review: "Human Review", blocked: "Blocked", dropped: "Dropped", done: "Done"}
   end
 
-  defp start_orchestrator do
+  defp start_orchestrator(agent_runner \\ __MODULE__.FakeAgent) do
     name = Module.concat(__MODULE__, "Pipeline#{System.unique_integer([:positive])}")
-    {:ok, pid} = Orchestrator.start_link(name: name, agent_runner: __MODULE__.FakeAgent)
+    {:ok, pid} = Orchestrator.start_link(name: name, agent_runner: agent_runner)
     pid
   end
 
@@ -1489,6 +1487,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
   defp target_status("review", "merged"), do: status_value(:done)
   defp target_status("review", outcome) when outcome in ["changes_requested", "failed"], do: status_value(:building)
   defp target_status("review", "blocked"), do: status_value(:blocked)
+  defp target_status("diagnostic", "blocked"), do: status_value(:blocked)
   defp target_status("finalize", "merged"), do: status_value(:done)
   defp target_status(_, _), do: nil
 
@@ -1500,6 +1499,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
         "build" -> [status_value(:building)]
         "qa" -> [status_value(:qa)]
         "review" -> [status_value(:review), status_value(:human_review)]
+        "diagnostic" -> [status_value(:building), status_value(:qa), status_value(:review)]
         "finalize" -> [status_value(:human_review)]
       end
 
@@ -1541,9 +1541,11 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
     |> String.trim()
   end
 
-  defp validate_lease(%{issue: issue, generation: generation, lane: lane, attempt: attempt})
+  defp validate_lease(%{issue: issue, generation: generation, lane: lane, attempt: attempt} = context)
        when is_integer(generation) and is_integer(attempt) do
-    if Store.agent_lease_active?(issue.id, generation, to_string(lane), attempt),
+    phase = Map.get(context, :lease_phase, to_string(lane))
+
+    if Store.agent_lease_active?(issue.id, generation, phase, attempt),
       do: :ok,
       else: {:error, :stale_agent_lease}
   end
@@ -1587,4 +1589,73 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
   end
 
   defp issue_index(%{id: id}), do: id |> String.split("#") |> List.last() |> String.to_integer()
+end
+
+defmodule SymphonyElixir.PipelineIntegrationTest.DiagnosticAgent do
+  alias SymphonyElixir.GitHub.AgentTool
+  alias SymphonyElixir.PipelineIntegrationTest.FakeClient
+
+  def run(issue, _recipient, opts) do
+    table = Application.fetch_env!(:symphony_elixir, :pipeline_test_board)
+    :ets.update_counter(table, {:diagnostic_runner_calls, issue.id}, {2, 1}, {{:diagnostic_runner_calls, issue.id}, 0})
+
+    if Keyword.get(opts, :diagnostic, false) do
+      run_diagnostic(issue, opts)
+    else
+      {:phase_result,
+       {:system_blocker,
+        %{
+          "outcome" => "blocked",
+          "summary" => "The host could not verify the accepted workspace SHA.",
+          "reason" => "The host could not verify the accepted workspace SHA.",
+          "next_step" => "Inspect the saved phase evidence and current PR."
+        }}}
+    end
+  end
+
+  defp run_diagnostic(issue, opts) do
+    table = Application.fetch_env!(:symphony_elixir, :pipeline_test_board)
+    :ets.insert(table, {:diagnostic_opts, opts})
+
+    report = %{
+      "outcome" => "blocked",
+      "summary" => "The PR head no longer matches the accepted QA SHA.",
+      "reason" => "The PR head no longer matches the accepted QA SHA.",
+      "next_step" => "Move the issue to Ready to rerun Build, QA, and Review.",
+      "sha" => String.duplicate("a", 40),
+      "findings" => [],
+      "criteria" => [],
+      "changes" => [],
+      "checks" => []
+    }
+
+    with {:ok, workpad} <- workflow(issue, opts, %{"operation" => "workpad", "body" => "### Diagnosis\nThe PR head changed."}),
+         {:ok, handoff} <- workflow(issue, opts, %{"operation" => "handoff", "outcome" => "blocked", "report" => report}) do
+      Map.put(report, "_remote_evidence", [workpad, handoff])
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp workflow(issue, opts, arguments) do
+    context = %{
+      issue: issue,
+      lane: :diagnostic,
+      task: Keyword.get(opts, :pipeline_task),
+      generation: Keyword.get(opts, :generation),
+      attempt: Keyword.get(opts, :phase_attempt),
+      lease_phase: Keyword.fetch!(opts, :phase) |> to_string(),
+      tracker_kind: "github_projects",
+      merge_policy: "human",
+      host_checks: []
+    }
+
+    case AgentTool.execute("github_workflow", arguments,
+           agent_context: context,
+           workflow_client: &FakeClient.workflow_operation/3
+         ) do
+      %{"success" => true, "evidence" => evidence} -> {:ok, evidence}
+      _ -> {:error, :github_tool_call_failed}
+    end
+  end
 end

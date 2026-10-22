@@ -20,8 +20,9 @@ pueden pasar a `Blocked`. Mover una tarea de `Human Review` a `Ready` solicita c
 misma rama y PR. Antes de QA o Review, Symphony comprueba que el `head SHA` de la PR siga siendo el
 que aceptó Build y que el workspace esté limpio en ese SHA. Si una tarea bloqueada en QA o Review
 vuelve de `Blocked` a `Ready` con el head cambiado o sin PR, reinicia en `Build` y repite ambas
-fases. Un fallo determinista de estas comprobaciones previas queda registrado en la issue y el
-Project antes de iniciar al agente.
+fases. Si falla una comprobación previa, el agente del lane `diagnostic` lee el workpad e inspecciona
+el workspace y la PR antes de documentar el motivo y la recuperación en la issue y el Project.
+Symphony detecta el bloqueo y coordina esa sesión, pero no escribe en GitHub.
 
 El tablero usa el campo `Status` y las opciones canónicas de Symphony: `Backlog`, `Ready`, `Building`,
 `QA`, `Review`, `Human Review`, `Blocked`, `Done` y `Dropped`.

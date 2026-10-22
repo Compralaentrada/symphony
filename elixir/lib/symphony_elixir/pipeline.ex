@@ -65,7 +65,12 @@ defmodule SymphonyElixir.Pipeline do
       when phase in ["build", "qa", "review"] and is_map(result) do
     case normalize_phase_result(result, phase, report_locale(issue)) do
       {:ok, %{"outcome" => "blocked"} = normalized} ->
-        persist_blocked_phase(issue, task, phase, attempt, normalized)
+        if Tracker.agent_owned_writes?() do
+          _ = Store.interrupt_phase(issue.id, task["generation"], phase, attempt)
+          {:error, :diagnostic_handoff_required}
+        else
+          persist_blocked_phase(issue, task, phase, attempt, normalized)
+        end
 
       {:ok, _normalized} ->
         {:error, :invalid_system_blocker_report}
@@ -106,30 +111,8 @@ defmodule SymphonyElixir.Pipeline do
     reason = result["reason"]
     next = task |> Map.put("phase", phase) |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
     operations = report_ops(next, phase, attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
-    report = report_op(next, phase, attempt, result)
-
-    with :ok <- persist_agent_owned_system_block(issue, report, reason) do
-      commit(issue, next, phase, attempt, result, operations)
-    end
+    commit(issue, next, phase, attempt, result, operations)
   end
-
-  defp persist_agent_owned_system_block(issue, report, reason) do
-    if Tracker.agent_owned_writes?() do
-      Tracker.persist_system_block(
-        issue,
-        report.payload["marker"],
-        report.payload["body"],
-        report.payload["phase"],
-        reason
-      )
-      |> ignore_unavailable_system_block()
-    else
-      :ok
-    end
-  end
-
-  defp ignore_unavailable_system_block(:ignore), do: :ok
-  defp ignore_unavailable_system_block(result), do: result
 
   @spec execute_pending(Issue.t()) :: :ok | {:error, term()}
   def execute_pending(%Issue{} = issue) do
