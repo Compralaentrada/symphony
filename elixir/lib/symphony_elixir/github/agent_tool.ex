@@ -9,17 +9,17 @@ defmodule SymphonyElixir.GitHub.AgentTool do
   @allowed_methods ["GET"]
   @github_workflow_tool "github_workflow"
   @workflow_operations %{
-    "build" => ["claim", "workpad", "handoff", "create_follow_up_issue"],
-    "qa" => ["workpad", "handoff", "create_follow_up_issue"],
-    "review" => ["workpad", "handoff", "create_follow_up_issue"],
-    "diagnostic" => ["workpad", "handoff"],
-    "finalize" => ["workpad", "handoff"],
+    "build" => ["claim", "read_workpad", "workpad", "handoff", "create_follow_up_issue"],
+    "qa" => ["read_workpad", "workpad", "handoff", "create_follow_up_issue"],
+    "review" => ["read_workpad", "workpad", "handoff", "create_follow_up_issue"],
+    "diagnostic" => ["read_workpad", "workpad", "handoff"],
+    "finalize" => ["read_workpad", "workpad", "handoff"],
     "individual" => ["claim", "workpad", "handoff", "create_follow_up_issue", "release_claim"]
   }
   @github_api_description """
   Read GitHub data for the repository attached to this task using Symphony's configured auth.
   """
-  @github_workflow_description "Perform a GitHub write authorized for this task and phase."
+  @github_workflow_description "Read this task's saved workpad and phase reports, or perform a GitHub write authorized for this task and phase."
   @github_api_input_schema %{
     "type" => "object",
     "additionalProperties" => false,
@@ -139,6 +139,7 @@ defmodule SymphonyElixir.GitHub.AgentTool do
   defp allowed_operations(%{lane: lane} = context) do
     lane = to_string(lane)
     operations = Map.get(@workflow_operations, lane, [])
+    operations = if Map.get(context, :tracker_kind) == "github_projects", do: operations, else: List.delete(operations, "read_workpad")
     operations = if lane == "review" and Map.get(context, :merge_policy) == "auto", do: operations ++ ["request_merge"], else: operations
     if lane == "individual" and Map.get(context, :tracker_kind) != "github", do: List.delete(operations, "release_claim"), else: operations
   end

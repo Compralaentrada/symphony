@@ -241,6 +241,9 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         |> Enum.filter(&(&1["method"] == "turn/start"))
 
       assert length(turn_starts) == 1
+      prompt = get_in(hd(turn_starts), ["params", "input", Access.at(0), "text"])
+      assert prompt =~ "read_workpad"
+      refute prompt =~ "symphony/mt-build-foreign-turn"
     after
       File.rm_rf(test_root)
     end
@@ -381,15 +384,21 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         labels: ["backend"]
       }
 
+      host_checks = [
+        %{"name" => "echo required-check-secret", "status" => "passed", "evidence" => "host-evidence-secret"}
+      ]
+
       result =
         AgentRunner.run(issue, nil,
           phase: :qa,
           branch: "symphony/mt-qa-phase-report",
           sha: report["sha"],
-          required_checks: []
+          required_checks: ["echo required-check-secret"],
+          host_checks: host_checks
         )
 
       assert %{"outcome" => "passed", "findings" => []} = result
+      assert result["checks"] == host_checks
 
       turn_starts =
         trace_file
@@ -403,6 +412,9 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
 
       assert length(prompts) == 2
       assert hd(prompts) =~ "Each finding must include the exact keys id, reproduction, and criterion as non-empty strings."
+      assert hd(prompts) =~ "read_workpad"
+      refute hd(prompts) =~ "echo required-check-secret"
+      refute hd(prompts) =~ "host-evidence-secret"
       assert hd(prompts) =~ "Use the Humanizer guidance for report values"
       assert hd(prompts) =~ "Write report values in English"
       refute hd(prompts) =~ "- `code-review`"
@@ -515,8 +527,9 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       result =
         AgentRunner.run(issue, nil,
           phase: :review,
-          branch: "symphony/mt-phase-report",
-          sha: report["sha"]
+          branch: "symphony/branch-from-task",
+          sha: report["sha"],
+          prior_findings: [%{"id" => "finding-from-task", "reproduction" => "saved on the issue", "criterion" => "use task records"}]
         )
 
       assert %{"outcome" => "passed", "summary" => "Review passed"} = result
@@ -531,9 +544,14 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
 
       assert length(turn_starts) == 2
       [initial_turn, correction_turn] = turn_starts
-      assert get_in(initial_turn, ["params", "input", Access.at(0), "text"]) =~ "Do not invoke the repository's `code-review` skill or its Markdown report format"
+      review_prompt = get_in(initial_turn, ["params", "input", Access.at(0), "text"])
+      assert review_prompt =~ "Do not invoke the repository's `code-review` skill or its Markdown report format"
+      assert review_prompt =~ "read_workpad"
+      refute review_prompt =~ "finding-from-task"
+      refute review_prompt =~ "symphony/branch-from-task"
+      refute review_prompt =~ report["sha"]
 
-      assert get_in(initial_turn, ["params", "input", Access.at(0), "text"]) =~
+      assert review_prompt =~
                "The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result."
 
       assert get_in(correction_turn, ["params", "input", Access.at(0), "text"]) =~ "Do not include headings, bullets, Markdown, code fences, or text outside the JSON object."
@@ -655,6 +673,11 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         |> Enum.find(&(&1["method"] == "turn/start"))
 
       schema = get_in(turn_start, ["params", "outputSchema"])
+      prompt = get_in(turn_start, ["params", "input", Access.at(0), "text"])
+      assert prompt =~ "read_workpad"
+      refute prompt =~ "107"
+      refute prompt =~ "main"
+      refute prompt =~ report["sha"]
       assert Enum.sort(schema["required"]) == Enum.sort(["outcome", "summary", "sha", "next_step"])
       assert get_in(schema, ["properties", "outcome", "enum"]) == ["merged"]
     after

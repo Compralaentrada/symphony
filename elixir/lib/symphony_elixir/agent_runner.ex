@@ -299,11 +299,11 @@ defmodule SymphonyElixir.AgentRunner do
   defp report_language_name(:es), do: "Spanish"
   defp report_language_name(_locale), do: "English"
 
-  defp pipeline_phase_instructions(:build, opts) do
+  defp pipeline_phase_instructions(:build, _opts) do
     """
     Pipeline phase: Build.
-    Implement the issue, preserve the configured branch #{Keyword.get(opts, :branch)}, and push your work to origin.
-    Previously reported findings to address: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
+    Read the issue's workpad and current-generation phase reports with `github_workflow` operation `read_workpad` before editing. Use those task records for prior findings and decisions. Work on the branch already checked out for this task and push your work to origin.
+    Implement the issue using the accepted task context recorded on the issue. The host records the branch, base branch, required checks, and pushed SHA in the Build report for later phases.
     Before editing, create or update the persistent issue workpad with `github_workflow` operation `workpad` and record the plan.
     Before editing, call `github_workflow` with operation `claim` and stop if the claim is rejected.
     After pushing, call `github_workflow` with operation `handoff`, outcome `ready`, and your complete report; the host verifies the SHA, creates or updates the draft PR, posts your report, and moves the Project item to QA.
@@ -314,22 +314,19 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
-  defp pipeline_phase_instructions(:qa, opts) do
+  defp pipeline_phase_instructions(:qa, _opts) do
     """
-    Pipeline phase: independent QA. Review and test the accepted commit #{Keyword.get(opts, :sha)} on branch #{Keyword.get(opts, :branch)}.
-    Prior findings to recheck after Build: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
-    Required checks: #{Enum.join(Keyword.get(opts, :required_checks, []), ", ")}.
-    Host check evidence: #{Jason.encode!(Keyword.get(opts, :host_checks, []), pretty: true)}.
-    Symphony ran every configured check before this session on the accepted SHA. Do not modify files. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings.
+    Pipeline phase: independent QA. Read the issue's workpad and current-generation Build reports with `github_workflow` operation `read_workpad`; use the saved task records to identify the accepted commit, branch, required checks, and prior findings.
+    Symphony runs the configured host checks on the accepted SHA and records their evidence in your QA report. Do not modify files or invent check results. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings.
     Update the persistent workpad with QA evidence and findings using `github_workflow` operation `workpad`.
-    Call `github_workflow` with operation `handoff` and your QA report; include the host check evidence exactly as supplied. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
+    Call `github_workflow` with operation `handoff` and your QA report. Symphony adds the authoritative host-check evidence before saving the report and advances only when every required check passed. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end
 
-  defp pipeline_phase_instructions(:review, opts) do
+  defp pipeline_phase_instructions(:review, _opts) do
     """
-    Pipeline phase: autonomous code review. Inspect the diff and accepted commit #{Keyword.get(opts, :sha)} on branch #{Keyword.get(opts, :branch)}.
-    Prior finding IDs to resolve explicitly: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
+    Pipeline phase: autonomous code review. Read the issue's workpad and all current-generation QA reports with `github_workflow` operation `read_workpad` before reviewing. Use those task records to identify the accepted commit, branch, QA findings, and findings to resolve.
+    Use the QA report's host-check evidence for its recorded SHA; do not require a separate GitHub status context for Symphony's host-run check.
     Do not invoke the repository's `code-review` skill or its Markdown report format; perform this review directly under the pipeline's JSON contract.
     The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
     Do not modify files. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
@@ -339,10 +336,10 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
-  defp pipeline_phase_instructions(:finalize, opts) do
+  defp pipeline_phase_instructions(:finalize, _opts) do
     """
-    Pipeline phase: Finalize a human-merged pull request. Verify that PR #{Keyword.get(opts, :pr_number)} is merged into #{Keyword.get(opts, :base_branch)} at the accepted SHA #{Keyword.get(opts, :sha)}.
-    Do not modify files. Call `github_workflow` with operation `handoff`, outcome `merged`, and a short report. The host closes the issue and moves its Project item to Done only after verifying the remote merge.
+    Pipeline phase: Finalize a human-merged pull request. Read the issue's workpad and current-generation Build, QA, and Review reports with `github_workflow` operation `read_workpad`. Use the Review report's persisted pull request number, base branch, and accepted SHA to verify the merge with GitHub read tools.
+    Do not modify files. Call `github_workflow` with operation `handoff`, outcome `merged`, and a short report using the accepted SHA from the Review report. The host closes the issue and moves its Project item to Done only after verifying the remote merge.
     Finish with exactly one JSON object containing outcome `merged`, summary, sha, and next_step.
     """
   end

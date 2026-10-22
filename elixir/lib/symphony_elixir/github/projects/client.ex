@@ -404,6 +404,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp dispatch_agent_operation(issue, context, operation, arguments, tracker_settings, settings, request_fun, opts) do
     case operation do
       "claim" -> agent_claim(issue, tracker_settings, settings, request_fun)
+      "read_workpad" -> agent_read_workpad(issue, context, settings, request_fun)
       "workpad" -> agent_workpad(issue, arguments, settings, request_fun)
       "handoff" -> agent_handoff(issue, context, arguments, tracker_settings, settings, request_fun)
       "create_follow_up_issue" -> create_follow_up_issue(issue, context, arguments, tracker_settings, settings, opts)
@@ -939,6 +940,11 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp handoff_status("individual", %{"outcome" => outcome}, _settings) when outcome in ["ready", "blocked", "no_changes"], do: {:ok, nil}
   defp handoff_status(_lane, _report, _settings), do: {:error, :invalid_github_handoff}
 
+  defp normalize_agent_report(report, "build", context) do
+    task = context[:task] || %{}
+    Map.merge(report, Map.take(task, ["branch", "base_branch", "required_checks"]))
+  end
+
   defp normalize_agent_report(report, "qa", context) do
     checks = normalize_report_list(context[:host_checks])
     required = get_in(context, [:task, "required_checks"]) || []
@@ -969,10 +975,17 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp normalize_agent_report(report, "review", context) do
     resolutions = report["resolutions"] || []
-    prior_findings = get_in(context, [:task, "prior_findings"]) || []
+    task = context[:task] || %{}
+    prior_findings = task["prior_findings"] || []
     pending_findings = Enum.reject(prior_findings, &Findings.resolved?(&1["id"], resolutions))
     findings = Enum.uniq_by((report["findings"] || []) ++ pending_findings, & &1["id"])
-    report = Map.put(report, "findings", findings)
+
+    metadata =
+      task
+      |> Map.take(["branch", "base_branch", "pr_number"])
+      |> Map.merge(if(is_binary(task["current_sha"]), do: %{"sha" => task["current_sha"]}, else: %{}))
+
+    report = report |> Map.put("findings", findings) |> Map.merge(metadata)
 
     if report["outcome"] == "passed" and findings != [],
       do: Map.put(report, "outcome", "changes_requested"),
@@ -1139,6 +1152,103 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       end
     end
   end
+
+  defp agent_read_workpad(issue, context, settings, request_fun) do
+    with {:ok, issue_ref} <- issue_repository_and_number(issue),
+         {:ok, comments} <- list_issue_comments(issue_ref, settings, request_fun, nil, []),
+         {:ok, viewer_data} <- graphql(request_fun, @viewer_query, %{}, settings),
+         viewer when is_binary(viewer) <- get_in(viewer_data, ["viewer", "login"]),
+         comments = Enum.filter(comments, &(get_in(&1, ["author", "login"]) == viewer)),
+         phase_reports = current_generation_phase_reports(issue, context[:generation] || 0, comments),
+         :ok <- validate_review_qa_report(context, phase_reports) do
+      workpad = Enum.find(comments, &String.contains?(&1["body"] || "", "<!-- symphony:workpad:start -->"))
+
+      {:ok,
+       %{
+         "issue" => %{"id" => issue.id, "url" => issue.url},
+         "workpad" => if(workpad, do: task_comment(workpad)),
+         "phase_reports" => phase_reports
+       }}
+    else
+      nil -> {:error, :github_agent_identity_missing}
+      {:error, _reason} = error -> error
+      _ -> {:error, :github_agent_identity_missing}
+    end
+  end
+
+  defp current_generation_phase_reports(issue, generation, comments) do
+    Enum.reduce(~w(build qa review finalize), %{}, fn phase, reports ->
+      marker = phase_report_marker(issue, generation, phase)
+
+      phase_reports =
+        comments
+        |> Enum.filter(&phase_report_comment?(&1["body"] || "", marker))
+        |> Enum.map(&Map.put(task_comment(&1), "attempt", phase_report_attempt(&1["body"] || "", marker)))
+        |> Enum.sort_by(& &1["attempt"])
+
+      if phase_reports == [], do: reports, else: Map.put(reports, phase, phase_reports)
+    end)
+  end
+
+  defp validate_review_qa_report(%{lane: lane, task: task}, phase_reports)
+       when lane in [:review, "review"] and is_map(task) do
+    with %{"body" => body} <- latest_phase_report(phase_reports, "qa"),
+         {:ok, report} <- decode_phase_report_comment(body),
+         true <- report["outcome"] == "passed",
+         true <- report["sha"] == task["current_sha"],
+         true <- required_checks_passed?(task["required_checks"] || [], report["checks"] || []) do
+      :ok
+    else
+      _ -> {:error, :qa_evidence_unavailable}
+    end
+  end
+
+  defp validate_review_qa_report(%{lane: lane}, _phase_reports) when lane in [:review, "review"],
+    do: {:error, :qa_evidence_unavailable}
+
+  defp validate_review_qa_report(_context, _phase_reports), do: :ok
+
+  defp latest_phase_report(phase_reports, phase), do: phase_reports |> Map.get(phase, []) |> List.last()
+
+  defp phase_report_marker(issue, generation, phase),
+    do: "<!-- symphony:report:start:#{issue.id}:#{generation}:#{phase}"
+
+  defp phase_report_comment?(body, marker),
+    do: String.contains?(body, marker <> " -->") or String.contains?(body, marker <> ":")
+
+  defp phase_report_attempt(body, marker) do
+    case Regex.run(~r/#{Regex.escape(marker)}:(\d+) -->/, body) do
+      [_, attempt] -> String.to_integer(attempt)
+      _ -> 0
+    end
+  end
+
+  defp decode_phase_report_comment(body) do
+    json =
+      body
+      |> String.split("\n")
+      |> Enum.drop_while(&(String.trim(&1) != "{"))
+      |> Enum.take_while(&(String.trim(&1) != "<!-- symphony:report:end -->"))
+      |> Enum.join("\n")
+      |> String.trim()
+
+    if json == "", do: {:error, :invalid_phase_report}, else: Jason.decode(json)
+  end
+
+  defp list_issue_comments(issue_ref, settings, request_fun, cursor, comments) do
+    with {:ok, data} <- graphql(request_fun, @comments_query, Map.put(issue_ref, "after", cursor), settings) do
+      connection = get_in(data, ["repository", "issue", "comments"]) || %{}
+      nodes = connection["nodes"] || []
+      page_info = connection["pageInfo"] || %{}
+      comments = comments ++ nodes
+
+      if page_info["hasNextPage"],
+        do: list_issue_comments(issue_ref, settings, request_fun, page_info["endCursor"], comments),
+        else: {:ok, comments}
+    end
+  end
+
+  defp task_comment(comment), do: %{"id" => comment["id"], "url" => comment["url"], "body" => comment["body"]}
 
   defp agent_workpad(issue, arguments, settings, request_fun) do
     body = Map.get(arguments, "body")
@@ -1316,7 +1426,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp agent_report_marker(issue, context, phase) do
-    "<!-- symphony:report:start:#{issue.id}:#{context[:generation] || 0}:#{phase} -->"
+    phase_report_marker(issue, context[:generation] || 0, phase) <> ":#{context[:attempt] || 0} -->"
   end
 
   defp comment_evidence(comment, marker),

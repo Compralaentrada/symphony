@@ -1230,12 +1230,7 @@ defmodule SymphonyElixir.Orchestrator do
         pipeline_task: task,
         generation: task["generation"],
         phase_attempt: phase_attempt,
-        pr_number: task["pr_number"],
-        branch: task["branch"],
-        base_branch: task["base_branch"],
-        sha: task["current_sha"],
-        prior_findings: task["prior_findings"] || [],
-        required_checks: task["required_checks"]
+        prior_findings: task["prior_findings"] || []
       )
 
     send(recipient, {:pipeline_phase_result, issue.id, task["generation"], phase, phase_attempt, result})

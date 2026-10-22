@@ -9,10 +9,11 @@ defmodule SymphonyElixir.GitHubAgentToolPermissionsTest do
     review = AgentTool.tool_specs(agent_context(:review, "auto"))
     individual = AgentTool.tool_specs(agent_context(:individual, "auto"))
 
-    assert workflow_operations(build) == ["claim", "workpad", "handoff", "create_follow_up_issue"]
-    assert workflow_operations(qa) == ["workpad", "handoff", "create_follow_up_issue"]
-    assert workflow_operations(review) == ["workpad", "handoff", "create_follow_up_issue", "request_merge"]
+    assert workflow_operations(build) == ["claim", "read_workpad", "workpad", "handoff", "create_follow_up_issue"]
+    assert workflow_operations(qa) == ["read_workpad", "workpad", "handoff", "create_follow_up_issue"]
+    assert workflow_operations(review) == ["read_workpad", "workpad", "handoff", "create_follow_up_issue", "request_merge"]
     refute "request_merge" in workflow_operations(individual)
+    refute "read_workpad" in workflow_operations(individual)
   end
 
   test "GitHub reads are bound to the task repository and raw writes are unavailable" do
@@ -149,7 +150,8 @@ defmodule SymphonyElixir.GitHubAgentToolPermissionsTest do
         native_ref: %{repository: "octo/app", base_branch: "main"}
       },
       lane: lane,
-      merge_policy: merge_policy
+      merge_policy: merge_policy,
+      tracker_kind: "github_projects"
     }
   end
 end

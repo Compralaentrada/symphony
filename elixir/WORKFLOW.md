@@ -74,9 +74,9 @@ The configured Project status is the source of dispatch:
 
 - Symphony reads and reconciles Project state. Each phase agent owns the GitHub writes for its lane through authorized host tools and preserves newer human decisions.
 - Ready: Symphony dispatches Build or resumes a human-requested correction on the same branch and PR.
-- Building: Build owns the issue claim, branch push, draft PR, report, and transition to QA.
-- QA: the QA agent reviews the current SHA, runs every `required_checks` command in the task workspace, records evidence, and advances or returns the task. Missing or failed host checks cannot pass QA.
-- Review: the Review agent examines the QA-accepted SHA, records findings, and either requests changes or prepares the PR for human review.
+- Building: Build owns the issue claim, branch push, draft PR, report, and transition to QA. Its issue report records the configured branch and pushed SHA for later phases.
+- QA: the QA agent independently reviews the current SHA. Symphony runs every `required_checks` command in the task workspace and attaches command evidence to the QA report before handoff. Missing or failed host checks cannot pass QA.
+- Review: the Review agent reads all current-generation QA reports from the issue, verifies the latest report's SHA and required-check evidence, and uses earlier reports to carry forward findings before preparing the PR for human review or requesting changes. Symphony's host-run checks are evidenced in the report, so Review does not require a separate GitHub status context.
 - Human Review: the PR is ready for a person; Symphony waits for a merge or a move back to Ready.
 - Blocked: the phase agent records the reason in the issue and moves the Project item to Blocked. After it is resolved, a human moves the issue to Ready.
 - Done: the PR merge into the configured base branch has been confirmed.
@@ -112,6 +112,7 @@ Before planning, inspect the relevant skills under `.agents/skills` and `.codex/
 
 - Read the issue, its comments, linked PRs, and review feedback before editing.
 - Keep one persistent issue comment marked `## Codex Workpad` as the source of truth for plan, progress, acceptance criteria, validation, and handoff notes. Create and update it with `github_workflow` operation `workpad`; do not post separate progress summaries.
+- Persist each phase result as an issue comment before handoff; keep one comment per attempt so later reports cannot erase earlier findings. Build reports persist the branch, base branch, and required checks; QA reports persist the accepted SHA, host-check evidence, and findings; Review reports persist the PR number, base branch, accepted SHA, findings, and resolutions. Later phases must use `github_workflow` operation `read_workpad` to read the workpad and all current-generation phase reports. Never pass data from one phase to another through prompts.
 - Reproduce the issue signal before changing code. Plan the smallest change that fully meets its acceptance criteria.
 - Follow any issue-provided Validation, Test Plan, or Testing section.
 - For user-facing changes, include an end-to-end walkthrough. For application behavior changes, record the launch path, interaction, and expected result.
