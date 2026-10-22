@@ -3,6 +3,11 @@ defmodule SymphonyElixir.PipelineAgentLeaseTest do
 
   alias SymphonyElixir.Pipeline.Store
 
+  test "the test runtime stores pipeline state in a temporary database" do
+    assert path = Store.database_path()
+    assert String.starts_with?(path, System.tmp_dir!())
+  end
+
   test "a superseded attempt cannot keep the GitHub write lease" do
     previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
     root = Path.join(System.tmp_dir!(), "symphony-agent-lease-#{System.unique_integer([:positive])}")
