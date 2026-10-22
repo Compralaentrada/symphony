@@ -42,9 +42,11 @@ permissions are restricted by repository, issue, lane, lease, and operation.
 If a claimed issue moves to a configured terminal state, Symphony stops the active agent and cleans
 up its workspace. In GitHub Projects mode, closing the linked GitHub Issue is terminal; Project
 items in Done or Blocked keep their workspace so moving them back to Ready can resume prior work.
-When resuming a Blocked item from Review, Symphony compares the PR head with the saved SHA. A
-changed head clears the accepted SHA and restarts at Build to rerun QA and Review. If it cannot read
-the PR head, Symphony does not dispatch Review.
+Before QA or Review starts, Symphony compares the remote PR head and clean workspace with the
+Build-accepted SHA. A missing or changed PR head, a mismatched workspace, or uncommitted workspace
+changes creates a blocker report before the agent starts. When a Blocked item from QA or Review is
+moved to Ready, a changed or missing PR head clears the accepted SHA and restarts at Build to rerun
+QA and Review. Transient tracker read errors keep the existing retry behavior.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. For the durable
@@ -177,7 +179,11 @@ Notes:
   create the repository at `.`. It receives `SYMPHONY_REPOSITORY`, `SYMPHONY_BASE_BRANCH`,
   `SYMPHONY_ISSUE_ID`, and `SYMPHONY_ISSUE_IDENTIFIER`; Symphony then creates the issue branch from
   the configured base branch. The profile command replaces `hooks.after_create` for that workspace.
-  Requeues reuse an existing workspace without rerunning either command.
+  Requeues reuse an existing workspace without rerunning either command. When Build resumes without
+  an accepted SHA, Symphony fetches the issue branch and fast-forwards it when possible. If local and
+  remote work diverged, the branch is missing from both, or local changes prevent the update, Build
+  records the blocked report and Project status without resetting the workspace. QA and Review check
+  that the PR head and clean workspace still match the accepted Build SHA before starting the agent.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or

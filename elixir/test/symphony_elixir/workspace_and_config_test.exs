@@ -40,7 +40,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "Projects workspace checks out its configured base branch and retains requeued work" do
+  test "Projects workspace refreshes on request and preserves diverged local work" do
     test_root = Path.join(System.tmp_dir!(), "symphony-project-workspace-#{System.unique_integer([:positive])}")
     source_repo = Path.join(test_root, "source")
     workspace_root = Path.join(test_root, "workspaces")
@@ -65,8 +65,98 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert File.read!(Path.join(workspace, "BASE")) == "release"
 
       File.write!(Path.join(workspace, "agent-work.txt"), "preserve me")
+      git!(workspace, ["push", "--set-upstream", "origin", issue.branch_name])
+
+      external = Path.join(test_root, "external")
+      git!(test_root, ["clone", "--quiet", "--branch", issue.branch_name, source_repo, external])
+      git!(external, ["config", "user.name", "Test User"])
+      git!(external, ["config", "user.email", "test@example.com"])
+      File.write!(Path.join(external, "SWITCH_COLLISION"), "tracked in PR")
+      git!(external, ["add", "SWITCH_COLLISION"])
+      git!(external, ["commit", "-m", "add switch collision file"])
+      git!(external, ["push", "origin", issue.branch_name])
+
+      File.write!(Path.join(workspace, "SWITCH_COLLISION"), "preserve untracked file")
+      git!(workspace, ["switch", "release"])
+      git!(workspace, ["branch", "-D", issue.branch_name])
       assert {:ok, ^workspace} = Workspace.create_for_issue(issue)
+      assert git!(workspace, ["branch", "--show-current"]) == "release"
+
+      assert {:error, :project_branch_dirty} =
+               Workspace.create_for_issue(issue, nil, refresh_project_branch: true)
+
+      assert git!(workspace, ["branch", "--show-current"]) == "release"
+      assert File.read!(Path.join(workspace, "SWITCH_COLLISION")) == "preserve untracked file"
+      File.rm!(Path.join(workspace, "SWITCH_COLLISION"))
+      assert {:ok, ^workspace} = Workspace.create_for_issue(issue, nil, refresh_project_branch: true)
+      assert git!(workspace, ["branch", "--show-current"]) == issue.branch_name
+
+      File.write!(Path.join(external, "EXTERNAL"), "new PR head")
+      git!(external, ["add", "EXTERNAL"])
+      git!(external, ["commit", "-m", "external PR update"])
+      external_sha = git!(external, ["rev-parse", "HEAD"])
+      git!(external, ["push", "origin", issue.branch_name])
+
+      assert {:ok, ^workspace} = Workspace.create_for_issue(issue)
+      refute File.exists?(Path.join(workspace, "EXTERNAL"))
+
+      agent_work = Path.join(workspace, "agent-work.txt")
+      parked_agent_work = Path.join(test_root, "agent-work.txt")
+      File.rename!(agent_work, parked_agent_work)
+
+      index_lock = Path.join([workspace, ".git", "index.lock"])
+      File.write!(index_lock, "locked")
+
+      assert {:error, {:workspace_hook_failed, "before_run", 1, output}} =
+               Workspace.create_for_issue(issue, nil, refresh_project_branch: true)
+
+      assert output =~ "index.lock"
+      File.rm!(index_lock)
+      File.rename!(parked_agent_work, agent_work)
+
+      assert {:ok, ^workspace} = Workspace.create_for_issue(issue, nil, refresh_project_branch: true)
+      assert git!(workspace, ["rev-parse", "HEAD"]) == external_sha
+      assert File.read!(Path.join(workspace, "EXTERNAL")) == "new PR head"
       assert File.read!(Path.join(workspace, "agent-work.txt")) == "preserve me"
+
+      File.write!(Path.join(external, "BASE"), "updated by PR")
+      git!(external, ["commit", "-am", "update base file"])
+      git!(external, ["push", "origin", issue.branch_name])
+      File.write!(Path.join(workspace, "BASE"), "uncommitted local edit")
+
+      assert {:error, :project_branch_dirty} =
+               Workspace.create_for_issue(issue, nil, refresh_project_branch: true)
+
+      assert File.read!(Path.join(workspace, "BASE")) == "uncommitted local edit"
+      git!(workspace, ["checkout", "--", "BASE"])
+      assert {:ok, ^workspace} = Workspace.create_for_issue(issue, nil, refresh_project_branch: true)
+      assert File.read!(Path.join(workspace, "BASE")) == "updated by PR"
+
+      File.write!(Path.join(workspace, "LOCAL"), "unpublished local work")
+      git!(workspace, ["add", "LOCAL"])
+      git!(workspace, ["commit", "-m", "local progress"])
+      local_sha = git!(workspace, ["rev-parse", "HEAD"])
+      File.write!(Path.join(external, "SECOND-EXTERNAL"), "diverged PR head")
+      git!(external, ["add", "SECOND-EXTERNAL"])
+      git!(external, ["commit", "-m", "second external PR update"])
+      git!(external, ["push", "origin", issue.branch_name])
+
+      assert {:ok, ^workspace} = Workspace.create_for_issue(issue)
+
+      assert {:error, :project_branch_diverged} =
+               Workspace.create_for_issue(issue, nil, refresh_project_branch: true)
+
+      assert git!(workspace, ["rev-parse", "HEAD"]) == local_sha
+      assert File.read!(Path.join(workspace, "LOCAL")) == "unpublished local work"
+
+      git!(workspace, ["switch", "release"])
+      git!(workspace, ["branch", "-D", issue.branch_name])
+      git!(external, ["push", "origin", "--delete", issue.branch_name])
+
+      assert {:error, :project_branch_missing} =
+               Workspace.create_for_issue(issue, nil, refresh_project_branch: true)
+
+      refute Enum.member?(git!(workspace, ["branch", "--list"]) |> String.split("\n"), issue.branch_name)
     after
       File.rm_rf(test_root)
     end

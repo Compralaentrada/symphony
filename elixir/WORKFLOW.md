@@ -78,15 +78,15 @@ The configured Project status is the source of dispatch:
 - QA: the QA agent independently reviews the current SHA. Symphony runs every `required_checks` command in the task workspace and attaches command evidence to the QA report before handoff. Missing or failed host checks cannot pass QA.
 - Review: the Review agent reads all current-generation QA reports from the issue, verifies the latest report's SHA and required-check evidence, and uses earlier reports to carry forward findings before preparing the PR for human review or requesting changes. Symphony's host-run checks are evidenced in the report, so Review does not require a separate GitHub status context.
 - Human Review: the PR is ready for a person; Symphony waits for a merge or a move back to Ready.
-- Blocked: the phase agent records the reason in the issue and moves the Project item to Blocked. After it is resolved, a human moves the issue to Ready. If Review was blocked and the PR head SHA changed, Symphony restarts at Build and repeats QA and Review.
+- Blocked: the phase agent records its reason through `github_workflow`; a deterministic host preflight blocker is recorded by Symphony before the agent starts. After it is resolved, a human moves the issue to Ready. If QA or Review was blocked and the PR head changed or is missing, Symphony restarts at Build and repeats QA and Review.
 - Done: the PR merge into the configured base branch has been confirmed.
 - Closed GitHub issue: terminal; stop.
 - Backlog: not dispatched.
 - Dropped: terminal work without a merge. Include a human-authored `Drop reason: <reason>` line in the issue body; after `no_changes`, this confirms the decision to discard the work.
 
-The issue identifier starts with the target repository in the form owner/repository#number. Work only in that repository. Do not assume a specific organization, repository, or default branch. The runtime has selected a repository profile and checked out the task branch from that profile's base branch.
+The issue identifier starts with the target repository in the form owner/repository#number. Work only in that repository. Do not assume a specific organization, repository, or default branch. The runtime has selected a repository profile and checked out the task branch from that profile's base branch. When Build resumes without an accepted SHA, a reused workspace fetches that task branch and fast-forwards when possible; if local and remote work diverged, both copies of the branch are missing, or local changes prevent the update, Build records its blocked report and Project status with recovery instructions and preserves the workspace. Before QA and Review, Symphony verifies that the PR head and clean workspace match the Build SHA. A deterministic preflight failure is the narrow exception to agent-owned GitHub writes: Symphony records its blocker report and status before the phase agent starts. Transient tracker read failures retry without creating a blocker.
 
-Use `github_workflow` for GitHub writes. `github_api` is read-only and scoped to the task repository. Do not use `gh` or shell commands to write issues, Project items, or pull requests. Git push is allowed for the Build handoff. Never copy tracker tokens into the workpad or command output.
+Use `github_workflow` for GitHub writes made by the agent. Before an agent session starts, Symphony persists its own generated blocker report and status through the tracker adapter. `github_api` is read-only and scoped to the task repository. Do not use `gh` or shell commands to write issues, Project items, or pull requests. Git push is allowed for the Build handoff. Never copy tracker tokens into the workpad or command output.
 
 ## Skills
 
@@ -145,7 +145,7 @@ Before planning, inspect the relevant skills under `.agents/skills` and `.codex/
 2. Create or update a draft PR when the task produces code that needs review. Link it to the issue and include `Fixes #<issue-number>` when merging should close that issue.
 3. Do not merge or approve the PR.
 4. Update the persistent workpad with the final summary, validation evidence, and PR link.
-5. Stop after the handoff. On successful completion, the current tracker moves Building to Done. If a reviewer requests changes, a human moves the open issue back to Ready; Symphony resumes the same workspace and branch.
+5. Stop after the handoff. On successful completion, the current tracker moves Building to Done. If a reviewer requests changes, a human moves the open issue back to Ready; Symphony resumes the same workspace and branch. If the saved SHA was invalidated, Build syncs the issue branch before its next run; if the workspace cannot be reconciled automatically, follow its blocked report, resolve the branch, and move the issue back to Ready.
 
 ## Workpad template
 

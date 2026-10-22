@@ -9,6 +9,7 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
+  @workspace_refresh_blockers [:project_branch_diverged, :project_branch_missing, :project_branch_dirty]
 
   @doc false
   @spec continue_with_issue_for_test(Issue.t(), ([String.t()] -> term())) ::
@@ -18,7 +19,7 @@ defmodule SymphonyElixir.AgentRunner do
     continue_with_issue?(issue, issue_state_fetcher)
   end
 
-  @spec run(map(), pid() | nil, keyword()) :: :ok | map() | no_return()
+  @spec run(map(), pid() | nil, keyword()) :: :ok | map() | {:system_blocker, map()} | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
     worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
@@ -40,13 +41,22 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
+    refresh_project_branch? = refresh_project_branch?(opts)
+    task = Keyword.get(opts, :pipeline_task, %{})
+    has_pull_request? = is_map(task) and not is_nil(Map.get(task, "pr_number"))
 
-    case Workspace.create_for_issue(issue, worker_host) do
+    workspace_opts = [
+      require_existing_project_branch: has_pull_request?,
+      refresh_project_branch: refresh_project_branch?
+    ]
+
+    case Workspace.create_for_issue(issue, worker_host, workspace_opts) do
       {:ok, workspace} ->
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
         try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host),
+               :ok <- verify_pipeline_workspace_sha(workspace, issue, opts, worker_host) do
             run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
           end
         after
@@ -54,9 +64,188 @@ defmodule SymphonyElixir.AgentRunner do
         end
 
       {:error, reason} ->
+        workspace_creation_error(reason, issue, opts, has_pull_request?, refresh_project_branch?)
+    end
+  end
+
+  defp workspace_creation_error(reason, issue, opts, has_pull_request?, refresh_project_branch?) do
+    is_missing_pr_branch? = has_pull_request? and phase_with_pr?(opts) and reason == :project_branch_missing
+    refresh_blocked? = refresh_project_branch? and reason in @workspace_refresh_blockers
+
+    if refresh_blocked? or is_missing_pr_branch?,
+      do: {:phase_result, {:system_blocker, blocked_workspace_report(reason, issue)}},
+      else: {:error, reason}
+  end
+
+  defp verify_pipeline_workspace_sha(workspace, issue, opts, worker_host) do
+    case {Keyword.get(opts, :phase), Keyword.get(opts, :pipeline_task)} do
+      {phase, task} when phase in [:qa, :review] and is_map(task) ->
+        case Map.get(task, "current_sha") do
+          sha when is_binary(sha) and sha != "" ->
+            verify_pipeline_workspace_sha_at_sha(workspace, issue, sha, worker_host)
+
+          _ ->
+            {:phase_result, {:system_blocker, blocked_workspace_report(:project_branch_sha_missing, issue)}}
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp verify_pipeline_workspace_sha_at_sha(workspace, issue, sha, worker_host) do
+    case verify_pipeline_pr_sha(issue, sha) do
+      :ok -> verify_accepted_workspace_sha(workspace, issue, sha, worker_host)
+      result -> result
+    end
+  end
+
+  @doc false
+  @spec verify_pipeline_workspace_sha_for_test(term(), Issue.t(), keyword(), worker_host()) ::
+          :ok | {:phase_result, {:system_blocker, map()}} | {:error, term()}
+  def verify_pipeline_workspace_sha_for_test(workspace, issue, opts, worker_host),
+    do: verify_pipeline_workspace_sha(workspace, issue, opts, worker_host)
+
+  defp verify_pipeline_pr_sha(issue, accepted_sha) do
+    if Pipeline.enabled?(), do: read_pipeline_pr_sha(issue, accepted_sha), else: :ok
+  end
+
+  defp read_pipeline_pr_sha(issue, accepted_sha) do
+    case Tracker.pull_request(issue) do
+      {:ok, %{sha: ^accepted_sha}} ->
+        :ok
+
+      {:ok, %{sha: observed_sha}} when is_binary(observed_sha) ->
+        pipeline_sha_blocker(:project_pr_head_changed, accepted_sha, observed_sha, issue)
+
+      {:ok, _pr} ->
+        pipeline_sha_blocker(:project_pr_head_unavailable, accepted_sha, nil, issue)
+
+      :ignore ->
+        pipeline_sha_blocker(:project_pr_head_unavailable, accepted_sha, nil, issue)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp pipeline_sha_blocker(reason, expected_sha, observed_sha, issue) do
+    report = blocked_workspace_report({reason, expected_sha, observed_sha}, issue)
+    {:phase_result, {:system_blocker, report}}
+  end
+
+  defp verify_accepted_workspace_sha(workspace, issue, sha, worker_host) do
+    case Workspace.run_required_check(workspace, "true", sha, issue, worker_host) do
+      {:ok, _evidence} ->
+        :ok
+
+      {:error, {:workspace_sha_mismatch, expected_sha, observed_sha}} ->
+        workspace_sha_blocker(:project_branch_sha_mismatch, expected_sha, observed_sha, issue)
+
+      {:error, {:workspace_dirty, expected_sha, observed_sha}} ->
+        workspace_sha_blocker(:project_branch_sha_workspace_dirty, expected_sha, observed_sha, issue)
+
+      {:error, reason} ->
         {:error, reason}
     end
   end
+
+  defp workspace_sha_blocker(reason, expected_sha, observed_sha, issue) do
+    report = blocked_workspace_report({reason, expected_sha, observed_sha}, issue)
+    {:phase_result, {:system_blocker, report}}
+  end
+
+  defp blocked_workspace_report({reason, expected_sha, observed_sha}, issue)
+       when reason in [
+              :project_branch_sha_mismatch,
+              :project_branch_sha_workspace_dirty,
+              :project_pr_head_changed,
+              :project_pr_head_unavailable
+            ] do
+    locale = Pipeline.report_locale(issue)
+    {summary, next_step} = blocked_workspace_report_content(reason, locale)
+    observed_sha = observed_sha || if(locale == :es, do: "desconocido", else: "unavailable")
+
+    evidence =
+      if locale == :es,
+        do: "SHA esperado: #{expected_sha}; SHA observado: #{observed_sha}.",
+        else: "Expected SHA: #{expected_sha}; observed SHA: #{observed_sha}."
+
+    summary = summary <> " " <> evidence
+
+    %{
+      "outcome" => "blocked",
+      "summary" => summary,
+      "reason" => summary,
+      "next_step" => next_step
+    }
+  end
+
+  defp blocked_workspace_report(reason, issue) when is_atom(reason) do
+    {summary, next_step} = blocked_workspace_report_content(reason, Pipeline.report_locale(issue))
+
+    %{
+      "outcome" => "blocked",
+      "summary" => summary,
+      "reason" => summary,
+      "next_step" => next_step
+    }
+  end
+
+  defp blocked_workspace_report_content(:project_branch_diverged, :es),
+    do: {"La rama guardada del workspace diverge de la rama actualizada de la PR.", "Conserva los commits locales, reconcilíalos con la rama de la PR, sube el resultado y mueve la issue a Ready."}
+
+  defp blocked_workspace_report_content(:project_branch_diverged, _locale),
+    do: {"The saved workspace branch diverges from the updated PR branch.", "Preserve the local commits, reconcile them with the PR branch, push the result, then move the issue to Ready."}
+
+  defp blocked_workspace_report_content(:project_branch_missing, :es),
+    do: {"Falta la rama guardada de la PR, tanto en local como en remoto.", "Restaura la rama de la PR o actualiza la PR y mueve la issue a Ready."}
+
+  defp blocked_workspace_report_content(:project_branch_missing, _locale),
+    do: {"The saved PR branch is missing locally and remotely.", "Restore the PR branch or update the PR, then move the issue to Ready."}
+
+  defp blocked_workspace_report_content(:project_branch_dirty, :es),
+    do: {"Hay cambios locales que impiden actualizar la rama de la PR.", "Conserva o confirma los cambios locales y mueve la issue a Ready para reintentarlo."}
+
+  defp blocked_workspace_report_content(:project_branch_dirty, _locale),
+    do: {"Local workspace changes prevent updating the PR branch.", "Preserve or commit the local changes, then move the issue to Ready to retry."}
+
+  defp blocked_workspace_report_content(:project_branch_sha_mismatch, :es),
+    do: {"El workspace no coincide con el SHA aceptado por Build.", "Restaura el workspace en el SHA aceptado y mueve la issue a Ready para reintentar QA o Review."}
+
+  defp blocked_workspace_report_content(:project_branch_sha_mismatch, _locale),
+    do: {"The workspace does not match the SHA accepted by Build.", "Restore the workspace at the accepted SHA, then move the issue to Ready to retry QA or Review."}
+
+  defp blocked_workspace_report_content(:project_branch_sha_workspace_dirty, :es),
+    do: {"El workspace tiene cambios locales sin confirmar.", "Conserva o limpia los cambios locales y mueve la issue a Ready para repetir Build, QA y Review."}
+
+  defp blocked_workspace_report_content(:project_branch_sha_workspace_dirty, _locale),
+    do: {"The workspace contains uncommitted local changes.", "Preserve or clean the local changes, then move the issue to Ready to rerun Build, QA, and Review."}
+
+  defp blocked_workspace_report_content(:project_branch_sha_missing, :es),
+    do: {"QA/Review no tiene el SHA aceptado por Build para validar el workspace.", "Mueve la issue a Ready para repetir Build con la rama actual de la PR antes de QA y Review."}
+
+  defp blocked_workspace_report_content(:project_branch_sha_missing, _locale),
+    do: {"QA/Review has no Build-accepted SHA to validate the workspace.", "Move the issue to Ready to rerun Build against the current PR branch before QA and Review."}
+
+  defp blocked_workspace_report_content(:project_pr_head_changed, :es),
+    do: {"La cabeza de la PR cambió después de que Build aceptara el SHA.", "Mueve la issue de Blocked a Ready para repetir Build, QA y Review sobre la cabeza actual de la PR."}
+
+  defp blocked_workspace_report_content(:project_pr_head_changed, _locale),
+    do: {"The PR head changed after Build accepted its SHA.", "Move the issue from Blocked to Ready to rerun Build, QA, and Review against the current PR head."}
+
+  defp blocked_workspace_report_content(:project_pr_head_unavailable, :es),
+    do: {"Symphony no pudo verificar la cabeza de la PR antes de QA/Review.", "Restaura o crea la PR y mueve la issue de Blocked a Ready para repetir Build, QA y Review."}
+
+  defp blocked_workspace_report_content(:project_pr_head_unavailable, _locale),
+    do: {"Symphony could not verify the PR head before QA/Review.", "Restore or create the PR, then move the issue from Blocked to Ready to rerun Build, QA, and Review."}
+
+  defp refresh_project_branch?(opts) do
+    task = Keyword.get(opts, :pipeline_task, %{})
+    Keyword.get(opts, :phase) == :build and is_map(task) and is_nil(Map.get(task, "current_sha"))
+  end
+
+  defp phase_with_pr?(opts), do: Keyword.get(opts, :phase) in [:build, :qa, :review]
 
   defp codex_message_handler(recipient, issue) do
     fn message ->
@@ -153,12 +342,20 @@ defmodule SymphonyElixir.AgentRunner do
           "evidence" => "Symphony ran the configured check at SHA #{current_sha}; host exit status #{status}."
         }
 
-      {:error, :workspace_mismatch} ->
+      {:error, {:workspace_sha_mismatch, expected_sha, observed_sha}} ->
         %{
           "name" => command,
           "status" => "failed",
           "finding_id" => "workspace-sha-mismatch",
-          "evidence" => "Symphony did not run the check because workspace HEAD or files differed from accepted SHA #{current_sha}."
+          "evidence" => "Symphony did not run the check because workspace HEAD was #{observed_sha || "unavailable"}, not accepted SHA #{expected_sha}."
+        }
+
+      {:error, {:workspace_dirty, expected_sha, observed_sha}} ->
+        %{
+          "name" => command,
+          "status" => "failed",
+          "finding_id" => "workspace-dirty",
+          "evidence" => "Symphony did not run the check because the workspace had local changes at SHA #{observed_sha || "unavailable"}; accepted SHA was #{expected_sha}."
         }
 
       {:error, :check_unavailable} ->

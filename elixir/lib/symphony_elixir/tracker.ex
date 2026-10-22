@@ -105,6 +105,24 @@ defmodule SymphonyElixir.Tracker do
   def publish_phase_report(%Issue{} = issue, marker, body, phase),
     do: issue_lifecycle_callback(:publish_phase_report, [issue, marker, body, phase])
 
+  @doc "Persists a trusted pre-agent blocker for GitHub Projects, where no agent can call the handoff tool."
+  @spec persist_system_block(Issue.t(), String.t(), String.t(), String.t(), String.t()) ::
+          :ok | :ignore | {:error, term()}
+  def persist_system_block(%Issue{} = issue, marker, body, phase, reason)
+      when is_binary(marker) and is_binary(body) and is_binary(phase) and is_binary(reason) do
+    case Config.settings!().tracker.kind do
+      "github_projects" ->
+        adapter = adapter()
+
+        with :ok <- adapter.publish_phase_report(issue, marker, body, phase) do
+          adapter.set_pipeline_status(issue, :blocked, reason)
+        end
+
+      _ ->
+        :ignore
+    end
+  end
+
   @doc """
   Captures the selected adapter and effective tracker settings for one
   app-server session so tool advertisement and execution cannot drift across a

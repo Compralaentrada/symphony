@@ -35,6 +35,151 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     end
   end
 
+  test "system-generated Build blockers persist without agent handoff evidence" do
+    issue = issue("octo/app#40", 40)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+
+    assert {:ok, task, "build"} = Pipeline.prepare(issue)
+    assert {:ok, task, attempt} = Pipeline.begin_phase(issue, task, "build")
+
+    result = %{
+      "outcome" => "blocked",
+      "summary" => "The saved workspace branch diverges from the updated PR branch.",
+      "reason" => "The saved workspace branch diverges from the updated PR branch.",
+      "next_step" => "Reconcile the branch and move the issue to Ready."
+    }
+
+    assert :ok = Pipeline.finish_phase(issue, task, "build", attempt, {:system_blocker, result})
+    assert project_state(table, issue.id) == "Blocked"
+    assert {:ok, %{"status" => "blocked", "blocked_reason" => reason}} = Store.get_task(issue.id)
+    assert reason == result["reason"]
+    report = table |> lookup({:reports, issue.id}) |> Map.values() |> hd()
+    assert report =~ result["reason"]
+    assert report =~ result["next_step"]
+  end
+
+  test "system-generated blockers skip remote persistence for other trackers" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    assert :ignore =
+             Tracker.persist_system_block(
+               issue("octo/app#41", 41),
+               "marker",
+               "blocked report",
+               "build",
+               "branch missing"
+             )
+  end
+
+  test "system-generated QA blockers persist without agent handoff evidence" do
+    issue = issue("octo/app#42", 42)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+
+    assert {:ok, task, "build"} = Pipeline.prepare(issue)
+
+    task =
+      Map.merge(task, %{
+        "phase" => "qa",
+        "status" => "qa",
+        "current_sha" => String.duplicate("a", 40)
+      })
+
+    assert :ok = Store.save_task(task)
+    assert {:ok, task, attempt} = Pipeline.begin_phase(issue, task, "qa")
+
+    result = %{
+      "outcome" => "blocked",
+      "summary" => "The workspace is not at the accepted Build SHA.",
+      "reason" => "The workspace is not at the accepted Build SHA.",
+      "next_step" => "Restore the accepted workspace and move the issue to Ready."
+    }
+
+    assert :ok = Pipeline.finish_phase(issue, task, "qa", attempt, {:system_blocker, result})
+    assert project_state(table, issue.id) == "Blocked"
+    assert {:ok, %{"status" => "blocked", "blocked_reason" => reason}} = Store.get_task(issue.id)
+    assert reason == result["reason"]
+    report = table |> lookup({:reports, issue.id}) |> Map.values() |> hd()
+    assert report =~ result["reason"]
+  end
+
+  test "Review blocks when the PR head advances after the Build SHA was accepted" do
+    issue = issue("octo/app#43", 43)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    accepted_sha = String.duplicate("a", 40)
+    observed_sha = String.duplicate("b", 40)
+    :ets.insert(table, {{:pull_request, issue.id}, %{sha: observed_sha}})
+
+    assert {:phase_result, {:system_blocker, report}} =
+             AgentRunner.verify_pipeline_workspace_sha_for_test(
+               "unused",
+               issue,
+               [phase: :review, pipeline_task: %{"current_sha" => accepted_sha}],
+               nil
+             )
+
+    assert report["outcome"] == "blocked"
+    assert report["summary"] =~ accepted_sha
+    assert report["summary"] =~ observed_sha
+    assert report["next_step"] =~ "Build"
+  end
+
+  test "resuming a blocked Review without a PR restarts Build" do
+    issue = issue("octo/app#44", 44)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+
+    task = %{
+      "issue_id" => issue.id,
+      "repository" => "octo/app",
+      "branch" => issue.branch_name,
+      "base_branch" => "main",
+      "required_checks" => ["true"],
+      "generation" => 1,
+      "phase" => "review",
+      "status" => "blocked",
+      "attempts" => %{"review" => 1},
+      "prior_findings" => [],
+      "current_sha" => String.duplicate("a", 40),
+      "pr_number" => 144
+    }
+
+    assert :ok = Store.save_task(task)
+
+    assert {:ok, %{"phase" => "build", "status" => "building", "current_sha" => nil}, "build"} =
+             Pipeline.prepare(issue)
+  end
+
+  test "resuming blocked QA restarts Build when the tracker cannot read a PR" do
+    issue = issue("octo/app#45", 45)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    task = %{
+      "issue_id" => issue.id,
+      "repository" => "octo/app",
+      "branch" => issue.branch_name,
+      "base_branch" => "main",
+      "required_checks" => ["true"],
+      "generation" => 1,
+      "phase" => "qa",
+      "status" => "blocked",
+      "attempts" => %{"qa" => 1},
+      "prior_findings" => [],
+      "current_sha" => String.duplicate("a", 40),
+      "pr_number" => 145
+    }
+
+    assert :ok = Store.save_task(task)
+    assert :ignore = Tracker.pull_request(issue)
+
+    assert {:ok, %{"phase" => "build", "status" => "building", "current_sha" => nil}, "build"} =
+             Pipeline.prepare(issue)
+  end
+
   test "QA finding normalization uses Spanish report values for a Spanish issue" do
     spanish_issue = %{issue("octo/app#40", 40) | description: "Implementar soporte para nuevas salas"}
     finding = %{"id" => "QA-40", "reproduction" => "Ejecuta la ruta afectada.", "criterion" => "Se cumple el criterio."}
@@ -184,6 +329,57 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert pull_request(table, issue.id).sha == lookup(table, {:remote_sha, issue.id})
 
     stop_orchestrator(orchestrator)
+    File.rm_rf!(Path.dirname(path))
+  end
+
+  test "Blocked QA reruns Build when the pull request head changes" do
+    issue = issue("octo/app#43", 43)
+
+    table =
+      start_board([issue], %{
+        issue.id => %{
+          build: [build("sha-forty-three-old"), build("sha-forty-three-new")],
+          qa: [blocked(), qa("sha-forty-three-new")],
+          review: [review("sha-forty-three-new")]
+        }
+      })
+
+    path = pipeline_database!(table)
+    orchestrator = start_orchestrator()
+
+    assert await(fn -> project_state(table, issue.id) == "Blocked" end)
+    accepted_sha = lookup(table, {:remote_sha, issue.id})
+    pr = pull_request(table, issue.id)
+    assert pr.sha == accepted_sha
+
+    :ets.insert(table, {{:pull_request, issue.id}, %{pr | sha: "external-head-update"}})
+    set_project_state(table, issue.id, "Ready")
+
+    assert await(fn -> project_state(table, issue.id) == "Human Review" end)
+    assert agent_calls(table, issue.id) == 5
+    assert report_phases(table, issue.id) == [:build, :qa, :build, :qa, :review]
+    assert pull_request(table, issue.id).sha == lookup(table, {:remote_sha, issue.id})
+
+    stop_orchestrator(orchestrator)
+    File.rm_rf!(Path.dirname(path))
+  end
+
+  test "Blocked QA without an accepted SHA restarts Build before retrying" do
+    issue = issue("octo/app#44", 44)
+    table = start_board([issue], %{})
+    path = pipeline_database!(table)
+
+    assert {:ok, task, "build"} = Pipeline.prepare(issue)
+
+    task =
+      task
+      |> Map.put("phase", "qa")
+      |> Map.put("status", "blocked")
+      |> Map.put("current_sha", nil)
+
+    assert :ok = Store.save_task(task)
+    assert {:ok, %{"phase" => "build", "status" => "building", "current_sha" => nil}, "build"} = Pipeline.prepare(issue)
+
     File.rm_rf!(Path.dirname(path))
   end
 
@@ -434,7 +630,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
         issue.id => %{
           build: [build("dirty"), build("clean")],
           qa: [qa("dirty"), qa("clean")],
-          review: [Map.put(review("clean"), "resolutions", ["workspace-sha-mismatch"])]
+          review: [Map.put(review("clean"), "resolutions", ["workspace-dirty"])]
         }
       })
 
@@ -445,7 +641,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert await(fn -> project_state(table, issue.id) == "Human Review" end)
     assert agent_calls(table, issue.id) == 5
     assert report_phases(table, issue.id) == [:build, :qa, :build, :qa, :review]
-    assert lookup(table, {:agent_prior_findings, issue.id, :build, 2}) |> Enum.any?(&(&1["id"] == "workspace-sha-mismatch"))
+    assert lookup(table, {:agent_prior_findings, issue.id, :build, 2}) |> Enum.any?(&(&1["id"] == "workspace-dirty"))
 
     assert table
            |> lookup({:reports, issue.id})
@@ -902,10 +1098,25 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
            issue,
            Keyword.get(opts, :worker_host)
          ) do
-      {:ok, evidence} -> %{"name" => command, "status" => "passed", "evidence" => evidence}
-      {:error, {:check_failed, status}} -> %{"name" => command, "status" => "failed", "evidence" => "Symphony ran the configured check at SHA #{task["current_sha"]}; host exit status #{status}."}
-      {:error, :workspace_mismatch} -> %{"name" => command, "status" => "failed", "finding_id" => "workspace-sha-mismatch", "evidence" => "Workspace differs from accepted SHA #{task["current_sha"]}."}
-      {:error, :check_unavailable} -> %{"name" => command, "status" => "unavailable", "evidence" => "Symphony could not execute the required check."}
+      {:ok, evidence} ->
+        %{"name" => command, "status" => "passed", "evidence" => evidence}
+
+      {:error, {:check_failed, status}} ->
+        %{"name" => command, "status" => "failed", "evidence" => "Symphony ran the configured check at SHA #{task["current_sha"]}; host exit status #{status}."}
+
+      {:error, {:workspace_sha_mismatch, expected_sha, observed_sha}} ->
+        %{"name" => command, "status" => "failed", "finding_id" => "workspace-sha-mismatch", "evidence" => "Workspace HEAD was #{observed_sha || "unavailable"}, not accepted SHA #{expected_sha}."}
+
+      {:error, {:workspace_dirty, expected_sha, observed_sha}} ->
+        %{
+          "name" => command,
+          "status" => "failed",
+          "finding_id" => "workspace-dirty",
+          "evidence" => "Workspace had local changes at SHA #{observed_sha || "unavailable"}; accepted SHA was #{expected_sha}."
+        }
+
+      {:error, :check_unavailable} ->
+        %{"name" => command, "status" => "unavailable", "evidence" => "Symphony could not execute the required check."}
     end
   end
 

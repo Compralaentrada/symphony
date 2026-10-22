@@ -899,6 +899,19 @@ Failure handling:
   prepared directory.
 - Reused workspaces SHOULD NOT be destructively reset on population failure unless that policy is
   explicitly chosen and documented.
+- GitHub Projects repository profiles synchronize a reused issue branch when Build resumes without
+  an accepted SHA. They fetch and fast-forward; if the local and remote branches have diverged, the
+  task is blocked with a recovery instruction and the local workspace is preserved. Dirty workspace
+  changes that prevent a switch or fast-forward are reported separately. If neither the local nor
+  remote issue branch exists, Build blocks instead of recreating it from the base branch. A system
+  generated blocker is saved to the GitHub issue and Project because no agent session is available
+  to perform the normal handoff. This is a narrow exception to agent-owned GitHub writes for
+  deterministic host preflight failures; diagnostic work remains agent-owned. Before QA or Review
+  starts, the PR head and clean workspace must match the accepted Build SHA; an absent or changed PR
+  head, workspace mismatch, or dirty tree is saved as a system-generated blocker with expected and
+  observed SHA evidence where available. When a blocked QA or Review task is requeued after the PR
+  head changed or the PR is missing, it restarts at Build so the accepted SHA and subsequent QA and
+  Review evidence are refreshed together.
 
 ### 9.4 Workspace Hooks
 

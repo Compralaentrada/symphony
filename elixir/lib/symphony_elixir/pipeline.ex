@@ -61,6 +61,21 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   @spec finish_phase(Issue.t(), map(), String.t(), pos_integer(), term()) :: :ok | {:error, term()}
+  def finish_phase(%Issue{} = issue, task, phase, attempt, {:system_blocker, result})
+      when phase in ["build", "qa", "review"] and is_map(result) do
+    case normalize_phase_result(result, phase, report_locale(issue)) do
+      {:ok, %{"outcome" => "blocked"} = normalized} ->
+        persist_blocked_phase(issue, task, phase, attempt, normalized)
+
+      {:ok, _normalized} ->
+        {:error, :invalid_system_blocker_report}
+
+      {:error, reason} ->
+        _ = Store.interrupt_phase(issue.id, task["generation"], phase, attempt)
+        {:error, reason}
+    end
+  end
+
   def finish_phase(%Issue{} = issue, task, phase, attempt, result) do
     case normalize_phase_result(result, phase, report_locale(issue)) do
       {:ok, result} ->
@@ -75,7 +90,7 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   @spec block_phase(Issue.t(), map(), String.t(), pos_integer(), String.t()) :: :ok | {:error, term()}
-  def block_phase(%Issue{} = issue, task, phase, attempt, reason) do
+  def block_phase(%Issue{} = issue, task, phase, attempt, reason) when is_binary(reason) do
     result = %{
       "outcome" => "blocked",
       "summary" => "An operator must resolve an intervention before this phase can continue.",
@@ -84,10 +99,37 @@ defmodule SymphonyElixir.Pipeline do
       "sha" => task["current_sha"]
     }
 
+    persist_blocked_phase(issue, task, phase, attempt, result)
+  end
+
+  defp persist_blocked_phase(issue, task, phase, attempt, result) do
+    reason = result["reason"]
     next = task |> Map.put("phase", phase) |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
     operations = report_ops(next, phase, attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
-    commit(issue, next, phase, attempt, result, operations)
+    report = report_op(next, phase, attempt, result)
+
+    with :ok <- persist_agent_owned_system_block(issue, report, reason) do
+      commit(issue, next, phase, attempt, result, operations)
+    end
   end
+
+  defp persist_agent_owned_system_block(issue, report, reason) do
+    if Tracker.agent_owned_writes?() do
+      Tracker.persist_system_block(
+        issue,
+        report.payload["marker"],
+        report.payload["body"],
+        report.payload["phase"],
+        reason
+      )
+      |> ignore_unavailable_system_block()
+    else
+      :ok
+    end
+  end
+
+  defp ignore_unavailable_system_block(:ignore), do: :ok
+  defp ignore_unavailable_system_block(result), do: result
 
   @spec execute_pending(Issue.t()) :: :ok | {:error, term()}
   def execute_pending(%Issue{} = issue) do
@@ -201,30 +243,30 @@ defmodule SymphonyElixir.Pipeline do
 
   defp prepare_task(_task, _issue), do: :ignore
 
-  defp resume_blocked_task(%{"phase" => "review", "current_sha" => current_sha} = task, issue)
-       when is_binary(current_sha) do
+  defp resume_blocked_task(%{"phase" => phase, "current_sha" => current_sha} = task, issue)
+       when phase in ["qa", "review"] and is_binary(current_sha) do
     case Tracker.pull_request(issue) do
       {:ok, %{sha: ^current_sha}} ->
         resume_blocked_task(task)
 
-      {:ok, %{sha: pr_sha}} when is_binary(pr_sha) ->
-        task |> Map.put("phase", "build") |> Map.put("current_sha", nil) |> resume_blocked_task()
-
       {:ok, _pr} ->
-        {:error, :blocked_review_pr_head_unavailable}
+        restart_blocked_task_at_build(task)
 
       :ignore ->
-        {:error, :blocked_review_pr_head_unavailable}
+        restart_blocked_task_at_build(task)
 
       {:error, _reason} = error ->
         error
     end
   end
 
-  defp resume_blocked_task(%{"phase" => "review"}, _issue),
-    do: {:error, :blocked_review_checkpoint_missing_sha}
+  defp resume_blocked_task(%{"phase" => phase} = task, _issue) when phase in ["qa", "review"],
+    do: restart_blocked_task_at_build(task)
 
   defp resume_blocked_task(task, _issue), do: resume_blocked_task(task)
+
+  defp restart_blocked_task_at_build(task),
+    do: task |> Map.put("phase", "build") |> Map.put("current_sha", nil) |> resume_blocked_task()
 
   defp resume_blocked_task(task) do
     task = Map.put(task, "status", "building")
