@@ -946,16 +946,20 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
     cond do
       not required_checks_passed?(required, checks) and Enum.any?(checks, &(&1["status"] == "unavailable")) ->
-        report |> Map.put("outcome", "blocked") |> Map.put("reason", "Symphony could not execute every configured required check.")
+        report
+        |> Map.put("outcome", "blocked")
+        |> Map.put("reason", qa_text(context, :checks_unavailable))
 
       not required_checks_passed?(required, checks) ->
-        report |> Map.put("outcome", "changes_requested") |> Map.put("summary", "One or more required host checks failed or were missing.")
+        report
+        |> Map.put("outcome", "changes_requested")
+        |> Map.put("summary", qa_text(context, :checks_failed))
 
       report["outcome"] == "passed" and report["findings"] not in [nil, []] ->
         Map.merge(report, %{
           "outcome" => "changes_requested",
-          "summary" => "QA reported findings that need correction.",
-          "next_step" => "Fix the findings and submit a new Build delivery."
+          "summary" => qa_text(context, :findings),
+          "next_step" => qa_text(context, :next_step)
         })
 
       true ->
@@ -976,6 +980,15 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp normalize_agent_report(report, _lane, _context), do: report
+
+  defp qa_text(%{report_locale: :es}, :checks_unavailable), do: "Symphony no pudo ejecutar todas las comprobaciones requeridas."
+  defp qa_text(%{report_locale: :es}, :checks_failed), do: "Falló alguna comprobación requerida o falta evidencia para confirmarla."
+  defp qa_text(%{report_locale: :es}, :findings), do: "QA encontró hallazgos que requieren corrección."
+  defp qa_text(%{report_locale: :es}, :next_step), do: "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
+  defp qa_text(_context, :checks_unavailable), do: "Symphony could not execute every configured required check."
+  defp qa_text(_context, :checks_failed), do: "One or more required host checks failed or were missing."
+  defp qa_text(_context, :findings), do: "QA reported findings that need correction."
+  defp qa_text(_context, :next_step), do: "Fix the findings and submit a new Build delivery."
 
   @doc false
   @spec normalize_agent_report_for_test(map(), String.t(), map()) :: map()

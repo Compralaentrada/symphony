@@ -107,6 +107,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     opts = Keyword.put(opts, :selected_repo_skills, selected_repo_skills)
     opts = Keyword.put_new(opts, :host_checks, run_pipeline_host_checks(workspace, issue, opts, worker_host))
+    opts = Keyword.put(opts, :report_locale, Pipeline.report_locale(issue))
     agent_context = github_agent_context(issue, opts)
 
     with :ok <- ensure_skills_available(workspace, issue, worker_host),
@@ -176,6 +177,7 @@ defmodule SymphonyElixir.AgentRunner do
       attempt: Keyword.get(opts, :phase_attempt),
       lease_token: Keyword.get(opts, :github_lease_token),
       host_checks: Keyword.get(opts, :host_checks, []),
+      report_locale: Keyword.get(opts, :report_locale, Pipeline.report_locale(issue)),
       tracker_kind: tracker.kind,
       merge_policy: Map.get(tracker.provider, "merge_policy", "human")
     }
@@ -222,7 +224,8 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_pipeline_turn(session, issue, on_message, message_key, phase, opts) do
     evidence_key = {message_key, :remote_evidence}
-    report_language = report_language_name(Pipeline.report_locale(issue))
+    report_locale = Keyword.get(opts, :report_locale, Pipeline.report_locale(issue))
+    report_language = report_language_name(report_locale)
 
     prompt =
       issue
@@ -237,7 +240,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     output_schema = phase_report_schema(phase)
 
-    case run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema) do
+    case run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema, report_locale) do
       {:ok, report} ->
         phase_result(report, phase, opts, evidence_key)
 
@@ -251,7 +254,8 @@ defmodule SymphonyElixir.AgentRunner do
                on_message,
                message_key,
                phase,
-               output_schema
+               output_schema,
+               report_locale
              ) do
           {:ok, report} -> phase_result(report, phase, opts, evidence_key)
           error -> error
@@ -262,14 +266,14 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema) do
+  defp run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema, report_locale) do
     case AppServer.run_turn(session, prompt, issue,
            on_message: on_message,
            output_schema: output_schema
          ) do
       {:ok, _turn} ->
         with {:ok, report} <- decode_phase_report(phase_report_text(Process.get(message_key))) do
-          Pipeline.normalize_phase_result(report, Atom.to_string(phase), Pipeline.report_locale(issue))
+          Pipeline.normalize_phase_result(report, Atom.to_string(phase), report_locale)
         end
 
       error ->

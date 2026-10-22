@@ -324,6 +324,30 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
            } = Client.normalize_agent_report_for_test(report, "qa", context)
   end
 
+  test "QA-generated report values follow the issue locale" do
+    finding = %{"id" => "QA-3", "reproduction" => "Ejecutar la comprobación fallida.", "criterion" => "La comprobación pasa."}
+    base = %{report_locale: :es, task: %{"required_checks" => ["mix test"]}}
+    failed = Map.put(base, :host_checks, [%{"name" => "mix test", "status" => "failed"}])
+    unavailable = Map.put(base, :host_checks, [%{"name" => "mix test", "status" => "unavailable"}])
+    passed = Map.put(base, :host_checks, [%{"name" => "mix test", "status" => "passed", "evidence" => "exit status 0"}])
+
+    assert %{
+             "outcome" => "changes_requested",
+             "summary" => "Falló alguna comprobación requerida o falta evidencia para confirmarla."
+           } = Client.normalize_agent_report_for_test(%{"outcome" => "passed"}, "qa", failed)
+
+    assert %{
+             "outcome" => "blocked",
+             "reason" => "Symphony no pudo ejecutar todas las comprobaciones requeridas."
+           } = Client.normalize_agent_report_for_test(%{"outcome" => "passed"}, "qa", unavailable)
+
+    assert %{
+             "outcome" => "changes_requested",
+             "summary" => "QA encontró hallazgos que requieren corrección.",
+             "next_step" => "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
+           } = Client.normalize_agent_report_for_test(%{"outcome" => "passed", "findings" => [finding]}, "qa", passed)
+  end
+
   test "QA defects return the Project item to Building" do
     previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
     root = Path.join(System.tmp_dir!(), "symphony-project-qa-defects-#{System.unique_integer([:positive])}")
