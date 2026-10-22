@@ -32,6 +32,57 @@ defmodule SymphonyElixir.Pipeline.Store do
   @spec save_task(map()) :: :ok | {:error, term()}
   def save_task(task), do: with_db(&save_task(&1, task))
 
+  @spec begin_agent_lease(String.t(), String.t()) :: :ok | {:error, term()}
+  def begin_agent_lease(issue_id, token) do
+    with_db(fn conn ->
+      execute(
+        conn,
+        "INSERT INTO agent_leases (issue_id, token, status) VALUES (?, ?, 'active') ON CONFLICT(issue_id) DO UPDATE SET token = excluded.token, status = 'active'",
+        [issue_id, token]
+      )
+    end)
+  end
+
+  @spec end_agent_lease(String.t(), String.t()) :: :ok | {:error, term()}
+  def end_agent_lease(issue_id, token) do
+    with_db(fn conn ->
+      execute(conn, "UPDATE agent_leases SET status = 'ended' WHERE issue_id = ? AND token = ?", [issue_id, token])
+    end)
+  end
+
+  @spec agent_lease_active?(String.t(), String.t()) :: boolean()
+  def agent_lease_active?(issue_id, token) do
+    with_db(fn conn ->
+      case query(conn, "SELECT status FROM agent_leases WHERE issue_id = ? AND token = ?", [issue_id, token]) do
+        {:ok, [["active"]]} -> true
+        _ -> false
+      end
+    end)
+    |> case do
+      true -> true
+      _ -> false
+    end
+  end
+
+  @spec revoke_agent_leases() :: :ok | {:error, term()}
+  def revoke_agent_leases do
+    with_db(&execute(&1, "UPDATE agent_leases SET status = 'revoked' WHERE status = 'active'"))
+  end
+
+  @spec interrupt_running_phases() :: :ok | {:error, term()}
+  def interrupt_running_phases do
+    with_db(fn conn ->
+      execute(conn, "UPDATE pipeline_runs SET status = 'interrupted', ended_at = ? WHERE status = 'running'", [timestamp()])
+    end)
+  end
+
+  @spec supersede_pending_operations(String.t()) :: :ok | {:error, term()}
+  def supersede_pending_operations(issue_id) do
+    with_db(fn conn ->
+      execute(conn, "UPDATE pipeline_operations SET status = 'superseded', updated_at = ? WHERE issue_id = ? AND status = 'pending'", [timestamp(), issue_id])
+    end)
+  end
+
   @spec save_task_with_operations(map(), [map()]) :: :ok | {:error, term()}
   def save_task_with_operations(task, operations) do
     with_db(fn conn ->
@@ -92,6 +143,31 @@ defmodule SymphonyElixir.Pipeline.Store do
         [timestamp(), issue_id, generation, phase, attempt]
       )
     end)
+  end
+
+  @spec agent_lease_active?(String.t(), pos_integer(), String.t(), pos_integer()) :: boolean()
+  def agent_lease_active?(issue_id, generation, phase, attempt) do
+    with_db(fn conn ->
+      case query(
+             conn,
+             "SELECT t.payload, r.status FROM pipeline_tasks t JOIN pipeline_runs r ON r.issue_id = t.issue_id WHERE t.issue_id = ? AND r.generation = ? AND r.phase = ? AND r.attempt = ?",
+             [issue_id, generation, phase, attempt]
+           ) do
+        {:ok, rows} -> Enum.any?(rows, &active_pipeline_lease_row?(&1, generation, phase, attempt))
+        _ -> false
+      end
+    end)
+    |> case do
+      true -> true
+      _ -> false
+    end
+  end
+
+  defp active_pipeline_lease_row?([payload, status], generation, phase, attempt) do
+    task = Jason.decode!(payload)
+
+    status == "running" and task["generation"] == generation and task["phase"] == phase and
+      get_in(task, ["attempts", phase]) == attempt
   end
 
   @spec pending_operations(String.t()) :: {:ok, [map()]} | {:error, term()}
@@ -217,6 +293,11 @@ defmodule SymphonyElixir.Pipeline.Store do
            execute(
              conn,
              "CREATE TABLE IF NOT EXISTS pipeline_operations (operation_key TEXT PRIMARY KEY, issue_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL, result TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+           ),
+         :ok <-
+           execute(
+             conn,
+             "CREATE TABLE IF NOT EXISTS agent_leases (issue_id TEXT PRIMARY KEY, token TEXT NOT NULL, status TEXT NOT NULL)"
            ) do
       execute(conn, "CREATE INDEX IF NOT EXISTS pipeline_operations_pending ON pipeline_operations (issue_id, status)")
     end

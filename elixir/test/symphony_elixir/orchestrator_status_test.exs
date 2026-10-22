@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
-  test "Projects completion and intervention blockers update the tracker while transient errors retry" do
+  test "Projects lifecycle callbacks stay local while transient errors retry" do
     previous_client = Application.get_env(:symphony_elixir, :github_projects_client_module)
     previous_owner = Application.get_env(:symphony_elixir, :projects_lifecycle_test_owner)
 
@@ -67,8 +67,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert Map.has_key?(state.blocked, blocked.id)
     assert Map.has_key?(state.retry_attempts, transient.id)
 
-    assert_receive {:projects_complete, ^done}
-    assert_receive {:projects_block, ^blocked, "codex turn requires operator input"}
+    refute_receive {:projects_complete, ^done}
+    refute_receive {:projects_block, ^blocked, "codex turn requires operator input"}
     refute_receive {:projects_complete, ^continued}
     refute_receive {:projects_block, ^transient, _reason}
   end
@@ -1946,17 +1946,16 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       ---
       tracker:
         kind: github_projects
-        active_states: [Ready, Building]
-        terminal_states: [closed]
+        active_states: [Ready, Building, QA, Review, Human Review]
+        terminal_states: [closed, Dropped]
         provider:
           owner: acme
           project_number: 12
-          status_field: Status
-          status_values: {ready: Ready, building: Building, blocked: Blocked, done: Done}
           repositories:
             - repository: repo/app
               base_branch: main
               prepare_command: "true"
+              required_checks: ["true"]
           token: test-token
       ---
       Work on {{ issue.identifier }}.

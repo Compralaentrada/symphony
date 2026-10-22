@@ -1,101 +1,95 @@
-# Symphony Elixir
+# Symphony runtime (Elixir)
 
-This directory contains the current Elixir/OTP implementation of Symphony, based on
-[`SPEC.md`](../SPEC.md) at the repository root.
+This directory contains the Elixir/OTP service used by the Compralaentrada project. It coordinates
+work from GitHub Projects v2 across configured repositories and runs the Build → QA → Review
+pipeline with Codex.
 
-> [!WARNING]
-> Symphony Elixir is prototype software intended for evaluation only and is presented as-is.
-> We recommend implementing your own hardened version based on `SPEC.md`.
-
-## Screenshot
-
-![Symphony Elixir screenshot](../.github/media/elixir-screenshot.png)
+The checked-in [`WORKFLOW.md`](WORKFLOW.md) is configured for this repository's pilot. Review its
+Project, repository profiles, credentials, and Codex permissions before using it on another
+installation.
 
 ## How it works
 
-1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues,
-   GitHub Projects v2, Jira Cloud, Asana, and GitLab)
-2. Creates a workspace per issue and launches Codex in
-   [App Server mode](https://developers.openai.com/codex/app-server/)
-3. Uses separate Build, QA, and autonomous Review sessions when GitHub Projects v2 has the pipeline
-   statuses configured; other tracker configurations keep the existing single-run behavior
-4. Creates a draft PR after Build, marks it ready after QA and Review, then waits for a human decision
+1. Reads eligible issues from the configured tracker. The current pilot uses GitHub Projects v2;
+   adapters are also available for GitHub Issues, Linear, Jira Cloud, Asana, and GitLab.
+2. Creates an isolated workspace for each issue and launches Codex in
+   [App Server mode](https://developers.openai.com/codex/app-server/).
+3. Runs Build, QA, and autonomous Review in separate sessions for GitHub Projects work.
+4. Verifies configured QA checks, prepares a pull request for human review, and waits for the
+   merge or a request for corrections.
 
-## Pipeline ownership decision
+## GitHub write ownership
 
-The accepted design in [ADR-0002](../docs/adr/0002-agentes-propietarios-de-escrituras-github.md) assigns GitHub issue and PR writes to the agent handling each run dispatched through GitHub Issues or GitHub Projects. In the Projects pipeline, Build, QA, and Review own writes for their respective lanes. Build opens the draft PR; Review prepares it for human review and invokes the deterministic merge gate only when auto-merge is explicitly enabled. Symphony remains the reader and execution coordinator.
+As recorded in [ADR-0002](../docs/adr/0002-agentes-propietarios-de-escrituras-github.md), the agent
+handling a GitHub Issues run or Projects phase owns the writes for its issue and pull request.
+GitHub agents use the host-mediated `github_workflow` tool for lane-authorized writes; the
+`github_api` tool is read-only and scoped to the task repository. Symphony keeps credentials on the
+host, verifies remote evidence, and reconciles the resulting state. Build pushes through the host's
+Git credential helper or SSH. Configure push access for each repository profile on the Symphony
+host.
 
-The current prototype still centralizes these writes in Symphony and disables tracker tools in pipeline sessions. Issue #40 tracks moving the implementation to the accepted design.
-
-Local runs discover repo-local Codex skills from `.agents/skills` in the workspace checkout. Symphony checks the selected skills before launching Codex and reports a missing `SKILL.md` path; pinned sources and fingerprints are listed in the repository's `.agents/skills/SOURCES.md`.
+Local runs discover repo-local Codex skills from `.agents/skills` in the workspace checkout.
+Symphony checks selected skills before launching Codex and reports a missing `SKILL.md` path; pinned
+sources and fingerprints are listed in [`../.agents/skills/SOURCES.md`](../.agents/skills/SOURCES.md).
 
 During single-run app-server sessions, the selected tracker adapter may advertise provider-native
-tools. Linear serves `linear_graphql`, GitHub Issues and GitHub Projects v2 serve `github_api`, Jira
-Cloud serves `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes
-those tools with configured host-side auth and removes declared tracker-token environment variables
-from the Codex child. Until issue #40 lands, pipeline phase sessions disable tracker tools; Build
-pushes through the host's Git credential helper or SSH, while Symphony owns the API writes for PRs,
-Project status, and issue reports. Configure push access for each repository profile on the Symphony
-host.
+tools. Linear serves `linear_graphql`, GitHub Issues and GitHub Projects v2 serve the read-only
+`github_api` plus the task-scoped `github_workflow`, Jira Cloud serves `jira_rest`, Asana serves
+`asana_api`, and GitLab serves `gitlab_api`. Symphony executes tools with configured host-side auth
+and removes declared tracker-token environment variables from the Codex child. GitHub workflow
+permissions are restricted by repository, issue, lane, lease, and operation.
 
 If a claimed issue moves to a configured terminal state, Symphony stops the active agent and cleans
 up its workspace. In GitHub Projects mode, closing the linked GitHub Issue is terminal; Project
 items in Done or Blocked keep their workspace so moving them back to Ready can resume prior work.
+Before QA or Review starts, Symphony compares the remote PR head and clean workspace with the
+Build-accepted SHA. A missing or changed PR head, a mismatched workspace, or uncommitted workspace
+changes creates a blocker report before the agent starts. When a Blocked item from QA or Review is
+moved to Ready, a changed or missing PR head clears the accepted SHA and restarts at Build to rerun
+QA and Review. Transient tracker read errors keep the existing retry behavior.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
-issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. The GitHub
-Projects adapter also updates the Project status and comments on the linked issue with the reason.
-For the durable Projects pipeline, phase checkpoints and pending external writes are stored in SQLite
-at `~/.symphony/pipeline.sqlite3`; a restart resumes from the last confirmed phase. After the
-independent QA review, Symphony runs every `required_checks` command from the repository profile in
-the task workspace and records host-generated evidence; a missing or failed check cannot pass QA.
+issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. For the durable
+Projects pipeline, phase checkpoints and external-operation records are stored in SQLite at
+`~/.symphony/pipeline.sqlite3`; GitHub agent writes are verified remotely before Symphony advances
+the checkpoint. After the independent QA review, Symphony runs every `required_checks` command from
+the repository profile in the task workspace and gives the evidence to the QA agent; missing or
+failed host checks cannot pass QA.
 A merge into the configured base branch is required before Symphony sets Done. Moving a Human Review
 item back to Ready requests corrections on the same branch and PR. To move unmerged work to Dropped,
 add a human-authored `Drop reason: <reason>` line to the issue body; after a `no_changes` result,
 this line confirms the decision to discard the work.
 
-## How to use it
-
-1. Make sure your codebase is set up to work well with agents: see
-   [Harness engineering](https://openai.com/index/harness-engineering/).
-2. Get a new personal token in Linear via Settings → Security & access → Personal API keys, and
-   set it as the `LINEAR_API_KEY` environment variable.
-3. Copy this directory's `WORKFLOW.md` to your repo.
-4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
-   - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
-     operations such as comment editing or upload flows.
-5. Customize the copied `WORKFLOW.md` file for your project.
-   - To get your project's slug, right-click the project and copy its URL. The slug is part of the
-     URL.
-   - When creating a workflow based on this repo, note that it depends on non-standard Linear
-     issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
-     Team Settings → Workflow in Linear.
-6. Follow the instructions below to install the required runtime dependencies and start the service.
+Pipeline phase reports use Markdown in Spanish when the issue is Spanish, and English for English,
+unsupported, or ambiguous issue languages. Reports omit empty sections and distinguish blocked
+phases from checks that did not run.
 
 ## Prerequisites
 
-We recommend using [mise](https://mise.jdx.dev/) to manage Elixir/Erlang versions.
+Use [mise](https://mise.jdx.dev/) for Elixir/Erlang and install Codex CLI with App Server support.
+The host also needs Git credentials for every configured repository and a `GITHUB_TOKEN` that can
+read the Project and linked issues.
 
 ```bash
 mise install
 mise exec -- elixir --version
 ```
 
-## Run
+## Run the pilot
 
 ```bash
-git clone https://github.com/openai/symphony
+git clone https://github.com/Compralaentrada/symphony.git
 cd symphony/elixir
 mise trust
 mise install
 mise exec -- mix setup
-mise exec -- mix run --no-start --no-halt -e 'SymphonyElixir.CLI.main(["--i-understand-that-this-will-be-running-without-the-usual-guardrails", "./WORKFLOW.md"])'
+mise exec -- mix run --no-start --no-halt -e 'SymphonyElixir.CLI.main(["--i-understand-that-this-will-be-running-without-the-usual-guardrails", "--port", "4000", "./WORKFLOW.md"])'
 ```
 
 The local Mix run loads Exqlite's native SQLite library from the compiled dependency. Do not build
 or run an escript; its archive cannot provide the NIF used by the pipeline journal.
 
-## Burrito releases
+## Release builds
 
 Symphony ships self-contained executables built with
 [Burrito](https://github.com/burrito-elixir/burrito). They embed Erlang/OTP, Elixir, and Symphony,
@@ -113,59 +107,37 @@ artifacts without creating a release.
 
 The `burrito-nightly` workflow builds each push to `main`, with no scheduled rebuilds.
 After all four platform smoke tests pass, it updates the rolling
-[`nightly` prerelease](https://github.com/openai/symphony/releases/tag/nightly),
-including binaries and checksums. Nightly binaries use a `-nightly` version suffix;
-the release notes identify the source commit. Stable releases remain unchanged.
+[`nightly` prerelease](https://github.com/Compralaentrada/symphony/releases/tag/nightly),
+including binaries and checksums. Nightly binaries use a `-nightly` version suffix; the release
+notes identify the source commit.
 
 After downloading the executable for your platform from a release:
 
 ```bash
-chmod +x ./symphony-v0.0.1-macos_arm64
-./symphony-v0.0.1-macos_arm64 --i-understand-that-this-will-be-running-without-the-usual-guardrails ./WORKFLOW.md
+chmod +x ./symphony-vX.Y.Z-macos_arm64
+./symphony-vX.Y.Z-macos_arm64 --i-understand-that-this-will-be-running-without-the-usual-guardrails ./WORKFLOW.md
 ```
 
 ## Configuration
 
-Pass a custom workflow file path to the Burrito executable when starting the service:
-
-```bash
-./burrito_out/symphony_macos_arm64 --i-understand-that-this-will-be-running-without-the-usual-guardrails /path/to/custom/WORKFLOW.md
-```
-
-If no path is passed, Symphony defaults to `./WORKFLOW.md`.
+The pilot configuration is in [`WORKFLOW.md`](WORKFLOW.md). Its YAML front matter configures the
+tracker, repository profiles, workspace, agent limits, and Codex command; the Markdown body is the
+agent prompt. Adapt the Project and repository profiles before pointing the service at another
+installation. Do not commit literal credentials; use environment variables such as `$GITHUB_TOKEN`.
 
 Optional flags:
 
-- `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
+- `--logs-root` tells Symphony to write logs under a different directory (default: `./log`). All
+  events go to `symphony.log.1`; warnings and errors are also copied to `symphony-errors.log.1`.
+  Rotated segments use the same base names with suffixes `.2` through `.5`.
 - `--port` also starts the Phoenix observability service (default: disabled)
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
 
-Minimal example:
-
-```md
----
-tracker:
-  kind: linear
-  provider:
-    project_slug: "..."
-workspace:
-  root: ~/code/workspaces
-hooks:
-  after_create: |
-    git clone git@github.com:your-org/your-repo.git .
-agent:
-  max_concurrent_agents: 10
-  max_turns: 20
-codex:
-  command: codex app-server
----
-
-You are working on an issue from the configured tracker {{ issue.identifier }}.
-
-Title: {{ issue.title }} Body: {{ issue.description }}
-```
+For a complete configuration, start from [`WORKFLOW.md`](WORKFLOW.md) and replace its pilot
+Project and repository profile with the values for your installation. The adapter sections below
+describe the supported tracker settings.
 
 Notes:
 
@@ -209,7 +181,11 @@ Notes:
   create the repository at `.`. It receives `SYMPHONY_REPOSITORY`, `SYMPHONY_BASE_BRANCH`,
   `SYMPHONY_ISSUE_ID`, and `SYMPHONY_ISSUE_IDENTIFIER`; Symphony then creates the issue branch from
   the configured base branch. The profile command replaces `hooks.after_create` for that workspace.
-  Requeues reuse an existing workspace without rerunning either command.
+  Requeues reuse an existing workspace without rerunning either command. When Build resumes without
+  an accepted SHA, Symphony fetches the issue branch and fast-forwards it when possible. If local and
+  remote work diverged, the branch is missing from both, or local changes prevent the update, Build
+  records the blocked report and Project status without resetting the workspace. QA and Review check
+  that the PR head and clean workspace still match the accepted Build SHA before starting the agent.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or
@@ -221,19 +197,6 @@ Notes:
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
   launched shell.
-
-```yaml
-tracker:
-  provider:
-    api_key: $LINEAR_API_KEY
-workspace:
-  root: $SYMPHONY_WORKSPACE_ROOT
-hooks:
-  after_create: |
-    git clone --depth 1 "$SOURCE_REPO_URL" .
-codex:
-  command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
-```
 
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
@@ -267,41 +230,39 @@ codex:
 ```yaml
 tracker:
   kind: github_projects
-  required_labels: []
-  active_states: [Ready, Building]
-  terminal_states: [closed]
+  active_states: [Ready, Building, QA, Review, Human Review]
+  terminal_states: [closed, Dropped]
   provider:
     owner: your-user-or-organization
     project_number: 12
-    status_field: Status
-    status_values:
-      ready: Ready
-      building: In Progress
-      blocked: Blocked
-      done: Done
     token: $GITHUB_TOKEN
     repositories:
       - repository: your-org/api
         base_branch: main
+        required_checks:
+          - mix test
         prepare_command: |
           gh repo clone "$SYMPHONY_REPOSITORY" .
-          git fetch origin "refs/heads/$SYMPHONY_BASE_BRANCH:refs/remotes/origin/$SYMPHONY_BASE_BRANCH"
-          git switch --track -c "$SYMPHONY_BASE_BRANCH" "origin/$SYMPHONY_BASE_BRANCH"
+          mise trust
           mise exec -- mix deps.get
 ```
 
-- `owner` and `project_number` identify a user or organization Project. `status_field` and the four
-  `status_values` must match a single-select Project field and its options.
+- `owner` and `project_number` identify a user or organization Project. Symphony uses its `Status`
+  single-select field and canonical options: Backlog, Ready, Building, QA, Review, Human Review,
+  Blocked, Done, and Dropped.
 - `token` defaults to `GITHUB_TOKEN` and accepts `$ENV_VAR`; never put a literal token in
   `WORKFLOW.md`. The token needs access to read and update the Project and linked issues.
-- `active_states` must include the configured Ready and Building values. `terminal_states` must
-  include `closed` and must leave Done and Blocked requeueable.
+- `active_states` must include Ready, Building, QA, Review, and Human Review. `terminal_states` must
+  include `closed` and Dropped, leaving Done and Blocked requeueable.
 - Only Ready Project items linked to native GitHub Issues with an exact repository profile are
   dispatched. Pull requests, draft issues, and unsupported item types are ignored. An unconfigured
   repository is moved to Blocked and receives a comment explaining the missing profile.
 - Work identity is `owner/repository#number`. Claiming moves Ready to Building, successful completion
   moves Building to Done, and intervention-required failures move to Blocked with a comment. Transient
   failures retry on the existing backoff path.
+- Native GitHub `blocked by` relations populate `issue.blocked_by` with `owner/repository#number`
+  identities. Incomplete or failed blocker reads fail the Project refresh instead of dropping
+  dependency data.
 - Project items can belong to either a user or organization Project. The optional `graphql_url`
   setting defaults to `https://api.github.com/graphql`.
 - Tool: the Linear adapter advertises `linear_graphql`, accepting either a raw query string or an
@@ -391,7 +352,7 @@ The observability UI now runs on a minimal Phoenix stack:
 ## Testing
 
 ```bash
-make all
+MIX='mise exec -- mix' make all
 ```
 
 Run the real external end-to-end test only when you want Symphony to create disposable Linear
@@ -400,7 +361,7 @@ resources and launch a real `codex app-server` session:
 ```bash
 cd elixir
 export LINEAR_API_KEY=...
-make e2e
+MIX='mise exec -- mix' make e2e
 ```
 
 Optional environment variables:
@@ -469,14 +430,8 @@ SYMPHONY_RUN_GITLAB_LIVE_E2E=1 mix test test/symphony_elixir/gitlab_live_e2e_tes
 
 ### Why Elixir?
 
-Elixir is built on Erlang/BEAM/OTP, which is great for supervising long-running processes. It has an
-active ecosystem of tools and libraries. It also supports hot code reloading without stopping
-actively running subagents, which is very useful during development.
-
-### What's the easiest way to set this up for my own codebase?
-
-Launch `codex` in your repo, give it the URL to the Symphony repo, and ask it to set things up for
-you.
+Elixir/OTP provides supervision and fault isolation for the long-running scheduler and its workers.
+SQLite checkpoints let the Projects pipeline resume after a service restart.
 
 ## License
 

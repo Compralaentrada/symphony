@@ -119,6 +119,13 @@ defmodule SymphonyElixir.CoreTest do
     assert get_in(tracker, ["provider", "owner"]) == "Compralaentrada"
     assert get_in(tracker, ["provider", "project_number"]) == 9
     assert get_in(tracker, ["provider", "token"]) == "$GITHUB_TOKEN"
+    assert get_in(tracker, ["active_states"]) == ["Ready", "Building", "QA", "Review", "Human Review"]
+    assert get_in(tracker, ["terminal_states"]) == ["closed", "Dropped"]
+    refute Map.has_key?(tracker["provider"], "status_field")
+    refute Map.has_key?(tracker["provider"], "status_values")
+
+    assert :ok = Config.validate!()
+    assert SymphonyElixir.Pipeline.enabled?()
 
     assert get_in(tracker, ["provider", "repositories"]) == [
              %{
@@ -1581,7 +1588,7 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}'
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
+            printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-1\",\"turn\":{\"id\":\"turn-1\",\"status\":\"completed\"}}}'
             exit 0
             ;;
           *)
@@ -1666,7 +1673,7 @@ defmodule SymphonyElixir.CoreTest do
               printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-live\"}}}'
               ;;
             4)
-              printf '%s\\n' '{\"method\":\"turn/completed\"}'
+              printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-live\",\"turn\":{\"id\":\"turn-live\",\"status\":\"completed\"}}}'
               ;;
             *)
               ;;
@@ -1828,11 +1835,11 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-cont","turn":{"id":"turn-cont-1","status":"completed"}}}'
             ;;
           5)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-cont","turn":{"id":"turn-cont-2","status":"completed"}}}'
             ;;
         esac
       done
@@ -1966,11 +1973,11 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-max","turn":{"id":"turn-max-1","status":"completed"}}}'
             ;;
           5)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-max","turn":{"id":"turn-max-2","status":"completed"}}}'
             ;;
         esac
       done
@@ -2070,7 +2077,7 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-77\"}}}'
             ;;
           4)
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
+            printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-77\",\"turn\":{\"id\":\"turn-77\",\"status\":\"completed\"}}}'
             exit 0
             ;;
           *)
@@ -2214,7 +2221,7 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-88\"}}}'
             ;;
           4)
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
+            printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-88\",\"turn\":{\"id\":\"turn-88\",\"status\":\"completed\"}}}'
             exit 0
             ;;
           *)
@@ -2300,7 +2307,7 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-99"}}}'
             ;;
           4)
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-99","turn":{"id":"turn-99","status":"completed"}}}'
             exit 0
             ;;
           *)

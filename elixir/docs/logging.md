@@ -8,6 +8,12 @@ This guide defines logging conventions for Symphony so Codex can diagnose failur
 - Capture enough execution context to identify root cause without reruns.
 - Keep messages stable so dashboards/alerts are reliable.
 
+## Files
+
+`SymphonyElixir.LogFile` writes all levels to `log/symphony.log.1` and duplicates warnings and
+errors to `log/symphony-errors.log.1`. Both use the same rotation policy; `--logs-root` changes
+their parent directory.
+
 ## Required Context Fields
 
 When logging tracker work, include both identifiers:

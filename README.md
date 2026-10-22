@@ -1,45 +1,73 @@
 # Symphony
 
-Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
-work instead of supervising coding agents.
+Symphony coordina agentes de código para llevar trabajo de desarrollo desde un GitHub Project hasta
+una entrega revisable. Lee las tareas admitidas, prepara un workspace aislado para el repositorio
+correspondiente y ejecuta las fases necesarias con Codex.
 
-[![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
+## Qué hace
 
-_In this [demo video](https://player.vimeo.com/video/1186371009?h=5626e4b899), Symphony monitors a Linear board for work and spawns agents to handle the tasks. The agents complete the tasks and provide proof of work: CI status, PR review feedback, complexity analysis, and walkthrough videos. When accepted, the agents land the PR safely. Engineers do not need to supervise Codex; they can manage the work at a higher level._
+- Coordina varios repositorios desde un único GitHub Project v2 mediante perfiles de repositorio.
+- Ejecuta Build, QA y Review en sesiones separadas y comprueba los comandos `required_checks` del
+  repositorio durante QA.
+- Publica informes Markdown en español para issues en español y en inglés para el resto.
+- Guarda checkpoints del pipeline en SQLite para reanudar el trabajo tras un reinicio.
+- Expone el estado operativo en un dashboard y una API JSON.
+- Espera una fusión humana por defecto; solo `auto` explícito solicita la fusión al gate determinista.
+  Symphony nunca aprueba PRs y solo marca una tarea como Done tras confirmar la fusión.
 
-> [!WARNING]
-> Symphony is a low-key engineering preview for testing in trusted environments.
+En el pipeline de Projects, el estado visible del Project determina el despacho. El flujo normal es
+`Ready → Building → QA → Review → Human Review → Done`; las tareas que requieren intervención
+pueden pasar a `Blocked`. Mover una tarea de `Human Review` a `Ready` solicita correcciones sobre la
+misma rama y PR. Antes de QA o Review, Symphony comprueba que el `head SHA` de la PR siga siendo el
+que aceptó Build y que el workspace esté limpio en ese SHA. Si una tarea bloqueada en QA o Review
+vuelve de `Blocked` a `Ready` con el head cambiado o sin PR, reinicia en `Build` y repite ambas
+fases. Si falla una comprobación previa, el agente del lane `diagnostic` lee el workpad e inspecciona
+el workspace y la PR antes de documentar el motivo y la recuperación en la issue y el Project.
+Symphony detecta el bloqueo y coordina esa sesión, pero no escribe en GitHub.
 
-## Running Symphony
+El tablero usa el campo `Status` y las opciones canónicas de Symphony: `Backlog`, `Ready`, `Building`,
+`QA`, `Review`, `Human Review`, `Blocked`, `Done` y `Dropped`.
 
-### Requirements
+El runtime también incluye adaptadores para GitHub Issues, Linear, Jira Cloud, Asana y GitLab. El
+pipeline multi-repositorio descrito aquí está centrado en GitHub Projects v2.
 
-Symphony works best in codebases that have adopted
-[harness engineering](https://openai.com/index/harness-engineering/). Symphony is the next step --
-moving from managing coding agents to managing work that needs to get done.
+## Estado del proyecto
 
-### Option 1. Make your own
+El pipeline y la recuperación durable están implementados. En ejecuciones desde GitHub Issues o
+GitHub Projects, el agente de cada tarea es propietario de sus escrituras de issue y PR. En el
+pipeline Projects, Build, QA y Review gestionan las operaciones de su lane mediante herramientas del
+host; Symphony conserva la lectura, el scheduling, los leases, los checkpoints y la reconciliación.
 
-Tell your favorite coding agent to build Symphony in a programming language of your choice:
+## Empezar en local
 
-> Implement Symphony according to the following spec:
-> https://github.com/openai/symphony/blob/main/SPEC.md
+Requisitos: macOS o Linux, `mise`, Git, Codex CLI autenticado y acceso de escritura a los
+repositorios configurados. Configura `GITHUB_TOKEN` con acceso al Project y a sus issues, y
+credenciales Git en el host para publicar ramas.
 
-### Option 2. Use our experimental reference implementation
+```sh
+git clone https://github.com/Compralaentrada/symphony.git
+cd symphony/elixir
+mise trust
+mise install
+mise exec -- mix setup
+mise exec -- mix run --no-start --no-halt -e 'SymphonyElixir.CLI.main(["--i-understand-that-this-will-be-running-without-the-usual-guardrails", "--port", "4000", "./WORKFLOW.md"])'
+```
 
-Check out [elixir/README.md](elixir/README.md) for instructions on how to set up your environment
-and run the Elixir-based Symphony implementation, which includes Linear, GitHub Issues, GitHub
-Projects v2, Jira, Asana, and GitLab tracker adapters. With a configured Projects v2 board, it can
-run Build, QA, and autonomous Review before waiting at Human Review for a person to request changes
-or merge. The installation-level merge policy defaults to human review; automatic merging requires
-the explicit `auto` setting, and Symphony never approves PRs automatically. You can also ask your
-favorite coding agent to help with the setup:
+El comando deja el servicio en primer plano y habilita el dashboard en `http://localhost:4000`. La
+configuración incluida en [`elixir/WORKFLOW.md`](elixir/WORKFLOW.md) corresponde al piloto de este
+repositorio; revísala antes de usarla con otro Project o repositorio.
 
-> Set up Symphony for my repository based on
-> https://github.com/openai/symphony/blob/main/elixir/README.md
+## Desarrollo y documentación
 
----
+```sh
+MIX='mise exec -- mix' make -C elixir all
+```
 
-## License
+- [Guía de ejecución y configuración](elixir/README.md)
+- [Workflow del piloto](elixir/WORKFLOW.md)
+- [Plan del producto](docs/superboard-symphony-plan.md)
+- [Decisión sobre escrituras de GitHub](docs/adr/0002-agentes-propietarios-de-escrituras-github.md)
 
-This project is licensed under the [Apache License 2.0](LICENSE).
+## Licencia
+
+Este proyecto está publicado bajo la [Apache License 2.0](LICENSE).
