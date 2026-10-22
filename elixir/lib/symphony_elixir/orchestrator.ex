@@ -1011,6 +1011,7 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
     Enum.all?([id, identifier, title, state_name], &present_string?/1) and
       issue_routable?(issue) and
+      project_dependencies_resolved?(issue) and
       active_issue_state?(state_name, active_states) and
       !terminal_issue_state?(state_name, terminal_states)
   end
@@ -1020,6 +1021,20 @@ defmodule SymphonyElixir.Orchestrator do
   defp issue_routable?(%Issue{} = issue) do
     Issue.routable?(issue, Config.settings!().tracker.required_labels)
   end
+
+  defp project_dependencies_resolved?(%Issue{dependency_error: error}) when is_binary(error), do: true
+
+  defp project_dependencies_resolved?(%Issue{blocked_by: blockers}) do
+    not Pipeline.enabled?() or
+      (is_list(blockers) and Enum.all?(blockers, &closed_project_blocker?/1))
+  end
+
+  defp closed_project_blocker?(blocker) when is_map(blocker) do
+    state = Map.get(blocker, :state) || Map.get(blocker, "state")
+    is_binary(state) and normalize_issue_state(state) == "closed"
+  end
+
+  defp closed_project_blocker?(_blocker), do: false
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
     MapSet.member?(terminal_states, normalize_issue_state(state_name))
@@ -1235,8 +1250,14 @@ defmodule SymphonyElixir.Orchestrator do
       prior_findings: task["prior_findings"] || []
     ]
 
-    result = runner.run(issue, recipient, opts)
-    result = diagnose_system_blocker(runner, issue, recipient, opts, result)
+    result =
+      if is_binary(issue.dependency_error) do
+        diagnostic_opts = Keyword.put(opts, :diagnostic_reason, issue.dependency_error)
+        runner.run(issue, recipient, Keyword.put(diagnostic_opts, :diagnostic, true))
+      else
+        runner.run(issue, recipient, opts)
+        |> then(&diagnose_system_blocker(runner, issue, recipient, opts, &1))
+      end
 
     send(recipient, {:pipeline_phase_result, issue.id, task["generation"], phase, phase_attempt, result})
   end

@@ -509,10 +509,22 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp phase_instructions(phase, opts) do
-    if Keyword.get(opts, :diagnostic, false), do: diagnostic_phase_instructions(phase), else: pipeline_phase_instructions(phase, opts)
+    if Keyword.get(opts, :diagnostic, false),
+      do: diagnostic_phase_instructions(phase, Keyword.get(opts, :diagnostic_reason)),
+      else: pipeline_phase_instructions(phase, opts)
   end
 
-  defp diagnostic_phase_instructions(phase) do
+  defp diagnostic_phase_instructions(phase, reason) when is_binary(reason) do
+    """
+    Pipeline lane: Diagnostic for #{phase}.
+    Symphony could not verify this issue's blocker relationships: #{reason}
+    Read the issue workpad and current-generation phase reports with `github_workflow` operation `read_workpad`. Independently inspect the task workspace and the repository's current pull request using read-only commands and GitHub reads. Diagnose why the normal phase cannot safely continue, using only saved task records and observed facts.
+    Record the diagnosis and recovery step in the persistent workpad with `github_workflow` operation `workpad`, then use `github_workflow` operation `handoff`, outcome `blocked`, with the complete report matching the #{phase} JSON schema. The host verifies and checkpoints your report.
+    Do not edit files, push, merge, or change the pull request. Do not guess at missing evidence.
+    """
+  end
+
+  defp diagnostic_phase_instructions(phase, _reason) do
     """
     Pipeline lane: Diagnostic for #{phase}.
     Read the issue workpad and current-generation phase reports with `github_workflow` operation `read_workpad`. Independently inspect the task workspace and the repository's current pull request using read-only commands and GitHub reads. Diagnose why the normal phase cannot safely continue, using only saved task records and observed facts.

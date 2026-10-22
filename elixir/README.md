@@ -259,8 +259,11 @@ tracker:
   moves Building to Done, and intervention-required failures move to Blocked with a comment. Transient
   failures retry on the existing backoff path.
 - Native GitHub `blocked by` relations populate `issue.blocked_by` with `owner/repository#number`
-  identities. Incomplete or failed blocker reads fail the Project refresh instead of dropping
-  dependency data.
+  identities. Open blockers wait without dispatch; closed blockers clear the dependency gate.
+  Malformed, ambiguous, incomplete, or permission-limited relations stay attached to the issue as
+  `dependency_error` and enter the restricted diagnostic lane. That agent requests `Blocked` with
+  the reason and correction through the mediated GitHub workflow. Transient tracker read failures
+  keep the existing retry behavior.
 - Project items can belong to either a user or organization Project. The optional `graphql_url`
   setting defaults to `https://api.github.com/graphql`.
 - Tool: the Linear adapter advertises `linear_graphql`, accepting either a raw query string or an

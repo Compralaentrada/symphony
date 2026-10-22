@@ -23,6 +23,7 @@ defmodule SymphonyElixir.Tracker.Issue do
     requeueable: false,
     tracker_blocked: false,
     blocked_by: [],
+    dependency_error: nil,
     labels: [],
     dispatchable: false,
     created_at: nil,
@@ -44,6 +45,7 @@ defmodule SymphonyElixir.Tracker.Issue do
           tracker_blocked: boolean(),
           labels: [String.t()],
           blocked_by: [map()],
+          dependency_error: String.t() | nil,
           dispatchable: boolean(),
           created_at: DateTime.t() | nil,
           updated_at: DateTime.t() | nil

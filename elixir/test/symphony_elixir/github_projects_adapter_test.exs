@@ -1479,28 +1479,54 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert Enum.map(issue.blocked_by, & &1.id) == ["octo/app#8", "octo/docs#8"]
   end
 
-  test "incomplete blocker pages and blocker read errors fail the Project read" do
+  test "invalid dependency data stays attached to the affected Project issue" do
     incomplete =
       issue_item("octo/app", 7, "Ready")
       |> put_in(["content", "blockedBy"], %{"nodes" => [], "pageInfo" => %{"hasNextPage" => true}})
-
-    assert {:error, {:github_projects_api_error, _}} =
-             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn _query, _variables, _settings ->
-               {:ok, %{status: 200, body: project_response([incomplete])}}
-             end)
 
     incomplete_count =
       issue_item("octo/app", 7, "Ready")
       |> put_in(["content", "blockedBy"], dependency_connection([], false, nil, 1))
 
-    assert {:error, {:github_projects_api_error, _}} =
-             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn _query, _variables, _settings ->
-               {:ok, %{status: 200, body: project_response([incomplete_count])}}
-             end)
+    unresolved_identity =
+      issue_item("octo/app", 7, "Ready")
+      |> put_in(["content", "blockedBy"], dependency_connection([blocker("octo/app", 0)]))
 
+    ambiguous =
+      issue_item("octo/app", 7, "Ready")
+      |> put_in(["content", "blockedBy"], dependency_connection([blocker("octo/app", 8), blocker("octo/app", 8)]))
+
+    unknown_state =
+      issue_item("octo/app", 7, "Ready")
+      |> put_in(["content", "blockedBy"], dependency_connection([blocker("octo/app", 8, "MERGED")]))
+
+    for item <- [incomplete, incomplete_count, unresolved_identity, ambiguous, unknown_state] do
+      assert {:ok, [issue]} =
+               Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn _query, _variables, _settings ->
+                 {:ok, %{status: 200, body: project_response([item])}}
+               end)
+
+      assert issue.id == "octo/app#7"
+      assert issue.blocked_by == []
+      assert is_binary(issue.dependency_error)
+    end
+  end
+
+  test "blocker permission errors are diagnosed while transient page read failures retry" do
     paged =
       issue_item("octo/app", 7, "Ready")
-      |> put_in(["content", "blockedBy"], dependency_connection([], true, "blocker-cursor", 1))
+      |> put_in(["content", "blockedBy"], dependency_connection([blocker("octo/app", 8)], true, "blocker-cursor", 2))
+
+    assert {:ok, [issue]} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn query, _variables, _settings ->
+               if query =~ "SymphonyIssueBlockers" do
+                 {:ok, %{status: 403, body: %{}}}
+               else
+                 {:ok, %{status: 200, body: project_response([paged])}}
+               end
+             end)
+
+    assert issue.dependency_error =~ "access"
 
     assert {:error, {:github_projects_api_error, _}} =
              Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn query, _variables, _settings ->
@@ -1510,6 +1536,37 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
                  {:ok, %{status: 200, body: project_response([paged])}}
                end
              end)
+  end
+
+  test "partial dependency responses retain the issue and a corrected relationship can be read again" do
+    partial =
+      project_response([issue_item("octo/app", 7, "Ready")])
+      |> Map.put("errors", [
+        %{
+          "type" => "FORBIDDEN",
+          "path" => ["organization", "projectV2", "items", "nodes", 0, "content", "blockedBy"],
+          "message" => "Resource not accessible by integration"
+        }
+      ])
+
+    assert {:ok, [invalid]} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn _query, _variables, _settings ->
+               {:ok, %{status: 200, body: partial}}
+             end)
+
+    assert is_binary(invalid.dependency_error)
+
+    corrected =
+      issue_item("octo/app", 7, "Ready")
+      |> put_in(["content", "blockedBy"], dependency_connection([blocker("octo/docs", 8, "CLOSED")]))
+
+    assert {:ok, [recovered]} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn _query, _variables, _settings ->
+               {:ok, %{status: 200, body: project_response([corrected])}}
+             end)
+
+    assert recovered.dependency_error == nil
+    assert recovered.blocked_by == [%{id: "octo/docs#8", identifier: "octo/docs#8", state: "CLOSED"}]
   end
 
   defp tracker_settings(provider_overrides \\ %{}) do
