@@ -3,6 +3,21 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
   alias SymphonyElixir.{Config, Pipeline}
 
+  test "pipeline reconciliation fetches all task issues in one tracker lookup" do
+    issues = [issue("octo/app#20", 20), issue("octo/app#21", 21)]
+    table = start_board(issues, %{})
+    pipeline_database!(table)
+
+    Enum.each(issues, fn issue ->
+      assert {:ok, _task, "build"} = Pipeline.prepare(issue)
+    end)
+
+    assert :ok = Pipeline.reconcile()
+    assert [{:fetch_issues_by_ids_calls, 1}] = :ets.lookup(table, :fetch_issues_by_ids_calls)
+    assert [{{:fetch_issues_by_ids_call, 1}, ids}] = :ets.lookup(table, {:fetch_issues_by_ids_call, 1})
+    assert MapSet.new(ids) == MapSet.new(Enum.map(issues, & &1.id))
+  end
+
   test "report locale uses Spanish only for Spanish issue descriptions" do
     for {description, locale} <- [
           {"Implementar soporte para nuevas salas", :es},
@@ -983,7 +998,13 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
     {:ok, issues() |> Enum.filter(&(&1.state in states))}
   end
 
-  def fetch_issues_by_ids(ids), do: {:ok, Enum.filter(issues(), &(&1.id in ids))}
+  def fetch_issues_by_ids(ids) do
+    table = table()
+    call = :ets.update_counter(table, :fetch_issues_by_ids_calls, {2, 1}, {:fetch_issues_by_ids_calls, 0})
+    :ets.insert(table, {{:fetch_issues_by_ids_call, call}, ids})
+    {:ok, Enum.filter(issues(), &(&1.id in ids))}
+  end
+
   def claim_issue(issue), do: set_pipeline_status(issue, :building)
   def complete_issue(issue), do: set_pipeline_status(issue, :done)
   def block_issue(issue, _reason), do: set_pipeline_status(issue, :blocked)
