@@ -129,6 +129,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_pipeline_phase(session, issue, recipient, opts) do
     phase = Keyword.fetch!(opts, :phase)
     message_key = {__MODULE__, make_ref()}
+    report_language = report_language_name(Pipeline.report_locale(issue))
 
     on_message = fn message ->
       send_codex_update(recipient, issue, message)
@@ -154,6 +155,7 @@ defmodule SymphonyElixir.AgentRunner do
       |> Kernel.<>(
         "\n\n" <>
           pipeline_phase_instructions(phase, opts) <>
+          "\nWrite report values in #{report_language} (Spanish only for Spanish issues; English otherwise). Keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details." <>
           "\nThe phase report JSON contract overrides any skill's preferred presentation format."
       )
 
@@ -169,7 +171,7 @@ defmodule SymphonyElixir.AgentRunner do
 
           case run_phase_turn(
                  session,
-                 phase_report_correction_prompt(),
+                 phase_report_correction_prompt(report_language),
                  issue,
                  on_message,
                  message_key,
@@ -203,9 +205,10 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp phase_report_correction_prompt do
+  defp phase_report_correction_prompt(report_language) do
     """
     The previous response did not match the pipeline's required phase report. Return exactly one JSON object using the fields and allowed outcome from the preceding phase instructions, including the exact key names required for each finding. Preserve its findings and conclusions; do not repeat the work. The pipeline's JSON report contract overrides any skill's preferred prose format.
+    Write report values in #{report_language} (Spanish only for Spanish issues; English otherwise). Preserve every fact, result, and evidence item without inventing details.
     The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
     Do not include headings, bullets, Markdown, code fences, or text outside the JSON object.
     """
@@ -216,7 +219,7 @@ defmodule SymphonyElixir.AgentRunner do
     Pipeline phase: Build.
     Implement the issue, preserve the configured branch #{Keyword.get(opts, :branch)}, and push your work to origin.
     Previously reported findings to address: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
-    Use the Humanizer guidance for report values: write in the issue description's language, keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details.
+    Use the Humanizer guidance for report values.
     Do not create or update a pull request, change Project status, or comment on the issue; Symphony owns those writes.
     Finish with exactly one JSON object containing outcome (ready, no_changes, or blocked), summary, criteria, changes, checks, risks, next_step, reason when blocked or no_changes, and sha after pushing.
     criteria, changes, checks, and risks must be JSON arrays, even when empty. Put each risk in its own string element.
@@ -230,7 +233,7 @@ defmodule SymphonyElixir.AgentRunner do
     Prior findings to recheck after Build: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
     Required checks: #{Enum.join(Keyword.get(opts, :required_checks, []), ", ")}.
     Symphony runs these configured checks on the workspace after your review. Do not claim their result or evidence; return an empty checks list. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings.
-    Use the Humanizer guidance for report values: write in the issue description's language, keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details.
+    Use the Humanizer guidance for report values.
     Do not modify files or write to GitHub. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end
@@ -242,10 +245,13 @@ defmodule SymphonyElixir.AgentRunner do
     Do not invoke the repository's `code-review` skill or its Markdown report format; perform this review directly under the pipeline's JSON contract.
     The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
     Do not modify files or write to GitHub. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
-    Use the Humanizer guidance for report values: write in the issue description's language, keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details.
+    Use the Humanizer guidance for report values.
     Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit. Do not include headings, bullets, Markdown, code fences, or commentary outside that object.
     """
   end
+
+  defp report_language_name(:es), do: "Spanish"
+  defp report_language_name(_locale), do: "English"
 
   defp phase_delta(%{payload: %{"method" => "item/agentMessage/delta", "params" => params}})
        when is_map(params) do

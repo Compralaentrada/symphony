@@ -5,8 +5,9 @@ defmodule SymphonyElixir.Pipeline do
   alias SymphonyElixir.Tracker.Issue
 
   @phases ~w(build qa review)
-  # shortcut: ambiguous text under 80% confidence falls back to English; revisit with more locale fixtures.
-  @report_locale_confidence 0.8
+  # shortcut: 30 randomized Tongue samples smooth locale scores; revisit if locale coverage or accuracy needs change.
+  @report_locale_samples 30
+  @report_locale_confidence 0.75
   @statuses %{
     backlog: "Backlog",
     ready: "Ready",
@@ -25,20 +26,11 @@ defmodule SymphonyElixir.Pipeline do
     tracker.kind == "github_projects"
   end
 
-  @spec report_locale(Issue.t()) :: :en | :es | :fr | :de
+  @spec report_locale(Issue.t()) :: :en | :es
   def report_locale(%Issue{description: description}) do
     description = if is_binary(description), do: String.downcase(description), else: ""
-
-    case Tongue.detect(description) do
-      [] ->
-        :en
-
-      detections ->
-        case Enum.max_by(detections, &elem(&1, 1)) do
-          {locale, confidence} when locale in [:es, :fr, :de] and confidence >= @report_locale_confidence -> locale
-          _ -> :en
-        end
-    end
+    confidence = Enum.reduce(1..@report_locale_samples, 0.0, fn _, total -> total + Keyword.get(Tongue.detect(description), :es, 0.0) end) / @report_locale_samples
+    if confidence >= @report_locale_confidence, do: :es, else: :en
   end
 
   @spec reconcile() :: :ok | {:error, term()}
@@ -90,18 +82,14 @@ defmodule SymphonyElixir.Pipeline do
         report_text(
           locale,
           "A person must resolve this blocker before the phase can continue.",
-          "Hace falta resolver este bloqueo para continuar con la fase.",
-          "Une personne doit résoudre ce blocage pour que la phase puisse continuer.",
-          "Eine Person muss das Hindernis beheben, damit die Phase fortgesetzt werden kann."
+          "Hace falta resolver este bloqueo para continuar con la fase."
         ),
       "reason" => reason,
       "next_step" =>
         report_text(
           locale,
           "Resolve the blocker and move the Project item to Ready.",
-          "Resuelve el bloqueo y mueve la tarea a Ready.",
-          "Résous le blocage et déplace l’élément du Project vers Ready.",
-          "Behebe das Hindernis und verschiebe das Project-Element auf Ready."
+          "Resuelve el bloqueo y mueve la tarea a Ready."
         ),
       "checks" => [],
       "sha" => task["current_sha"]
@@ -313,18 +301,14 @@ defmodule SymphonyElixir.Pipeline do
                 report_text(
                   report_locale(issue),
                   "Autonomous Review did not resolve all prior findings.",
-                  "La revisión automática dejó hallazgos pendientes.",
-                  "La revue automatique n’a pas traité tous les constats précédents.",
-                  "Die automatische Review hat frühere Befunde nicht behoben."
+                  "La revisión automática dejó hallazgos pendientes."
                 ),
               "findings" => findings,
               "next_step" =>
                 report_text(
                   report_locale(issue),
                   "Fix the remaining findings and submit a new Build delivery.",
-                  "Corrige los hallazgos y vuelve a entregar el trabajo en Build.",
-                  "Corrige les constats restants et soumets une nouvelle livraison Build.",
-                  "Behebe die offenen Befunde und übergib die Arbeit erneut an Build."
+                  "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
                 )
             })
 
@@ -580,17 +564,13 @@ defmodule SymphonyElixir.Pipeline do
         report_text(
           locale,
           "Work was dropped without a merged pull request.",
-          "El trabajo se descartó sin fusionar una pull request.",
-          "Le travail a été abandonné sans fusion de la pull request.",
-          "Die Arbeit wurde ohne gemergten Pull Request verworfen."
+          "El trabajo se descartó sin fusionar una pull request."
         ),
       "next_step" =>
         report_text(
           locale,
           "Create a new issue if this work should be started again.",
-          "Crea una issue nueva si hay que retomar este trabajo.",
-          "Crée une nouvelle issue si ce travail doit être repris.",
-          "Erstelle ein neues Issue, wenn diese Arbeit erneut begonnen werden soll."
+          "Crea una issue nueva si hay que retomar este trabajo."
         )
     }
 
@@ -613,9 +593,7 @@ defmodule SymphonyElixir.Pipeline do
       report_text(
         locale,
         "Add a human-authored `Drop reason: <reason>` line to the issue body to confirm this discard.",
-        "Añade a la descripción de la issue una línea escrita por una persona con el formato `Drop reason: <motivo>` para confirmar el descarte.",
-        "Ajoute une ligne `Drop reason: <reason>` à la description de l’issue pour confirmer son abandon.",
-        "Ergänze im Issue-Text eine von einer Person verfasste Zeile `Drop reason: <reason>`, um das Verwerfen zu bestätigen."
+        "Añade a la descripción de la issue una línea escrita por una persona con el formato `Drop reason: <motivo>` para confirmar el descarte."
       )
 
     result = %{
@@ -624,18 +602,14 @@ defmodule SymphonyElixir.Pipeline do
         report_text(
           locale,
           "A human-authored reason is required before this work can be dropped.",
-          "Hace falta un motivo escrito por una persona para descartar este trabajo.",
-          "Un motif rédigé par une personne est nécessaire avant d’abandonner ce travail.",
-          "Vor dem Verwerfen dieser Arbeit ist eine von einer Person verfasste Begründung erforderlich."
+          "Hace falta un motivo escrito por una persona para descartar este trabajo."
         ),
       "reason" => reason,
       "next_step" =>
         report_text(
           locale,
           "Add the drop reason to the issue body. Symphony will then mark the task Dropped.",
-          "Añade el motivo de descarte a la descripción de la issue. Symphony marcará la tarea como Dropped.",
-          "Ajoute le motif d’abandon à la description de l’issue. Symphony passera ensuite la tâche à Dropped.",
-          "Ergänze den Verwerfungsgrund im Issue-Text. Symphony setzt die Aufgabe dann auf Dropped."
+          "Añade el motivo de descarte a la descripción de la issue. Symphony marcará la tarea como Dropped."
         )
     }
 
@@ -664,17 +638,15 @@ defmodule SymphonyElixir.Pipeline do
 
         state_reason_text =
           if is_binary(state_reason) and state_reason != "" do
-            report_text(locale, " with reason #{state_reason}", " con el motivo #{state_reason}", " avec le motif #{state_reason}", " mit dem Grund #{state_reason}")
+            report_text(locale, " with reason #{state_reason}", " con el motivo #{state_reason}")
           else
-            report_text(locale, " by a human", " por decisión humana", " par une personne", " durch eine Person")
+            report_text(locale, " by a human", " por decisión humana")
           end
 
         report_text(
           locale,
           "GitHub issue closed#{state_reason_text} before the PR merged.",
-          "La issue de GitHub se cerró#{state_reason_text} antes de fusionar la pull request.",
-          "L’issue GitHub a été fermée#{state_reason_text} avant la fusion de la pull request.",
-          "Das GitHub-Issue wurde#{state_reason_text} geschlossen, bevor der Pull Request gemergt wurde."
+          "La issue de GitHub se cerró#{state_reason_text} antes de fusionar la pull request."
         )
     end
   end
@@ -724,21 +696,12 @@ defmodule SymphonyElixir.Pipeline do
   defp report_header(phase, outcome, :es, labels),
     do: "## Informe de Symphony: #{phase_title(phase, :es)} (#{Map.get(labels.outcomes, outcome, outcome)})"
 
-  defp report_header(phase, outcome, :fr, labels),
-    do: "## Rapport Symphony : #{phase_title(phase, :fr)} (#{Map.get(labels.outcomes, outcome, outcome)})"
-
-  defp report_header(phase, outcome, :de, labels),
-    do: "## Symphony-Bericht: #{phase_title(phase, :de)} (#{Map.get(labels.outcomes, outcome, outcome)})"
-
   defp report_header(phase, outcome, _locale, labels),
     do: "## Symphony #{phase_title(phase, :en)} report (#{Map.get(labels.outcomes, outcome, outcome)})"
 
   defp phase_title("qa", _locale), do: "QA"
   defp phase_title("dropped", :es), do: "Descartado"
-  defp phase_title("dropped", :fr), do: "Abandonné"
-  defp phase_title("dropped", :de), do: "Verworfen"
   defp phase_title("dropped", _locale), do: "Dropped"
-  defp phase_title("review", :fr), do: "Revue"
   defp phase_title(phase, _locale), do: String.capitalize(phase)
 
   defp report_checks_section(label, [], "blocked", locale) do
@@ -782,19 +745,17 @@ defmodule SymphonyElixir.Pipeline do
 
   defp report_check_status(_status, _labels), do: nil
 
-  defp localize_check_evidence(evidence, locale) when is_binary(evidence) and locale in [:es, :fr, :de] do
+  defp localize_check_evidence(evidence, :es) when is_binary(evidence) do
     case Regex.run(~r/^Symphony ran the configured check at SHA (.+); host exit status (\d+)\.$/, evidence) do
       [_, sha, status] ->
         report_text(
-          locale,
+          :es,
           "Symphony ran the configured check at SHA #{sha}; host exit status #{status}.",
-          "Symphony ejecutó la comprobación configurada en SHA #{sha}; código de salida del host: #{status}.",
-          "Symphony a exécuté la vérification configurée pour le SHA #{sha} ; code de sortie de l’hôte : #{status}.",
-          "Symphony hat die konfigurierte Prüfung für SHA #{sha} ausgeführt; Exitcode des Hosts: #{status}."
+          "Symphony ejecutó la comprobación configurada en SHA #{sha}; código de salida del host: #{status}."
         )
 
       _ ->
-        localize_other_check_evidence(evidence, locale)
+        localize_other_check_evidence(evidence, :es)
     end
   end
 
@@ -806,18 +767,6 @@ defmodule SymphonyElixir.Pipeline do
 
   defp localize_other_check_evidence("Symphony did not run the check because workspace HEAD or files differed from accepted SHA " <> rest, :es),
     do: "Symphony no ejecutó la comprobación porque el HEAD o los archivos del workspace no coincidían con el SHA aceptado " <> rest
-
-  defp localize_other_check_evidence("Symphony could not execute the required check.", :fr),
-    do: "Symphony n’a pas pu exécuter la vérification requise."
-
-  defp localize_other_check_evidence("Symphony did not run the check because workspace HEAD or files differed from accepted SHA " <> rest, :fr),
-    do: "Symphony n’a pas exécuté la vérification, car le HEAD ou les fichiers de l’espace de travail ne correspondaient pas au SHA accepté " <> rest
-
-  defp localize_other_check_evidence("Symphony could not execute the required check.", :de),
-    do: "Symphony konnte die erforderliche Prüfung nicht ausführen."
-
-  defp localize_other_check_evidence("Symphony did not run the check because workspace HEAD or files differed from accepted SHA " <> rest, :de),
-    do: "Symphony hat die Prüfung nicht ausgeführt, weil der HEAD oder die Dateien im Workspace nicht mit dem akzeptierten SHA übereinstimmten " <> rest
 
   defp localize_other_check_evidence(evidence, _locale), do: evidence
 
@@ -883,72 +832,6 @@ defmodule SymphonyElixir.Pipeline do
     }
   end
 
-  defp report_labels(:fr) do
-    %{
-      summary: "Résumé",
-      criteria: "Critères d’acceptation",
-      changes: "Modifications",
-      checks: "Vérifications",
-      check: "Vérification",
-      findings: "Constats",
-      resolutions: "Corrections",
-      risks: "Risques",
-      sha: "SHA",
-      validation: "Validation du pipeline",
-      reason: "Motif",
-      blocker: "Blocage",
-      next_step: "Étape suivante",
-      reproduction: "Reproduction",
-      criterion: "Critère",
-      no_checks: "Aucune vérification n’a été exécutée, car la phase est bloquée.",
-      no_check_results: "Aucun résultat de test n’a été communiqué pour cette phase bloquée.",
-      check_statuses: %{"passed" => "réussie", "failed" => "échouée", "unavailable" => "indisponible"},
-      outcomes: %{
-        "ready" => "prêt",
-        "no_changes" => "sans changement",
-        "blocked" => "bloqué",
-        "passed" => "réussi",
-        "changes_requested" => "modifications requises",
-        "failed" => "échec",
-        "defects_found" => "défauts détectés",
-        "dropped" => "abandonné"
-      }
-    }
-  end
-
-  defp report_labels(:de) do
-    %{
-      summary: "Zusammenfassung",
-      criteria: "Akzeptanzkriterien",
-      changes: "Änderungen",
-      checks: "Prüfungen",
-      check: "Prüfung",
-      findings: "Befunde",
-      resolutions: "Behobene Punkte",
-      risks: "Risiken",
-      sha: "SHA",
-      validation: "Pipeline-Validierung",
-      reason: "Grund",
-      blocker: "Hindernis",
-      next_step: "Nächster Schritt",
-      reproduction: "Reproduktion",
-      criterion: "Kriterium",
-      no_checks: "Es wurden keine Prüfungen ausgeführt, weil die Phase blockiert ist.",
-      no_check_results: "Für diese blockierte Phase wurden keine Prüfergebnisse gemeldet.",
-      check_statuses: %{"passed" => "bestanden", "failed" => "fehlgeschlagen", "unavailable" => "nicht verfügbar"},
-      outcomes: %{
-        "ready" => "bereit",
-        "no_changes" => "keine Änderungen",
-        "blocked" => "blockiert",
-        "passed" => "bestanden",
-        "changes_requested" => "Änderungen erforderlich",
-        "failed" => "fehlgeschlagen",
-        "defects_found" => "Fehler gefunden",
-        "dropped" => "verworfen"
-      }
-    }
-  end
-
   defp report_labels(_locale) do
     %{
       summary: "Summary",
@@ -982,10 +865,8 @@ defmodule SymphonyElixir.Pipeline do
     }
   end
 
-  defp report_text(:es, _english, spanish, _french, _german), do: spanish
-  defp report_text(:fr, _english, _spanish, french, _german), do: french
-  defp report_text(:de, _english, _spanish, _french, german), do: german
-  defp report_text(_locale, english, _spanish, _french, _german), do: english
+  defp report_text(:es, _english, spanish), do: spanish
+  defp report_text(_locale, english, _spanish), do: english
 
   defp report_reason(reason, "blocked", :es) when is_binary(reason) do
     case reason do
@@ -1009,50 +890,6 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp report_reason(reason, "blocked", :fr) when is_binary(reason) do
-    case reason do
-      "Codex requires operator input" ->
-        "Codex doit recevoir une réponse d’une personne pour continuer."
-
-      "codex turn requires operator input" ->
-        "Codex doit recevoir une réponse d’une personne pour continuer."
-
-      "codex turn requires approval" ->
-        "Codex doit obtenir une autorisation pour continuer."
-
-      "codex MCP elicitation requires operator input" ->
-        "Codex attend une réponse d’une personne à une demande MCP."
-
-      _ ->
-        case Regex.run(~r/^stalled for (\d+)ms after Codex requested operator input$/, reason) do
-          [_, milliseconds] -> "Codex a demandé une intervention ; la phase s’est arrêtée après #{milliseconds} ms."
-          _ -> reason
-        end
-    end
-  end
-
-  defp report_reason(reason, "blocked", :de) when is_binary(reason) do
-    case reason do
-      "Codex requires operator input" ->
-        "Codex benötigt eine Antwort von einer Person, um fortzufahren."
-
-      "codex turn requires operator input" ->
-        "Codex benötigt eine Antwort von einer Person, um fortzufahren."
-
-      "codex turn requires approval" ->
-        "Codex benötigt eine Genehmigung, um fortzufahren."
-
-      "codex MCP elicitation requires operator input" ->
-        "Codex wartet auf eine Antwort von einer Person auf eine MCP-Anfrage."
-
-      _ ->
-        case Regex.run(~r/^stalled for (\d+)ms after Codex requested operator input$/, reason) do
-          [_, milliseconds] -> "Codex hat eine Intervention angefordert; die Phase wurde nach #{milliseconds} ms angehalten."
-          _ -> reason
-        end
-    end
-  end
-
   defp report_reason(reason, _outcome, _locale), do: reason
 
   defp validation_error(":required_checks_missing_or_unavailable", :es),
@@ -1060,18 +897,6 @@ defmodule SymphonyElixir.Pipeline do
 
   defp validation_error(":phase_sha_mismatch", :es),
     do: "QA revisó un SHA distinto del aceptado por Build."
-
-  defp validation_error(":required_checks_missing_or_unavailable", :fr),
-    do: "Les vérifications requises sont absentes ou aucune preuve ne confirme leur réussite."
-
-  defp validation_error(":phase_sha_mismatch", :fr),
-    do: "L’assurance qualité a examiné un SHA différent de celui accepté par Build."
-
-  defp validation_error(":required_checks_missing_or_unavailable", :de),
-    do: "Erforderliche Prüfungen fehlen oder ihr Bestehen ist nicht belegt."
-
-  defp validation_error(":phase_sha_mismatch", :de),
-    do: "QA hat einen anderen SHA als den von Build akzeptierten geprüft."
 
   defp validation_error(":required_checks_missing_or_unavailable", _locale),
     do: "Required checks are missing or lack passing evidence."
@@ -1103,7 +928,7 @@ defmodule SymphonyElixir.Pipeline do
   @spec normalize_phase_result(term(), String.t()) :: {:ok, map()} | {:error, term()}
   def normalize_phase_result(result, phase), do: normalize_phase_result(result, phase, :en)
 
-  @spec normalize_phase_result(term(), String.t(), :en | :es | :fr | :de) :: {:ok, map()} | {:error, term()}
+  @spec normalize_phase_result(term(), String.t(), :en | :es) :: {:ok, map()} | {:error, term()}
   def normalize_phase_result(result, phase, locale) when is_map(result) do
     result = Map.new(result, fn {key, value} -> {to_string(key), value} end)
 
@@ -1127,16 +952,10 @@ defmodule SymphonyElixir.Pipeline do
 
   defp findings_summary(:es, "qa"), do: "QA encontró hallazgos que requieren corrección."
   defp findings_summary(:es, _phase), do: "La revisión encontró hallazgos que requieren corrección."
-  defp findings_summary(:fr, "qa"), do: "L’assurance qualité a relevé des constats à corriger."
-  defp findings_summary(:fr, _phase), do: "La revue a relevé des constats à corriger."
-  defp findings_summary(:de, "qa"), do: "QA hat Befunde gemeldet, die behoben werden müssen."
-  defp findings_summary(:de, _phase), do: "Die Review hat Befunde gemeldet, die behoben werden müssen."
   defp findings_summary(_locale, "qa"), do: "QA reported findings that need correction."
   defp findings_summary(_locale, _phase), do: "Review reported findings that need correction."
 
   defp findings_next_step(:es), do: "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
-  defp findings_next_step(:fr), do: "Corrige les constats et soumets une nouvelle livraison Build."
-  defp findings_next_step(:de), do: "Behebe die Befunde und übergib die Arbeit erneut an Build."
   defp findings_next_step(_locale), do: "Fix the findings and submit a new Build delivery."
 
   defp invalid_report_details(phase, result) do
