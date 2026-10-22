@@ -1,7 +1,7 @@
 # Plan de implementación de Super Board sobre Symphony
 
 **Proyecto:** [Compralaentrada/symphony](https://github.com/Compralaentrada/symphony)  
-**Estado:** pipeline base de issue #9 terminado; delegación de escrituras a agentes aprobada en ADR-0002, implementación en issue #40
+**Estado:** pipeline base de issue #9 y delegación de escrituras a agentes de issue #40 implementados
 **Fecha:** 21 de octubre de 2026
 **HEAD del fork revisado para este roadmap:** `4f2fbc8`
 **Base de la investigación técnica:** `15a1af42fb6e9de044b7b72da3e0d54d1cc9a88d` de `Compralaentrada/symphony`
@@ -128,7 +128,7 @@ Las ideas sin issue pueden permanecer en Backlog. Para pasar a ejecución deben 
 
 El Project es la autoridad del estado visible y la intención humana. SQLite es un diario interno de intentos, fases, checkpoints, evidencias y efectos externos; no puede contradecir ni reemplazar el estado del Project. Al reiniciar, Symphony reconcilia el Project, GitHub y SQLite antes de reanudar. Si no puede resolver una discrepancia sin adivinar, detiene la tarea y muestra el motivo.
 
-Mover a `Ready` inicia o reanuda según el estado anterior. Si una persona pide cambios desde `Human Review`, el agente de Build devuelve la misma PR a draft y conserva su rama; tras rehacer Build y repetir QA y Review, el agente de Review la marca lista para revisión antes de volver a `Human Review`. Desde `Blocked`, se conserva la rama y PR si existen y se reanuda desde el último checkpoint confirmado. Una issue cerrada en `Done` no se reactiva al mover el item del Project a `Ready`; el trabajo posterior requiere una issue nueva. Mover una tarea activa a `Blocked` o `Backlog` solicita parar: Symphony cancela el proceso, conserva el trabajo y confirma la parada. Un cambio manual a `Done` no acredita un merge.
+Mover a `Ready` inicia o reanuda según el estado anterior. Si una persona pide cambios desde `Human Review`, el agente de Build devuelve la misma PR a draft y conserva su rama; tras rehacer Build y repetir QA y Review, el agente de Review la marca lista para revisión antes de volver a `Human Review`. Desde `Blocked`, se conserva la rama y PR si existen y se reanuda desde el último checkpoint confirmado. Si el bloqueo ocurrió en Review y cambió el head SHA de la PR, se descarta ese checkpoint y se vuelve a Build para repetir QA y Review. Una issue cerrada en `Done` no se reactiva al mover el item del Project a `Ready`; el trabajo posterior requiere una issue nueva. Mover una tarea activa a `Blocked` o `Backlog` solicita parar: Symphony cancela el proceso, conserva el trabajo y confirma la parada. Un cambio manual a `Done` no acredita un merge.
 
 El agente de fase publica la rama e inicia las mutaciones GitHub necesarias para completar su lane mediante herramientas autorizadas. En una ejecución individual desde GitHub Issues, su agente gestiona las mutaciones permitidas de esa issue y su PR. El orquestador verifica repo, rama, SHA, estado remoto y generación; coordina el siguiente agente y reconcilia efectos confirmados, pero no inicia escrituras en issues, Projects o PRs. Una respuesta incierta requiere consultar GitHub antes de repetir la operación o volver a despachar la fase.
 
@@ -488,9 +488,9 @@ Terminar una tarea de Symphony en un host y un repo: Build → QA → Review →
 
 Aceptación del pipeline base: la ejecución se recupera tras reiniciar; el estado actual del Project prevalece sobre cualquier snapshot local; una respuesta incierta no duplica PR, comentario ni transición; `Done` requiere comprobar el merge.
 
-### Hito 0.1 — Delegar las escrituras de GitHub a los agentes (issue #40)
+### Hito 0.1 — Delegar las escrituras de GitHub a los agentes (completado: issue #40)
 
-En todas las ejecuciones iniciadas desde GitHub Issues o GitHub Projects, el agente gestiona las escrituras de su issue y PR. Dentro del pipeline Projects, Build, QA y Review se reparten las escrituras por lane. Symphony queda como lector y coordinador, conserva leases, slots, journal y recuperación, y verifica los efectos remotos. Build crea la draft PR; Review prepara la revisión humana o invoca el gate determinista cuando auto-merge está activado. Esta decisión está registrada en ADR-0002 y sigue el contrato de lanes de Super Board [SB1], [SB17].
+En todas las ejecuciones iniciadas desde GitHub Issues o GitHub Projects, el agente gestiona las escrituras de su issue y PR. Dentro del pipeline Projects, Build, QA y Review se reparten las escrituras por lane; el lane `diagnostic` registra bloqueos que impiden iniciar una de esas fases. Symphony queda como lector y coordinador, conserva leases, slots, journal y recuperación, y verifica los efectos remotos. Build crea la draft PR; Review prepara la revisión humana o invoca el gate determinista cuando auto-merge está activado. Esta decisión está registrada en ADR-0002 y sigue el contrato de lanes de Super Board [SB1], [SB17].
 
 Aceptación: los agentes ejecutan y verifican claim/liberación, informes y transiciones; el coordinador no escribe en GitHub; los permisos son por repo y rol; los efectos inciertos se reconcilian sin duplicados; texto humano, decisiones más recientes y el merge humano por defecto se conservan.
 

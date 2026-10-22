@@ -9,6 +9,7 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
+  @workspace_refresh_blockers [:project_branch_diverged, :project_branch_missing, :project_branch_dirty]
 
   @doc false
   @spec continue_with_issue_for_test(Issue.t(), ([String.t()] -> term())) ::
@@ -18,7 +19,7 @@ defmodule SymphonyElixir.AgentRunner do
     continue_with_issue?(issue, issue_state_fetcher)
   end
 
-  @spec run(map(), pid() | nil, keyword()) :: :ok | map() | no_return()
+  @spec run(map(), pid() | nil, keyword()) :: :ok | map() | {:system_blocker, map()} | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
     worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
@@ -40,13 +41,24 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
+    diagnostic? = Keyword.get(opts, :diagnostic, false)
+    refresh_project_branch? = not diagnostic? and refresh_project_branch?(opts)
+    task = Keyword.get(opts, :pipeline_task, %{})
+    has_pull_request? = is_map(task) and not is_nil(Map.get(task, "pr_number"))
 
-    case Workspace.create_for_issue(issue, worker_host) do
+    workspace_opts = [
+      require_existing_project_branch: has_pull_request? and not diagnostic?,
+      create_project_branch: not diagnostic?,
+      refresh_project_branch: refresh_project_branch?
+    ]
+
+    case Workspace.create_for_issue(issue, worker_host, workspace_opts) do
       {:ok, workspace} ->
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
         try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host),
+               :ok <- verify_pipeline_workspace_sha(workspace, issue, opts, worker_host) do
             run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
           end
         after
@@ -54,9 +66,195 @@ defmodule SymphonyElixir.AgentRunner do
         end
 
       {:error, reason} ->
+        workspace_creation_error(reason, issue, opts, has_pull_request?, refresh_project_branch?)
+    end
+  end
+
+  defp workspace_creation_error(reason, issue, opts, has_pull_request?, refresh_project_branch?) do
+    if Keyword.get(opts, :diagnostic, false) do
+      {:error, reason}
+    else
+      is_missing_pr_branch? = has_pull_request? and phase_with_pr?(opts) and reason == :project_branch_missing
+      refresh_blocked? = refresh_project_branch? and reason in @workspace_refresh_blockers
+
+      if refresh_blocked? or is_missing_pr_branch?,
+        do: {:phase_result, {:system_blocker, blocked_workspace_report(reason, issue)}},
+        else: {:error, reason}
+    end
+  end
+
+  defp verify_pipeline_workspace_sha(workspace, issue, opts, worker_host) do
+    case {Keyword.get(opts, :diagnostic, false), Keyword.get(opts, :phase), Keyword.get(opts, :pipeline_task)} do
+      {true, _, _} ->
+        :ok
+
+      {false, phase, task} when phase in [:qa, :review] and is_map(task) ->
+        case Map.get(task, "current_sha") do
+          sha when is_binary(sha) and sha != "" ->
+            verify_pipeline_workspace_sha_at_sha(workspace, issue, sha, worker_host)
+
+          _ ->
+            {:phase_result, {:system_blocker, blocked_workspace_report(:project_branch_sha_missing, issue)}}
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp verify_pipeline_workspace_sha_at_sha(workspace, issue, sha, worker_host) do
+    case verify_pipeline_pr_sha(issue, sha) do
+      :ok -> verify_accepted_workspace_sha(workspace, issue, sha, worker_host)
+      result -> result
+    end
+  end
+
+  @doc false
+  @spec verify_pipeline_workspace_sha_for_test(term(), Issue.t(), keyword(), worker_host()) ::
+          :ok | {:phase_result, {:system_blocker, map()}} | {:error, term()}
+  def verify_pipeline_workspace_sha_for_test(workspace, issue, opts, worker_host),
+    do: verify_pipeline_workspace_sha(workspace, issue, opts, worker_host)
+
+  defp verify_pipeline_pr_sha(issue, accepted_sha) do
+    if Pipeline.enabled?(), do: read_pipeline_pr_sha(issue, accepted_sha), else: :ok
+  end
+
+  defp read_pipeline_pr_sha(issue, accepted_sha) do
+    case Tracker.pull_request(issue) do
+      {:ok, %{sha: ^accepted_sha}} ->
+        :ok
+
+      {:ok, %{sha: observed_sha}} when is_binary(observed_sha) ->
+        pipeline_sha_blocker(:project_pr_head_changed, accepted_sha, observed_sha, issue)
+
+      {:ok, _pr} ->
+        pipeline_sha_blocker(:project_pr_head_unavailable, accepted_sha, nil, issue)
+
+      :ignore ->
+        pipeline_sha_blocker(:project_pr_head_unavailable, accepted_sha, nil, issue)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp pipeline_sha_blocker(reason, expected_sha, observed_sha, issue) do
+    report = blocked_workspace_report({reason, expected_sha, observed_sha}, issue)
+    {:phase_result, {:system_blocker, report}}
+  end
+
+  defp verify_accepted_workspace_sha(workspace, issue, sha, worker_host) do
+    case Workspace.run_required_check(workspace, "true", sha, issue, worker_host) do
+      {:ok, _evidence} ->
+        :ok
+
+      {:error, {:workspace_sha_mismatch, expected_sha, observed_sha}} ->
+        workspace_sha_blocker(:project_branch_sha_mismatch, expected_sha, observed_sha, issue)
+
+      {:error, {:workspace_dirty, expected_sha, observed_sha}} ->
+        workspace_sha_blocker(:project_branch_sha_workspace_dirty, expected_sha, observed_sha, issue)
+
+      {:error, reason} ->
         {:error, reason}
     end
   end
+
+  defp workspace_sha_blocker(reason, expected_sha, observed_sha, issue) do
+    report = blocked_workspace_report({reason, expected_sha, observed_sha}, issue)
+    {:phase_result, {:system_blocker, report}}
+  end
+
+  defp blocked_workspace_report({reason, expected_sha, observed_sha}, issue)
+       when reason in [
+              :project_branch_sha_mismatch,
+              :project_branch_sha_workspace_dirty,
+              :project_pr_head_changed,
+              :project_pr_head_unavailable
+            ] do
+    locale = Pipeline.report_locale(issue)
+    {summary, next_step} = blocked_workspace_report_content(reason, locale)
+    observed_sha = observed_sha || if(locale == :es, do: "desconocido", else: "unavailable")
+
+    evidence =
+      if locale == :es,
+        do: "SHA esperado: #{expected_sha}; SHA observado: #{observed_sha}.",
+        else: "Expected SHA: #{expected_sha}; observed SHA: #{observed_sha}."
+
+    summary = summary <> " " <> evidence
+
+    %{
+      "outcome" => "blocked",
+      "summary" => summary,
+      "reason" => summary,
+      "next_step" => next_step
+    }
+  end
+
+  defp blocked_workspace_report(reason, issue) when is_atom(reason) do
+    {summary, next_step} = blocked_workspace_report_content(reason, Pipeline.report_locale(issue))
+
+    %{
+      "outcome" => "blocked",
+      "summary" => summary,
+      "reason" => summary,
+      "next_step" => next_step
+    }
+  end
+
+  defp blocked_workspace_report_content(:project_branch_diverged, :es),
+    do: {"La rama guardada del workspace diverge de la rama actualizada de la PR.", "Conserva los commits locales, reconcilíalos con la rama de la PR, sube el resultado y mueve la issue a Ready."}
+
+  defp blocked_workspace_report_content(:project_branch_diverged, _locale),
+    do: {"The saved workspace branch diverges from the updated PR branch.", "Preserve the local commits, reconcile them with the PR branch, push the result, then move the issue to Ready."}
+
+  defp blocked_workspace_report_content(:project_branch_missing, :es),
+    do: {"Falta la rama guardada de la PR, tanto en local como en remoto.", "Restaura la rama de la PR o actualiza la PR y mueve la issue a Ready."}
+
+  defp blocked_workspace_report_content(:project_branch_missing, _locale),
+    do: {"The saved PR branch is missing locally and remotely.", "Restore the PR branch or update the PR, then move the issue to Ready."}
+
+  defp blocked_workspace_report_content(:project_branch_dirty, :es),
+    do: {"Hay cambios locales que impiden actualizar la rama de la PR.", "Conserva o confirma los cambios locales y mueve la issue a Ready para reintentarlo."}
+
+  defp blocked_workspace_report_content(:project_branch_dirty, _locale),
+    do: {"Local workspace changes prevent updating the PR branch.", "Preserve or commit the local changes, then move the issue to Ready to retry."}
+
+  defp blocked_workspace_report_content(:project_branch_sha_mismatch, :es),
+    do: {"El workspace no coincide con el SHA aceptado por Build.", "Restaura el workspace en el SHA aceptado y mueve la issue a Ready para reintentar QA o Review."}
+
+  defp blocked_workspace_report_content(:project_branch_sha_mismatch, _locale),
+    do: {"The workspace does not match the SHA accepted by Build.", "Restore the workspace at the accepted SHA, then move the issue to Ready to retry QA or Review."}
+
+  defp blocked_workspace_report_content(:project_branch_sha_workspace_dirty, :es),
+    do: {"El workspace tiene cambios locales sin confirmar.", "Conserva o limpia los cambios locales y mueve la issue a Ready para repetir Build, QA y Review."}
+
+  defp blocked_workspace_report_content(:project_branch_sha_workspace_dirty, _locale),
+    do: {"The workspace contains uncommitted local changes.", "Preserve or clean the local changes, then move the issue to Ready to rerun Build, QA, and Review."}
+
+  defp blocked_workspace_report_content(:project_branch_sha_missing, :es),
+    do: {"QA/Review no tiene el SHA aceptado por Build para validar el workspace.", "Mueve la issue a Ready para repetir Build con la rama actual de la PR antes de QA y Review."}
+
+  defp blocked_workspace_report_content(:project_branch_sha_missing, _locale),
+    do: {"QA/Review has no Build-accepted SHA to validate the workspace.", "Move the issue to Ready to rerun Build against the current PR branch before QA and Review."}
+
+  defp blocked_workspace_report_content(:project_pr_head_changed, :es),
+    do: {"La cabeza de la PR cambió después de que Build aceptara el SHA.", "Mueve la issue de Blocked a Ready para repetir Build, QA y Review sobre la cabeza actual de la PR."}
+
+  defp blocked_workspace_report_content(:project_pr_head_changed, _locale),
+    do: {"The PR head changed after Build accepted its SHA.", "Move the issue from Blocked to Ready to rerun Build, QA, and Review against the current PR head."}
+
+  defp blocked_workspace_report_content(:project_pr_head_unavailable, :es),
+    do: {"Symphony no pudo verificar la cabeza de la PR antes de QA/Review.", "Restaura o crea la PR y mueve la issue de Blocked a Ready para repetir Build, QA y Review."}
+
+  defp blocked_workspace_report_content(:project_pr_head_unavailable, _locale),
+    do: {"Symphony could not verify the PR head before QA/Review.", "Restore or create the PR, then move the issue from Blocked to Ready to rerun Build, QA, and Review."}
+
+  defp refresh_project_branch?(opts) do
+    task = Keyword.get(opts, :pipeline_task, %{})
+    Keyword.get(opts, :phase) == :build and is_map(task) and is_nil(Map.get(task, "current_sha"))
+  end
+
+  defp phase_with_pr?(opts), do: Keyword.get(opts, :phase) in [:build, :qa, :review]
 
   defp codex_message_handler(recipient, issue) do
     fn message ->
@@ -107,12 +305,22 @@ defmodule SymphonyElixir.AgentRunner do
 
     opts = Keyword.put(opts, :selected_repo_skills, selected_repo_skills)
 
+    opts =
+      Keyword.put_new(
+        opts,
+        :host_checks,
+        if(Keyword.get(opts, :diagnostic, false), do: [], else: run_pipeline_host_checks(workspace, issue, opts, worker_host))
+      )
+
+    opts = Keyword.put(opts, :report_locale, Pipeline.report_locale(issue))
+    agent_context = github_agent_context(issue, opts)
+
     with :ok <- ensure_skills_available(workspace, issue, worker_host),
          {:ok, session} <-
            AppServer.start_session(
              workspace,
              worker_host: worker_host,
-             disable_tracker_tools: Keyword.has_key?(opts, :phase)
+             agent_context: agent_context
            ) do
       try do
         if Keyword.has_key?(opts, :phase) do
@@ -126,13 +334,87 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  defp run_pipeline_host_checks(workspace, issue, opts, worker_host) do
+    if Keyword.get(opts, :phase) == :qa do
+      task = Keyword.get(opts, :pipeline_task, %{})
+
+      Enum.map(task["required_checks"] || [], fn command ->
+        run_pipeline_host_check(workspace, issue, worker_host, command, task["current_sha"])
+      end)
+    else
+      []
+    end
+  end
+
+  defp run_pipeline_host_check(workspace, issue, worker_host, command, current_sha) do
+    case SymphonyElixir.Workspace.run_required_check(workspace, command, current_sha, issue, worker_host) do
+      {:ok, evidence} ->
+        %{"name" => command, "status" => "passed", "evidence" => evidence}
+
+      {:error, {:check_failed, status}} ->
+        %{
+          "name" => command,
+          "status" => "failed",
+          "evidence" => "Symphony ran the configured check at SHA #{current_sha}; host exit status #{status}."
+        }
+
+      {:error, {:workspace_sha_mismatch, expected_sha, observed_sha}} ->
+        %{
+          "name" => command,
+          "status" => "failed",
+          "finding_id" => "workspace-sha-mismatch",
+          "evidence" => "Symphony did not run the check because workspace HEAD was #{observed_sha || "unavailable"}, not accepted SHA #{expected_sha}."
+        }
+
+      {:error, {:workspace_dirty, expected_sha, observed_sha}} ->
+        %{
+          "name" => command,
+          "status" => "failed",
+          "finding_id" => "workspace-dirty",
+          "evidence" => "Symphony did not run the check because the workspace had local changes at SHA #{observed_sha || "unavailable"}; accepted SHA was #{expected_sha}."
+        }
+
+      {:error, :check_unavailable} ->
+        %{"name" => command, "status" => "unavailable", "evidence" => "Symphony could not execute the required check."}
+    end
+  end
+
+  defp github_agent_context(issue, opts) do
+    tracker = Config.settings!().tracker
+    phase = Keyword.get(opts, :phase, :individual)
+    diagnostic? = Keyword.get(opts, :diagnostic, false)
+
+    %{
+      issue: issue,
+      lane: if(diagnostic?, do: :diagnostic, else: phase),
+      task: Keyword.get(opts, :pipeline_task),
+      generation: Keyword.get(opts, :generation),
+      attempt: Keyword.get(opts, :phase_attempt),
+      lease_phase: if(diagnostic?, do: phase),
+      lease_token: Keyword.get(opts, :github_lease_token),
+      host_checks: Keyword.get(opts, :host_checks, []),
+      report_locale: Keyword.get(opts, :report_locale, Pipeline.report_locale(issue)),
+      tracker_kind: tracker.kind,
+      merge_policy: Map.get(tracker.provider, "merge_policy", "human")
+    }
+  end
+
   defp run_pipeline_phase(session, issue, recipient, opts) do
     phase = Keyword.fetch!(opts, :phase)
     message_key = {__MODULE__, make_ref()}
-    report_language = report_language_name(Pipeline.report_locale(issue))
+    evidence_key = {message_key, :remote_evidence}
 
     on_message = fn message ->
       send_codex_update(recipient, issue, message)
+
+      case message do
+        %{event: :tool_call_completed, result: %{"evidence" => evidence}}
+        when is_map(evidence) ->
+          Process.put(evidence_key, [evidence | Process.get(evidence_key, [])])
+
+        _ ->
+          :ok
+      end
 
       case phase_delta(message) do
         nil ->
@@ -148,61 +430,90 @@ defmodule SymphonyElixir.AgentRunner do
       end
     end
 
+    try do
+      run_pipeline_turn(session, issue, on_message, message_key, phase, opts)
+    after
+      Process.delete(message_key)
+      Process.delete(evidence_key)
+    end
+  end
+
+  defp run_pipeline_turn(session, issue, on_message, message_key, phase, opts) do
+    evidence_key = {message_key, :remote_evidence}
+    report_locale = Keyword.get(opts, :report_locale, Pipeline.report_locale(issue))
+    report_language = report_language_name(report_locale)
+
     prompt =
       issue
       |> PromptBuilder.build_prompt(opts)
       |> append_selected_skills(Keyword.get(opts, :selected_repo_skills), 1)
       |> Kernel.<>(
         "\n\n" <>
-          pipeline_phase_instructions(phase, opts) <>
-          "\nWrite report values in #{report_language} (Spanish only for Spanish issues; English otherwise). Keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details." <>
+          phase_instructions(phase, opts) <>
+          "\nUse the Humanizer guidance for report values. Write report values in #{report_language} (Spanish only for Spanish issues; English otherwise). Keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details." <>
           "\nThe phase report JSON contract overrides any skill's preferred presentation format."
       )
 
     output_schema = phase_report_schema(phase)
 
-    try do
-      case run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema) do
-        {:ok, report} ->
-          {:phase_result, report}
+    case run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema, report_locale) do
+      {:ok, report} ->
+        phase_result(report, phase, opts, evidence_key)
 
-        {:error, {:invalid_phase_report, _details}} ->
-          Process.delete(message_key)
+      {:error, {:invalid_phase_report, _details}} ->
+        Process.delete(message_key)
 
-          case run_phase_turn(
-                 session,
-                 phase_report_correction_prompt(report_language),
-                 issue,
-                 on_message,
-                 message_key,
-                 phase,
-                 output_schema
-               ) do
-            {:ok, report} -> {:phase_result, report}
-            error -> error
-          end
+        case run_phase_turn(
+               session,
+               phase_report_correction_prompt(report_language),
+               issue,
+               on_message,
+               message_key,
+               phase,
+               output_schema,
+               report_locale
+             ) do
+          {:ok, report} -> phase_result(report, phase, opts, evidence_key)
+          error -> error
+        end
 
-        error ->
-          error
-      end
-    after
-      Process.delete(message_key)
+      error ->
+        error
     end
   end
 
-  defp run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema) do
+  defp phase_instructions(phase, opts) do
+    if Keyword.get(opts, :diagnostic, false), do: diagnostic_phase_instructions(phase), else: pipeline_phase_instructions(phase, opts)
+  end
+
+  defp diagnostic_phase_instructions(phase) do
+    """
+    Pipeline lane: Diagnostic for #{phase}.
+    Read the issue workpad and current-generation phase reports with `github_workflow` operation `read_workpad`. Independently inspect the task workspace and the repository's current pull request using read-only commands and GitHub reads. Diagnose why the normal phase cannot safely continue, using only saved task records and observed facts.
+    Record the diagnosis and recovery step in the persistent workpad with `github_workflow` operation `workpad`, then use `github_workflow` operation `handoff`, outcome `blocked`, with the complete report matching the #{phase} JSON schema. The host verifies and checkpoints your report.
+    Do not edit files, push, merge, or change the pull request. Do not guess at missing evidence.
+    """
+  end
+
+  defp run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema, report_locale) do
     case AppServer.run_turn(session, prompt, issue,
            on_message: on_message,
            output_schema: output_schema
          ) do
       {:ok, _turn} ->
         with {:ok, report} <- decode_phase_report(phase_report_text(Process.get(message_key))) do
-          Pipeline.normalize_phase_result(report, Atom.to_string(phase), Pipeline.report_locale(issue))
+          Pipeline.normalize_phase_result(report, Atom.to_string(phase), report_locale)
         end
 
       error ->
         error
     end
+  end
+
+  defp phase_result(report, phase, opts, evidence_key) do
+    evidence = evidence_key |> Process.get([]) |> Enum.reverse()
+    report = if phase == :qa, do: Map.put(report, "checks", Keyword.get(opts, :host_checks, [])), else: report
+    {:phase_result, report |> Map.put("_remote_evidence", evidence) |> Map.put("_host_checks", Keyword.get(opts, :host_checks, []))}
   end
 
   defp phase_report_correction_prompt(report_language) do
@@ -214,44 +525,53 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
-  defp pipeline_phase_instructions(:build, opts) do
+  defp report_language_name(:es), do: "Spanish"
+  defp report_language_name(_locale), do: "English"
+
+  defp pipeline_phase_instructions(:build, _opts) do
     """
     Pipeline phase: Build.
-    Implement the issue, preserve the configured branch #{Keyword.get(opts, :branch)}, and push your work to origin.
-    Previously reported findings to address: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
-    Use the Humanizer guidance for report values.
-    Do not create or update a pull request, change Project status, or comment on the issue; Symphony owns those writes.
+    Read the issue's workpad and current-generation phase reports with `github_workflow` operation `read_workpad` before editing. Use those task records for prior findings and decisions. Work on the branch already checked out for this task and push your work to origin.
+    Implement the issue using the accepted task context recorded on the issue. The host records the branch, base branch, required checks, and pushed SHA in the Build report for later phases.
+    Before editing, create or update the persistent issue workpad with `github_workflow` operation `workpad` and record the plan.
+    Before editing, call `github_workflow` with operation `claim` and stop if the claim is rejected.
+    After pushing, call `github_workflow` with operation `handoff`, outcome `ready`, and your complete report; the host verifies the SHA, creates or updates the draft PR, posts your report, and moves the Project item to QA.
+    For `no_changes` or `blocked`, hand off that result with a concise reason. Never merge a PR.
     Finish with exactly one JSON object containing outcome (ready, no_changes, or blocked), summary, criteria, changes, checks, risks, next_step, reason when blocked or no_changes, and sha after pushing.
     criteria, changes, checks, and risks must be JSON arrays, even when empty. Put each risk in its own string element.
     Use sha null only for no_changes or blocked.
     """
   end
 
-  defp pipeline_phase_instructions(:qa, opts) do
+  defp pipeline_phase_instructions(:qa, _opts) do
     """
-    Pipeline phase: independent QA. Review and test the accepted commit #{Keyword.get(opts, :sha)} on branch #{Keyword.get(opts, :branch)}.
-    Prior findings to recheck after Build: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
-    Required checks: #{Enum.join(Keyword.get(opts, :required_checks, []), ", ")}.
-    Symphony runs these configured checks on the workspace after your review. Do not claim their result or evidence; return an empty checks list. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings.
-    Use the Humanizer guidance for report values.
-    Do not modify files or write to GitHub. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
+    Pipeline phase: independent QA. Read the issue's workpad and current-generation Build reports with `github_workflow` operation `read_workpad`; use the saved task records to identify the accepted commit, branch, required checks, and prior findings.
+    Symphony runs the configured host checks on the accepted SHA and records their evidence in your QA report. Do not modify files or invent check results. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings.
+    Update the persistent workpad with QA evidence and findings using `github_workflow` operation `workpad`.
+    Call `github_workflow` with operation `handoff` and your QA report. Symphony adds the authoritative host-check evidence before saving the report and advances only when every required check passed. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end
 
-  defp pipeline_phase_instructions(:review, opts) do
+  defp pipeline_phase_instructions(:review, _opts) do
     """
-    Pipeline phase: autonomous code review. Inspect the diff and accepted commit #{Keyword.get(opts, :sha)} on branch #{Keyword.get(opts, :branch)}.
-    Prior finding IDs to resolve explicitly: #{Jason.encode!(Keyword.get(opts, :prior_findings, []), pretty: true)}.
+    Pipeline phase: autonomous code review. Read the issue's workpad and all current-generation QA reports with `github_workflow` operation `read_workpad` before reviewing. Use those task records to identify the accepted commit, branch, QA findings, and findings to resolve.
+    Use the QA report's host-check evidence for its recorded SHA; do not require a separate GitHub status context for Symphony's host-run check.
     Do not invoke the repository's `code-review` skill or its Markdown report format; perform this review directly under the pipeline's JSON contract.
     The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
-    Do not modify files or write to GitHub. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
-    Use the Humanizer guidance for report values.
-    Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit. Do not include headings, bullets, Markdown, code fences, or commentary outside that object.
+    Do not modify files. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
+    Update the persistent workpad with review findings and resolutions using `github_workflow` operation `workpad`.
+    With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`, then call `request_merge`; if the host confirms the merge, hand off outcome `merged` so the host verifies the merge before closing the issue and moving the item to Done. If the gate rejects the request, leave the PR in Human Review.
+    Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end
 
-  defp report_language_name(:es), do: "Spanish"
-  defp report_language_name(_locale), do: "English"
+  defp pipeline_phase_instructions(:finalize, _opts) do
+    """
+    Pipeline phase: Finalize a human-merged pull request. Read the issue's workpad and current-generation Build, QA, and Review reports with `github_workflow` operation `read_workpad`. Use the Review report's persisted pull request number, base branch, and accepted SHA to verify the merge with GitHub read tools.
+    Do not modify files. Call `github_workflow` with operation `handoff`, outcome `merged`, and a short report using the accepted SHA from the Review report. The host closes the issue and moves its Project item to Done only after verifying the remote merge.
+    Finish with exactly one JSON object containing outcome `merged`, summary, sha, and next_step.
+    """
+  end
 
   defp phase_delta(%{payload: %{"method" => "item/agentMessage/delta", "params" => params}})
        when is_map(params) do
@@ -349,6 +669,7 @@ defmodule SymphonyElixir.AgentRunner do
     issue
     |> PromptBuilder.build_prompt(opts)
     |> append_selected_skills(Keyword.get(opts, :selected_repo_skills), 1)
+    |> append_individual_github_instructions(issue, opts)
   end
 
   defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
@@ -361,6 +682,18 @@ defmodule SymphonyElixir.AgentRunner do
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
+  end
+
+  defp append_individual_github_instructions(prompt, issue, opts) do
+    if Config.settings!().tracker.kind in ["github", "github_projects"] and not Keyword.has_key?(opts, :phase) do
+      release = if Config.settings!().tracker.kind == "github", do: " After the handoff, release your claim.", else: ""
+
+      prompt <>
+        "\n\nFor this GitHub task, create or update the persistent issue workpad with `github_workflow` operation `workpad`, then claim the issue before working. Preserve branch #{issue.branch_name}, push it to origin, and hand off the complete report with outcome `ready` so the host can verify the SHA, create or update the draft PR, and publish the report. For `blocked` or `no_changes`, hand off that result with a reason and do not create a PR. Use `github_workflow` for every GitHub write; the default merge policy is human review." <>
+        release
+    else
+      prompt
+    end
   end
 
   defp append_selected_skills(prompt, selected_skills, 1) when is_list(selected_skills) do
@@ -382,6 +715,15 @@ defmodule SymphonyElixir.AgentRunner do
       "next_step" => %{"type" => "string"},
       "reason" => %{"type" => ["string", "null"]},
       "sha" => %{"type" => ["string", "null"]}
+    })
+  end
+
+  defp phase_report_schema(:finalize) do
+    report_schema(%{
+      "outcome" => %{"type" => "string", "enum" => ["merged"]},
+      "summary" => %{"type" => "string"},
+      "sha" => %{"type" => "string"},
+      "next_step" => %{"type" => "string"}
     })
   end
 

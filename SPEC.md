@@ -899,6 +899,23 @@ Failure handling:
   prepared directory.
 - Reused workspaces SHOULD NOT be destructively reset on population failure unless that policy is
   explicitly chosen and documented.
+- GitHub Projects repository profiles synchronize a reused issue branch when Build resumes without
+  an accepted SHA. They fetch and fast-forward; if the local and remote branches have diverged, the
+  task is blocked with a recovery instruction and the local workspace is preserved. Dirty workspace
+  changes that prevent a switch or fast-forward are reported separately. If neither the local nor
+  remote issue branch exists, Build blocks instead of recreating it from the base branch. For
+  deterministic host preflight failures that prevent Build, QA, or Review from starting, Symphony
+  coordinates a restricted diagnostic lane in the active attempt. If both issue branch refs are
+  absent, its workspace may inspect the configured base in detached HEAD but must not create the
+  task branch. The diagnostic agent reads the
+  issue workpad, saved phase reports, workspace, and PR, then records the blocker, evidence, and
+  recovery instruction using its authorized `github_workflow` operations. Symphony checkpoints and
+  validates the returned remote evidence but does not write to GitHub. Before QA or Review starts,
+  the PR head and clean workspace must match the accepted Build SHA; an absent or changed PR head,
+  workspace mismatch, or dirty tree is handed to the diagnostic lane with expected and observed SHA
+  evidence where available. When a blocked QA or Review task is requeued after the PR head changed
+  or the PR is missing, it restarts at Build so the accepted SHA and subsequent QA and Review
+  evidence are refreshed together.
 
 ### 9.4 Workspace Hooks
 

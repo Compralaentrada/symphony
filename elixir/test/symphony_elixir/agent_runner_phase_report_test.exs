@@ -241,6 +241,9 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         |> Enum.filter(&(&1["method"] == "turn/start"))
 
       assert length(turn_starts) == 1
+      prompt = get_in(hd(turn_starts), ["params", "input", Access.at(0), "text"])
+      assert prompt =~ "read_workpad"
+      refute prompt =~ "symphony/mt-build-foreign-turn"
     after
       File.rm_rf(test_root)
     end
@@ -381,15 +384,21 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         labels: ["backend"]
       }
 
+      host_checks = [
+        %{"name" => "echo required-check-secret", "status" => "passed", "evidence" => "host-evidence-secret"}
+      ]
+
       result =
         AgentRunner.run(issue, nil,
           phase: :qa,
           branch: "symphony/mt-qa-phase-report",
           sha: report["sha"],
-          required_checks: []
+          required_checks: ["echo required-check-secret"],
+          host_checks: host_checks
         )
 
       assert %{"outcome" => "passed", "findings" => []} = result
+      assert result["checks"] == host_checks
 
       turn_starts =
         trace_file
@@ -403,6 +412,9 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
 
       assert length(prompts) == 2
       assert hd(prompts) =~ "Each finding must include the exact keys id, reproduction, and criterion as non-empty strings."
+      assert hd(prompts) =~ "read_workpad"
+      refute hd(prompts) =~ "echo required-check-secret"
+      refute hd(prompts) =~ "host-evidence-secret"
       assert hd(prompts) =~ "Use the Humanizer guidance for report values"
       assert hd(prompts) =~ "Write report values in English"
       refute hd(prompts) =~ "- `code-review`"
@@ -515,8 +527,9 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       result =
         AgentRunner.run(issue, nil,
           phase: :review,
-          branch: "symphony/mt-phase-report",
-          sha: report["sha"]
+          branch: "symphony/branch-from-task",
+          sha: report["sha"],
+          prior_findings: [%{"id" => "finding-from-task", "reproduction" => "saved on the issue", "criterion" => "use task records"}]
         )
 
       assert %{"outcome" => "passed", "summary" => "Review passed"} = result
@@ -531,9 +544,14 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
 
       assert length(turn_starts) == 2
       [initial_turn, correction_turn] = turn_starts
-      assert get_in(initial_turn, ["params", "input", Access.at(0), "text"]) =~ "Do not invoke the repository's `code-review` skill or its Markdown report format"
+      review_prompt = get_in(initial_turn, ["params", "input", Access.at(0), "text"])
+      assert review_prompt =~ "Do not invoke the repository's `code-review` skill or its Markdown report format"
+      assert review_prompt =~ "read_workpad"
+      refute review_prompt =~ "finding-from-task"
+      refute review_prompt =~ "symphony/branch-from-task"
+      refute review_prompt =~ report["sha"]
 
-      assert get_in(initial_turn, ["params", "input", Access.at(0), "text"]) =~
+      assert review_prompt =~
                "The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result."
 
       assert get_in(correction_turn, ["params", "input", Access.at(0), "text"]) =~ "Do not include headings, bullets, Markdown, code fences, or text outside the JSON object."
@@ -550,5 +568,268 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "Finalize phase accepts a merged report with its schema" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-finalize-phase-report-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-input.trace")
+      File.mkdir_p!(test_root)
+
+      report = %{
+        "outcome" => "merged",
+        "summary" => "The merged pull request is confirmed.",
+        "sha" => String.duplicate("c", 40),
+        "next_step" => "Done."
+      }
+
+      report_delta =
+        Jason.encode!(%{
+          "method" => "item/agentMessage/delta",
+          "params" => %{
+            "threadId" => "finalize-report-thread",
+            "turnId" => "finalize-report-turn",
+            "itemId" => "finalize-report",
+            "delta" => Jason.encode!(report)
+          }
+        })
+
+      turn_completion =
+        Jason.encode!(%{
+          "method" => "turn/completed",
+          "params" => %{
+            "threadId" => "finalize-report-thread",
+            "turn" => %{
+              "id" => "finalize-report-turn",
+              "status" => "completed",
+              "items" => []
+            }
+          }
+        })
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> '#{trace_file}'
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"finalize-report-thread"}}}' ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"finalize-report-turn"}}}'
+            printf '%s\\n' '#{report_delta}'
+            printf '%s\\n' '#{turn_completion}'
+            exit 0
+            ;;
+          *) ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: required_skill_fixture_hook(),
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "octo/app#107",
+        identifier: "octo/app#107",
+        title: "Confirm merged delivery",
+        description: "Verify the human-merged pull request.",
+        state: "closed",
+        url: "https://github.com/octo/app/issues/107",
+        labels: ["backend"]
+      }
+
+      assert %{"outcome" => "merged", "sha" => sha} =
+               AgentRunner.run(issue, nil,
+                 phase: :finalize,
+                 branch: "symphony/octo-app-107",
+                 base_branch: "main",
+                 pr_number: 107,
+                 sha: report["sha"]
+               )
+
+      assert sha == report["sha"]
+
+      turn_start =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.find(&(&1["method"] == "turn/start"))
+
+      schema = get_in(turn_start, ["params", "outputSchema"])
+      prompt = get_in(turn_start, ["params", "input", Access.at(0), "text"])
+      assert prompt =~ "read_workpad"
+      refute prompt =~ "107"
+      refute prompt =~ "main"
+      refute prompt =~ report["sha"]
+      assert Enum.sort(schema["required"]) == Enum.sort(["outcome", "summary", "sha", "next_step"])
+      assert get_in(schema, ["properties", "outcome", "enum"]) == ["merged"]
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "Build with no accepted SHA reports a blocked workspace instead of retrying" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-build-diverged-#{System.unique_integer([:positive])}")
+    source_repo = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+
+    try do
+      File.mkdir_p!(source_repo)
+      git!(source_repo, ["init", "-b", "main"])
+      git!(source_repo, ["config", "user.name", "Test User"])
+      git!(source_repo, ["config", "user.email", "test@example.com"])
+      File.write!(Path.join(source_repo, "BASE"), "base")
+      git!(source_repo, ["add", "BASE"])
+      git!(source_repo, ["commit", "-m", "main"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "missing-codex-for-workspace-gate-test app-server"
+      )
+
+      issue = %Issue{
+        id: "octo/app#40",
+        identifier: "octo/app#40",
+        branch_name: "symphony/octo-app-40",
+        title: "Recover a requeued Build",
+        description: "Implementar soporte para nuevas salas.",
+        state: "Building",
+        url: "https://github.com/octo/app/issues/40",
+        native_ref: %{
+          repository: "octo/app",
+          base_branch: "main",
+          prepare_command: "git clone --quiet '#{source_repo}' ."
+        }
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      git!(workspace, ["config", "user.name", "Test User"])
+      git!(workspace, ["config", "user.email", "test@example.com"])
+      git!(workspace, ["push", "--set-upstream", "origin", issue.branch_name])
+
+      File.write!(Path.join(workspace, "LOCAL"), "keep local progress")
+      git!(workspace, ["add", "LOCAL"])
+      git!(workspace, ["commit", "-m", "local build progress"])
+      git!(workspace, ["push", "origin", issue.branch_name])
+      local_sha = git!(workspace, ["rev-parse", "HEAD"])
+
+      external = Path.join(test_root, "external")
+      git!(test_root, ["clone", "--quiet", "--branch", issue.branch_name, source_repo, external])
+      git!(external, ["config", "user.name", "Test User"])
+      git!(external, ["config", "user.email", "test@example.com"])
+      git!(external, ["reset", "--hard", "HEAD~1"])
+      File.write!(Path.join(external, "REMOTE"), "new PR head")
+      git!(external, ["add", "REMOTE"])
+      git!(external, ["commit", "-m", "external PR progress"])
+      git!(external, ["push", "--force", "origin", issue.branch_name])
+
+      build_error =
+        assert_raise RuntimeError, fn ->
+          AgentRunner.run(issue, nil,
+            phase: :build,
+            pipeline_task: %{"current_sha" => local_sha}
+          )
+        end
+
+      refute build_error.message =~ "project_branch_diverged"
+      assert git!(workspace, ["rev-parse", "HEAD"]) == local_sha
+
+      review_error =
+        assert_raise RuntimeError, fn ->
+          AgentRunner.run(issue, nil,
+            phase: :review,
+            pipeline_task: %{"current_sha" => local_sha}
+          )
+        end
+
+      refute review_error.message =~ "project_branch_diverged"
+      assert git!(workspace, ["rev-parse", "HEAD"]) == local_sha
+
+      assert {:system_blocker, %{"outcome" => "blocked", "reason" => missing_sha_reason}} =
+               AgentRunner.run(issue, nil,
+                 phase: :review,
+                 pipeline_task: %{"current_sha" => nil, "pr_number" => 40}
+               )
+
+      assert missing_sha_reason =~ "SHA aceptado por Build"
+      assert missing_sha_reason =~ "no tiene"
+
+      assert {:system_blocker,
+              %{
+                "outcome" => "blocked",
+                "summary" => summary,
+                "reason" => reason,
+                "next_step" => next_step
+              }} = AgentRunner.run(issue, nil, phase: :build, pipeline_task: %{"current_sha" => nil})
+
+      assert summary =~ "workspace"
+      assert reason =~ "diverge"
+      assert next_step =~ "reconcilíalos"
+      assert git!(workspace, ["rev-parse", "HEAD"]) == local_sha
+      assert File.read!(Path.join(workspace, "LOCAL")) == "keep local progress"
+
+      File.rm_rf!(workspace)
+
+      remote_sha = git!(external, ["rev-parse", "HEAD"])
+
+      assert {:system_blocker, %{"outcome" => "blocked", "reason" => stale_sha_reason}} =
+               AgentRunner.run(issue, nil,
+                 phase: :review,
+                 pipeline_task: %{"current_sha" => local_sha, "pr_number" => 40}
+               )
+
+      assert stale_sha_reason =~ "SHA aceptado por Build"
+      assert stale_sha_reason =~ local_sha
+      assert stale_sha_reason =~ remote_sha
+
+      File.write!(Path.join(workspace, "DIRTY"), "uncommitted QA workspace change")
+
+      assert {:system_blocker, %{"outcome" => "blocked", "reason" => dirty_reason}} =
+               AgentRunner.run(issue, nil,
+                 phase: :review,
+                 pipeline_task: %{"current_sha" => remote_sha, "pr_number" => 40}
+               )
+
+      assert dirty_reason =~ "cambios locales"
+      assert dirty_reason =~ remote_sha
+      File.rm!(Path.join(workspace, "DIRTY"))
+
+      File.rm_rf!(workspace)
+
+      git!(external, ["push", "origin", "--delete", issue.branch_name])
+
+      assert {:system_blocker, %{"outcome" => "blocked", "reason" => missing_branch_reason}} =
+               AgentRunner.run(issue, nil,
+                 phase: :build,
+                 pipeline_task: %{"current_sha" => nil, "pr_number" => 40}
+               )
+
+      assert missing_branch_reason =~ "Falta la rama"
+      refute File.exists?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp git!(directory, args) do
+    {output, 0} = System.cmd("git", ["-C", directory | args], stderr_to_stdout: true)
+    String.trim(output)
   end
 end
