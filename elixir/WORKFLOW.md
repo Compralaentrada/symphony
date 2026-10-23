@@ -1,4 +1,5 @@
 ---
+merge_policy: auto
 tracker:
   kind: github_projects
   active_states:
