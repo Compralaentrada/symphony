@@ -173,6 +173,54 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert Agent.get(remote_status, & &1) == "Ready"
   end
 
+  test "Build rejects a malformed PR description before the Projects handoff can write" do
+    alias SymphonyElixir.Pipeline.Store
+
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    root = Path.join(System.tmp_dir!(), "symphony-project-pr-body-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    issue = %Issue{
+      id: "octo/app#42",
+      branch_name: "symphony/octo-app-42",
+      state: "Building",
+      url: "https://github.com/octo/app/issues/42",
+      native_ref: %{repository: "octo/app", project_status: "Building"}
+    }
+
+    context = %{issue: issue, lane: :build, generation: 1, attempt: 1, task: %{"branch" => issue.branch_name}}
+    assert :ok = Store.save_task(%{"issue_id" => issue.id, "generation" => 1, "phase" => "build", "attempts" => %{"build" => 1}})
+    assert :ok = Store.begin_phase(issue.id, 1, "build", 1)
+
+    report = %{
+      "outcome" => "ready",
+      "summary" => "Build completed.",
+      "pull_request_body" => "A body that does not follow the PR template.",
+      "sha" => String.duplicate("a", 40)
+    }
+
+    comment = "## Build report\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
+
+    assert {:error, :invalid_github_pull_request_body} =
+             Client.agent_operation(
+               issue,
+               context,
+               "handoff",
+               %{"outcome" => "ready", "report" => report, "body" => comment},
+               tracker_settings: tracker_settings(),
+               projects_request: fn _query, _variables, _settings -> flunk("invalid PR bodies must fail before GitHub writes") end
+             )
+  end
+
   test "Finalize recovers and verifies the merged PR before closing the issue and moving it to Done" do
     alias SymphonyElixir.Pipeline.Store
 
@@ -1236,6 +1284,24 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     attrs = %{branch: issue.branch_name, base: "main", sha: "sha-seven", body: body}
     assert {:ok, %{body: ^body}} = Client.upsert_pull_request_for_test(issue, attrs, settings, request_fun)
+  end
+
+  test "pipeline PR creation requires an authored body" do
+    settings = tracker_settings()
+    issue = %SymphonyElixir.Tracker.Issue{id: "octo/app#7", branch_name: "symphony/octo-app-7", native_ref: %{repository: "octo/app"}}
+
+    request_fun = fn query, _variables, _settings ->
+      assert query =~ "pullRequests"
+      {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => []}}}}}}
+    end
+
+    assert {:error, :github_pull_request_body_required} =
+             Client.upsert_pull_request_for_test(
+               issue,
+               %{branch: issue.branch_name, base: "main"},
+               settings,
+               request_fun
+             )
   end
 
   test "pipeline PR lookup includes merged pull requests" do

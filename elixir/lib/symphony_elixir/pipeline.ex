@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Pipeline do
   @moduledoc false
 
-  alias SymphonyElixir.{Config, Pipeline.Findings, Pipeline.Store, Tracker}
+  alias SymphonyElixir.{Config, Pipeline.Findings, Pipeline.Store, PRBody, Tracker}
   alias SymphonyElixir.Tracker.Issue
 
   @phases ~w(build qa review finalize)
@@ -333,7 +333,8 @@ defmodule SymphonyElixir.Pipeline do
 
   defp finish_valid_phase(issue, task, "build", attempt, %{"outcome" => "ready", "sha" => sha} = result)
        when is_binary(sha) do
-    with :ok <- Tracker.validate_pipeline_delivery(issue, task["branch"], sha) do
+    with :ok <- PRBody.validate_agent_body(result["pull_request_body"], issue.id),
+         :ok <- Tracker.validate_pipeline_delivery(issue, task["branch"], sha) do
       handoff = remote_handoff(result)
       pr_number = get_in(handoff, ["pull_request", "number"])
       next = task |> Map.merge(%{"phase" => "qa", "status" => "qa", "current_sha" => sha}) |> maybe_put("pr_number", pr_number)
@@ -343,7 +344,7 @@ defmodule SymphonyElixir.Pipeline do
           "branch" => task["branch"],
           "base" => task["base_branch"],
           "sha" => sha,
-          "body" => pull_request_body(issue, result)
+          "body" => PRBody.delivery_block(result["pull_request_body"])
         }),
         report_op(next, "build", attempt, result),
         status_op(next, :qa, nil, attempt)
@@ -572,54 +573,6 @@ defmodule SymphonyElixir.Pipeline do
 
   defp ensure_pull_request_sha(%{sha: sha}, sha) when is_binary(sha), do: :ok
   defp ensure_pull_request_sha(_pr, _sha), do: {:error, :pull_request_head_sha_mismatch}
-
-  defp pull_request_body(issue, result) do
-    """
-    <!-- symphony:delivery -->
-
-    Fixes #{issue.id}
-
-    ## Summary
-
-    #{result["summary"]}
-
-    ## Acceptance criteria
-
-    #{markdown_items(result["criteria"])}
-
-    ## Changes
-
-    #{markdown_items(result["changes"])}
-
-    ## Checks
-
-    #{markdown_items(result["checks"])}
-
-    ## Evidence
-
-    - Build SHA: `#{result["sha"]}`
-
-    ## Risks and limitations
-
-    #{markdown_items(result["risks"])}
-
-    ## Next step
-
-    #{result["next_step"]}
-    """
-    |> String.trim()
-  end
-
-  defp markdown_items(items) when is_list(items) do
-    case items do
-      [] -> "- None reported."
-      items -> Enum.map_join(items, "\n", &("- " <> markdown_item(&1)))
-    end
-  end
-
-  defp markdown_items(_items), do: "- None reported."
-  defp markdown_item(item) when is_binary(item), do: item
-  defp markdown_item(item), do: Jason.encode!(item)
 
   defp complete_merged_task(task, number) do
     next = task |> Map.merge(%{"phase" => "finalize", "status" => "finalize", "pr_number" => number})

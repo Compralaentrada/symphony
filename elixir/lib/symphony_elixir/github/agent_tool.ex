@@ -183,7 +183,17 @@ defmodule SymphonyElixir.GitHub.AgentTool do
         "required" => ["operation"],
         "properties" => %{
           "operation" => %{"type" => "string", "enum" => operations},
-          "report" => %{"type" => ["object", "null"], "additionalProperties" => true},
+          "report" => %{
+            "type" => ["object", "null"],
+            "additionalProperties" => true,
+            "properties" => %{
+              "pull_request_body" => %{
+                "type" => "string",
+                "description" =>
+                  "For a ready Build or individual handoff, the complete description following .github/pull_request_template.md, with `Fixes #<issue-number>`. Do not include Symphony delivery markers; the host adds them."
+              }
+            }
+          },
           "outcome" => %{"type" => ["string", "null"]},
           "reason" => %{"type" => ["string", "null"]},
           "sha" => %{"type" => ["string", "null"]},
@@ -191,7 +201,8 @@ defmodule SymphonyElixir.GitHub.AgentTool do
           "title" => %{"type" => ["string", "null"]},
           "body" => %{
             "type" => ["string", "null"],
-            "description" => "For handoff, the complete Markdown comment with one hidden symphony:report:json HTML comment whose JSON exactly matches report."
+            "description" =>
+              "For handoff, the complete issue comment with one hidden symphony:report:json HTML comment whose JSON exactly matches report. Keep the PR description in report.pull_request_body."
           }
         }
       }

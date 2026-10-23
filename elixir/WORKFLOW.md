@@ -146,10 +146,12 @@ Before planning, inspect the relevant skills under `.agents/skills` and `.codex/
 ## Step 2: Prepare a human handoff
 
 1. Review the diff, acceptance criteria, validation evidence, and all PR feedback.
-2. Create or update a draft PR when the task produces code that needs review. Link it to the issue and include `Fixes #<issue-number>` when merging should close that issue.
-3. Do not merge or approve the PR.
-4. Update the persistent workpad with the final summary, validation evidence, and PR link.
-5. Stop after the handoff. On successful completion, the current tracker moves Building to Done. If a reviewer requests changes, a human moves the open issue back to Ready; Symphony resumes the same workspace and branch. If the saved SHA was invalidated, Build syncs the issue branch before its next run; if the workspace cannot be reconciled automatically, follow its blocked report, resolve the branch, and move the issue back to Ready.
+2. Read `.github/pull_request_template.md` and write the complete PR description with every section in order, its length guidance followed, and every placeholder removed. Put it in `report.pull_request_body`, include `Fixes #<issue-number>` on its own line for the assigned issue, and do not add Symphony delivery markers. The separate `github_workflow` handoff `body` is the issue report comment, not the PR description; its hidden JSON must match the report, including `pull_request_body`.
+3. Set `body_file=$(mktemp)`, save the exact PR description there, and validate it with `(cd elixir && mise exec -- mix pr_body.check --file "$body_file")`.
+4. Hand off with `github_workflow` operation `handoff`; the host validates the PR description, wraps it in Symphony-owned delivery markers, and creates or updates the draft PR while preserving human text outside that block.
+5. Do not merge or approve the PR.
+6. Update the persistent workpad with the final summary, validation evidence, and PR link.
+7. Stop after the handoff. On successful completion, the current tracker moves Building to Done. If a reviewer requests changes, a human moves the open issue back to Ready; Symphony resumes the same workspace and branch. If the saved SHA was invalidated, Build syncs the issue branch before its next run; if the workspace cannot be reconciled automatically, follow its blocked report, resolve the branch, and move the issue back to Ready.
 
 ## Workpad template
 
