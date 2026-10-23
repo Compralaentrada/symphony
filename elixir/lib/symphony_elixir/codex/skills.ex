@@ -5,34 +5,37 @@ defmodule SymphonyElixir.Codex.Skills do
 
   alias SymphonyElixir.{PathSafety, Tracker.Issue}
 
-  @code_skills ["ponytail", "tdd"]
+  @code_skills ["ponytail"]
   @phase_skills %{build: ["ponytail"], qa: [], review: []}
   @skill_free_phases [:diagnostic, :finalize]
-  @frontend_labels ["frontend", "front-end", "ui"]
+  @writing_only_labels ["writing-only", "text-only"]
   @writing_labels ["copywriting", "customer-facing", "humanizer", "user-facing"]
 
   @spec select(Issue.t()) :: [String.t()]
   def select(%Issue{} = issue) do
     labels = normalized_labels(issue)
-    code_skills = if Enum.member?(labels, "writing-only") or Enum.member?(labels, "text-only"), do: [], else: @code_skills
-    frontend_skill = if Enum.any?(@frontend_labels, &Enum.member?(labels, &1)), do: ["impeccable"], else: []
-    writing_skill = if Enum.any?(@writing_labels, &Enum.member?(labels, &1)), do: ["humanizer"], else: []
 
-    Enum.uniq(code_skills ++ ["code-review"] ++ frontend_skill ++ writing_skill)
+    Enum.uniq(selected_code_skills(labels, @code_skills) ++ ["code-review"] ++ humanizer_skills(labels))
   end
 
   @spec select(Issue.t(), atom() | nil) :: [String.t()]
   def select(%Issue{} = issue, phase) when is_map_key(@phase_skills, phase) do
     labels = normalized_labels(issue)
-    code_skills = if Enum.member?(labels, "writing-only") or Enum.member?(labels, "text-only"), do: [], else: @phase_skills[phase]
-    writing_skill = if Enum.any?(@writing_labels, &Enum.member?(labels, &1)), do: ["humanizer"], else: []
 
-    Enum.uniq(code_skills ++ writing_skill)
+    Enum.uniq(selected_code_skills(labels, @phase_skills[phase]) ++ humanizer_skills(labels))
   end
 
   def select(%Issue{}, phase) when phase in @skill_free_phases, do: []
   def select(%Issue{} = issue, nil), do: select(issue)
   def select(%Issue{}, _phase), do: []
+
+  defp selected_code_skills(labels, skills) do
+    if Enum.any?(@writing_only_labels, &Enum.member?(labels, &1)), do: [], else: skills
+  end
+
+  defp humanizer_skills(labels) do
+    if Enum.any?(@writing_labels, &Enum.member?(labels, &1)), do: ["humanizer"], else: []
+  end
 
   @spec ensure_available(Path.t(), Issue.t()) :: :ok | {:error, {:required_skill_unavailable, String.t(), Path.t()}}
   def ensure_available(workspace, %Issue{} = issue), do: ensure_available(workspace, issue, nil)

@@ -103,8 +103,9 @@ Before planning, inspect the relevant skills under `.agents/skills` and `.codex/
 
 For Projects pipeline sessions, Symphony fixes the Build, QA, and Review role prompts and base skill
 assignments. Installation front matter cannot remap them; task-specific skills are selected from
-issue context. Interactive skills such as Impeccable remain available to standalone sessions but are
-not forced into unattended phases.
+issue context. Only task-specific skills selected by Symphony may be loaded in an unattended session;
+separate workflow instructions can still request operational skills. Interactive skills such as
+Impeccable and TDD are not forced into unattended sessions.
 
 ## Instructions
 

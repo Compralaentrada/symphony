@@ -34,8 +34,9 @@ sources and fingerprints are listed in [`../.agents/skills/SOURCES.md`](../.agen
 
 In the Projects pipeline, Symphony owns the Build, QA, and Review role prompts and base skill
 assignments; installation `WORKFLOW.md` front matter cannot remap them. Task-specific skills are
-selected from issue context. Interactive skills such as Impeccable remain available to standalone
-sessions but are not forced into unattended phases.
+selected from issue context. Unattended sessions load only selected task skills; separate workflow
+instructions can still request operational skills. Interactive skills such as Impeccable and TDD
+are not forced into unattended sessions.
 
 During single-run app-server sessions, the selected tracker adapter may advertise provider-native
 tools. Linear serves `linear_graphql`, GitHub Issues and GitHub Projects v2 serve the read-only

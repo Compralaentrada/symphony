@@ -730,12 +730,18 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp append_selected_skills(prompt, [], 1), do: prompt
+  defp append_selected_skills(prompt, [], 1) do
+    prompt <>
+      "\n\nSymphony selected no task-specific repo skills for this unattended session. Do not load unlisted task-specific skills; follow separate repository workflow instructions for operational skills when relevant."
+  end
 
   defp append_selected_skills(prompt, selected_skills, 1) when is_list(selected_skills) do
     skills = Enum.map_join(selected_skills, "\n", &"- `#{&1}`")
 
-    prompt <> "\n\nUse these repo-local skills when their conditions apply:\n" <> skills
+    prompt <>
+      "\n\nUse only these task-specific repo skills selected by Symphony for this unattended session:\n" <>
+      skills <>
+      "\nFollow separate repository workflow instructions for operational skills such as pull, commit, and push when relevant."
   end
 
   defp append_selected_skills(prompt, _selected_skills, _turn_number), do: prompt

@@ -441,7 +441,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       refute hd(prompts) =~ "echo required-check-secret"
       refute hd(prompts) =~ "host-evidence-secret"
       assert hd(prompts) =~ "Write report values in English"
-      assert hd(prompts) =~ "Use these repo-local skills when their conditions apply:"
+      assert hd(prompts) =~ "Use only these task-specific repo skills selected by Symphony for this unattended session:"
       refute hd(prompts) =~ "- `ponytail`"
       refute hd(prompts) =~ "- `tdd`"
       refute hd(prompts) =~ "- `code-review`"
@@ -585,7 +585,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert review_prompt =~
                "The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result."
 
-      assert review_prompt =~ "Use these repo-local skills when their conditions apply:"
+      assert review_prompt =~ "Use only these task-specific repo skills selected by Symphony for this unattended session:"
       refute review_prompt =~ "- `ponytail`"
       refute review_prompt =~ "- `tdd`"
       refute review_prompt =~ "- `code-review`"

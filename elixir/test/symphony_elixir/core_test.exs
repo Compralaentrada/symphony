@@ -1919,13 +1919,13 @@ defmodule SymphonyElixir.CoreTest do
 
       assert length(turn_texts) == 2
       assert String.starts_with?(Enum.at(turn_texts, 0), "Use the configured prompt without rendering labels.")
-      assert Enum.at(turn_texts, 0) =~ "Use these repo-local skills when their conditions apply:"
+      assert Enum.at(turn_texts, 0) =~ "Use only these task-specific repo skills selected by Symphony for this unattended session:"
       assert Enum.at(turn_texts, 0) =~ "ponytail"
-      assert Enum.at(turn_texts, 0) =~ "tdd"
       assert Enum.at(turn_texts, 0) =~ "code-review"
+      refute Enum.at(turn_texts, 0) =~ "tdd"
       refute Enum.at(turn_texts, 0) =~ "impeccable"
       refute Enum.at(turn_texts, 0) =~ "humanizer"
-      refute Enum.at(turn_texts, 1) =~ "Use these repo-local skills when their conditions apply:"
+      refute Enum.at(turn_texts, 1) =~ "Use only these task-specific repo skills selected by Symphony for this unattended session:"
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
     after
