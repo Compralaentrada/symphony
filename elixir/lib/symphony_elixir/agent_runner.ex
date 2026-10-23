@@ -400,9 +400,11 @@ defmodule SymphonyElixir.AgentRunner do
     message_key = {__MODULE__, make_ref()}
     evidence_key = {message_key, :remote_evidence}
     workflow_errors_key = {message_key, :workflow_errors}
+    handoff_attempt_key = {message_key, :handoff_attempt}
 
     on_message = fn message ->
       send_codex_update(recipient, issue, message)
+      capture_handoff_attempt(message, handoff_attempt_key)
 
       case message do
         %{event: :tool_call_completed, result: %{"evidence" => evidence}}
@@ -436,6 +438,7 @@ defmodule SymphonyElixir.AgentRunner do
       Process.delete(message_key)
       Process.delete(evidence_key)
       Process.delete(workflow_errors_key)
+      Process.delete(handoff_attempt_key)
     end
   end
 
@@ -477,33 +480,110 @@ defmodule SymphonyElixir.AgentRunner do
           "\nThe phase report JSON contract overrides any skill's preferred presentation format."
       )
 
-    output_schema = phase_report_schema(phase)
+    result =
+      case run_phase_turn(session, prompt, issue, on_message, message_key, phase, report_locale, opts) do
+        {:error, {:invalid_phase_report, _details}} ->
+          Process.delete(message_key)
 
-    case run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema, report_locale) do
-      {:ok, report} ->
-        phase_result(report, phase, opts, evidence_key, workflow_errors_key)
+          run_phase_turn(
+            session,
+            phase_report_correction_prompt(report_language),
+            issue,
+            on_message,
+            message_key,
+            phase,
+            report_locale,
+            opts
+          )
 
-      {:error, {:invalid_phase_report, _details}} ->
-        Process.delete(message_key)
+        result ->
+          result
+      end
 
-        case run_phase_turn(
-               session,
-               phase_report_correction_prompt(report_language),
-               issue,
-               on_message,
-               message_key,
-               phase,
-               output_schema,
-               report_locale
-             ) do
-          {:ok, report} -> phase_result(report, phase, opts, evidence_key, workflow_errors_key)
-          error -> error
-        end
-
-      error ->
-        error
+    case maybe_retry_handoff(result, session, issue, on_message, message_key, phase, opts) do
+      {:ok, report} -> phase_result(report, phase, opts, evidence_key, workflow_errors_key)
+      error -> error
     end
   end
+
+  defp maybe_retry_handoff(
+         {:ok, _report} = result,
+         session,
+         issue,
+         on_message,
+         message_key,
+         phase,
+         opts
+       ) do
+    evidence_key = {message_key, :remote_evidence}
+    workflow_errors = Process.get({message_key, :workflow_errors}, [])
+
+    retry_handoff? =
+      Tracker.agent_owned_writes?() and not handoff_comment_evidence?(Process.get(evidence_key, [])) and
+        Process.get({message_key, :handoff_attempt}) != :tool_call_completed and
+        not Enum.any?(workflow_errors, &(&1["reason"] == ":stale_agent_lease"))
+
+    if retry_handoff? do
+      Process.delete(message_key)
+      report_locale = Keyword.get(opts, :report_locale, Pipeline.report_locale(issue))
+      report_language = report_language_name(report_locale)
+
+      run_phase_turn(
+        session,
+        handoff_correction_prompt(report_language, workflow_errors),
+        issue,
+        on_message,
+        message_key,
+        phase,
+        report_locale,
+        opts
+      )
+    else
+      result
+    end
+  end
+
+  defp maybe_retry_handoff(result, _session, _issue, _on_message, _message_key, _phase, _opts), do: result
+
+  defp handoff_comment_evidence?(evidence) when is_list(evidence),
+    do: Enum.any?(evidence, &handoff_comment_evidence?/1)
+
+  defp handoff_comment_evidence?(%{"evidence" => evidence}), do: handoff_comment_evidence?(evidence)
+
+  defp handoff_comment_evidence?(%{
+         "outcome" => outcome,
+         "comment" => %{"id" => id, "url" => url},
+         "project_item" => %{"id" => project_id}
+       })
+       when is_binary(outcome) and is_binary(id) and is_binary(url) and is_binary(project_id),
+       do: true
+
+  defp handoff_comment_evidence?(%{
+         "outcome" => outcome,
+         "comment" => %{"id" => id, "url" => url},
+         "issue" => %{"id" => issue_id}
+       })
+       when is_binary(outcome) and is_binary(id) and is_binary(url) and is_binary(issue_id),
+       do: true
+
+  defp handoff_comment_evidence?(_evidence), do: false
+
+  defp handoff_tool_call?(%{"tool" => "github_workflow", "arguments" => %{"operation" => "handoff"}}), do: true
+  defp handoff_tool_call?(%{"name" => "github_workflow", "arguments" => %{"operation" => "handoff"}}), do: true
+  defp handoff_tool_call?(_params), do: false
+
+  defp capture_handoff_attempt(
+         %{event: event, payload: %{"params" => params}},
+         key
+       )
+       when event in [:tool_call_completed, :tool_call_failed] do
+    if handoff_tool_call?(params) and
+         (event == :tool_call_completed or Process.get(key) != :tool_call_completed) do
+      Process.put(key, event)
+    end
+  end
+
+  defp capture_handoff_attempt(_message, _key), do: :ok
 
   defp phase_instructions(phase, opts) do
     if Keyword.get(opts, :diagnostic, false), do: diagnostic_phase_instructions(phase), else: pipeline_phase_instructions(phase, opts)
@@ -518,11 +598,14 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
-  defp run_phase_turn(session, prompt, issue, on_message, message_key, phase, output_schema, report_locale) do
-    case AppServer.run_turn(session, prompt, issue,
-           on_message: on_message,
-           output_schema: output_schema
-         ) do
+  defp run_phase_turn(session, prompt, issue, on_message, message_key, phase, report_locale, opts) do
+    output_schema = phase_report_schema(phase)
+
+    app_server_opts =
+      [on_message: on_message, output_schema: output_schema]
+      |> Keyword.merge(Keyword.take(opts, [:tool_executor]))
+
+    case AppServer.run_turn(session, prompt, issue, app_server_opts) do
       {:ok, _turn} ->
         with {:ok, report} <- decode_phase_report(phase_report_text(Process.get(message_key))) do
           Pipeline.normalize_phase_result(report, Atom.to_string(phase), report_locale)
@@ -533,9 +616,25 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  defp handoff_correction_prompt(report_language, workflow_errors) do
+    handoff_failure =
+      case Enum.find(workflow_errors, &(&1["operation"] == "handoff")) do
+        %{"reason" => reason} -> "The previous GitHub handoff was rejected by the host: #{reason}."
+        _ -> "No successful GitHub handoff comment was recorded by the host."
+      end
+
+    """
+    #{handoff_failure}
+    Make one corrected `github_workflow` call with operation `handoff`, using the existing work and report. Correct the host error and ensure the hidden JSON comment exactly matches the structured report. Do not repeat implementation or review work. If the handoff is rejected again, do not claim it succeeded; return the accurate phase report.
+    Write report values in #{report_language} (Spanish only for Spanish issues; English otherwise). Preserve every fact, result, and evidence item without inventing details.
+    The phase report JSON contract overrides any skill's preferred format. Return exactly one JSON object and no surrounding prose.
+    """
+  end
+
   defp phase_result(report, phase, opts, evidence_key, workflow_errors_key) do
     evidence = evidence_key |> Process.get([]) |> Enum.reverse()
     workflow_errors = workflow_errors_key |> Process.get([]) |> Enum.reverse()
+    workflow_errors = if handoff_comment_evidence?(evidence), do: Enum.reject(workflow_errors, &(&1["operation"] == "handoff")), else: workflow_errors
     report = if phase == :qa, do: Map.put(report, "checks", Keyword.get(opts, :host_checks, [])), else: report
 
     report =

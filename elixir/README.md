@@ -276,6 +276,9 @@ tracker:
 - Work identity is `owner/repository#number`. Claiming moves Ready to Building, successful completion
   moves Building to Done, and intervention-required failures move to Blocked with a comment. Transient
   failures retry on the existing backoff path.
+- A rejected GitHub handoff or a phase report with no handoff attempt gets one correction turn in
+  the same session; another rejection uses the normal retry path. A successful handoff without
+  returned evidence fails normally instead of risking a duplicate remote write.
 - Native GitHub `blocked by` relations populate `issue.blocked_by` with `owner/repository#number`
   identities. Incomplete or failed blocker reads fail the Project refresh instead of dropping
   dependency data.
