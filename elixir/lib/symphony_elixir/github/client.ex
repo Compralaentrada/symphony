@@ -5,6 +5,7 @@ defmodule SymphonyElixir.GitHub.Client do
 
   require Logger
   alias SymphonyElixir.Config
+  alias SymphonyElixir.GitHub.AgentReport
   alias SymphonyElixir.Pipeline.Store
   alias SymphonyElixir.Tracker.Issue
 
@@ -393,13 +394,15 @@ defmodule SymphonyElixir.GitHub.Client do
     report = normalize_report(arguments["report"])
     outcome = arguments["outcome"] || report["outcome"]
     report = Map.put(report, "outcome", outcome)
+    agent_body = Map.get(arguments, "body")
 
     with :ok <- validate_agent_handoff(context, outcome, report),
+         :ok <- AgentReport.validate_body(agent_body, report),
          {:ok, current_issue} <- current_issue(issue, settings, request_fun),
          :ok <- ensure_issue_open(current_issue),
          {:ok, pull_request} <- maybe_upsert_agent_pull_request(issue, context, report, settings, request_fun),
          marker = report_marker(issue, context),
-         body = report_body(marker, to_string(context.lane), report),
+         body = AgentReport.comment_body(marker, agent_body),
          {:ok, comment} <- upsert_agent_comment(issue, marker, "<!-- symphony:report:end -->", body, settings, request_fun) do
       {:ok,
        %{
@@ -775,9 +778,6 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp report_marker(issue, context),
     do: "<!-- symphony:report:start:#{issue.id}:#{context[:generation] || 0}:#{context[:lane]} -->"
-
-  defp report_body(marker, phase, report),
-    do: marker <> "\n## Symphony " <> String.capitalize(phase) <> " report\n\n" <> Jason.encode!(report, pretty: true) <> "\n<!-- symphony:report:end -->"
 
   defp replace_owned_block(current, start_marker, end_marker, replacement) do
     with {start, _} <- :binary.match(current, start_marker),

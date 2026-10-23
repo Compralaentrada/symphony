@@ -4,6 +4,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   """
 
   alias SymphonyElixir.Config
+  alias SymphonyElixir.GitHub.AgentReport
   alias SymphonyElixir.Pipeline.Findings
   alias SymphonyElixir.Pipeline.Store
   alias SymphonyElixir.Tracker.Issue
@@ -903,8 +904,10 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     report = normalize_report(Map.get(arguments, "report"))
     outcome = Map.get(arguments, "outcome") || report["outcome"]
     report = report |> Map.put("outcome", outcome) |> normalize_agent_report(lane, context)
+    body = Map.get(arguments, "body")
 
-    with {:ok, status} <- handoff_status(lane, report, settings),
+    with :ok <- AgentReport.validate_body(body, report),
+         {:ok, status} <- handoff_status(lane, report, settings),
          {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
          :ok <- handoff_source_status(lane, current, status, settings),
          {:ok, pr} <- handoff_pull_request(issue, context, report, tracker_settings, settings, request_fun),
@@ -912,7 +915,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          {:ok, closed_issue} <-
            maybe_finalize_merged_issue(issue, context, report, pr, tracker_settings, settings, request_fun),
          {:ok, comment} <-
-           publish_agent_report(issue, context, report, status, settings, tracker_settings, request_fun),
+           publish_agent_report(issue, context, body, status, settings, tracker_settings, request_fun),
          {:ok, status_evidence} <-
            apply_project_status(issue, current, status, lane, settings, tracker_settings, request_fun) do
       {:ok,
@@ -1125,7 +1128,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp maybe_finalize_merged_issue(_issue, _context, _report, _pr, _tracker_settings, _settings, _request_fun),
     do: {:error, :invalid_merged_handoff}
 
-  defp publish_agent_report(issue, context, report, target, settings, tracker_settings, request_fun) do
+  defp publish_agent_report(issue, context, body, target, settings, tracker_settings, request_fun) do
     phase = to_string(context.lane)
     marker = agent_report_marker(issue, context, phase)
 
@@ -1134,8 +1137,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          {:ok, issue_ref} <- issue_repository_and_number(issue),
          {:ok, existing} <- find_issue_comment(marker, issue_ref, settings, request_fun, nil) do
       case existing do
-        %{} = comment -> update_owned_agent_report(comment, marker, phase, report, settings, request_fun)
-        nil -> create_agent_report(issue, marker, phase, report, settings, request_fun)
+        %{} = comment -> update_owned_agent_report(comment, marker, body, settings, request_fun)
+        nil -> create_agent_report(issue, marker, body, settings, request_fun)
       end
     end
   end
@@ -1169,7 +1172,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
        %{
          "issue" => %{"id" => issue.id, "url" => issue.url},
          "workpad" => if(workpad, do: task_comment(workpad)),
-         "phase_reports" => phase_reports
+         "phase_reports" => phase_reports,
+         "report_context" => agent_report_context(context)
        }}
     else
       nil -> {:error, :github_agent_identity_missing}
@@ -1226,15 +1230,41 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp decode_phase_report_comment(body) do
-    json =
-      body
-      |> String.split("\n")
-      |> Enum.drop_while(&(String.trim(&1) != "{"))
-      |> Enum.take_while(&(String.trim(&1) != "<!-- symphony:report:end -->"))
-      |> Enum.join("\n")
-      |> String.trim()
+    AgentReport.decode_comment(body)
+  end
 
-    if json == "", do: {:error, :invalid_phase_report}, else: Jason.decode(json)
+  defp agent_report_context(context) do
+    lane = to_string(context.lane)
+    task = context[:task]
+    task = if is_map(task), do: task, else: %{}
+
+    fields =
+      case lane do
+        "build" -> ["branch", "base_branch", "required_checks"]
+        "qa" -> ["current_sha", "required_checks"]
+        "review" -> ["branch", "base_branch", "pr_number", "current_sha", "prior_findings"]
+        "finalize" -> ["branch", "base_branch", "pr_number", "current_sha"]
+        _ -> []
+      end
+
+    report_context = %{"lane" => lane, "task" => Map.take(task, fields)}
+
+    if lane == "qa" do
+      locale = context[:report_locale] || :en
+
+      Map.merge(report_context, %{
+        "host_checks" => normalize_report_list(context[:host_checks]),
+        "report_locale" => to_string(locale),
+        "qa_text" => %{
+          "checks_unavailable" => qa_text(%{report_locale: locale}, :checks_unavailable),
+          "checks_failed" => qa_text(%{report_locale: locale}, :checks_failed),
+          "findings" => qa_text(%{report_locale: locale}, :findings),
+          "next_step" => qa_text(%{report_locale: locale}, :next_step)
+        }
+      })
+    else
+      report_context
+    end
   end
 
   defp list_issue_comments(issue_ref, settings, request_fun, cursor, comments) do
@@ -1313,8 +1343,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     marker <> "\n" <> content <> "\n" <> end_marker
   end
 
-  defp create_agent_report(issue, marker, phase, report, settings, request_fun) do
-    body = agent_report_body(marker, phase, report)
+  defp create_agent_report(issue, marker, agent_body, settings, request_fun) do
+    body = AgentReport.comment_body(marker, agent_body)
     subject_id = ref_value(issue.native_ref, :issue_node_id)
 
     with subject_id when is_binary(subject_id) <- subject_id,
@@ -1327,7 +1357,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     end
   end
 
-  defp update_owned_agent_report(comment, marker, phase, report, settings, request_fun) do
+  defp update_owned_agent_report(comment, marker, agent_body, settings, request_fun) do
     with {:ok, viewer_data} <- graphql(request_fun, @viewer_query, %{}, settings),
          viewer when is_binary(viewer) <- get_in(viewer_data, ["viewer", "login"]),
          true <- get_in(comment, ["author", "login"]) == viewer,
@@ -1336,7 +1366,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
              comment["body"] || "",
              marker,
              "<!-- symphony:report:end -->",
-             agent_report_body(marker, phase, report)
+             AgentReport.comment_body(marker, agent_body)
            ),
          {:ok, data} <- graphql(request_fun, @update_comment_mutation, %{"id" => comment["id"], "body" => body}, settings),
          %{} = updated <- get_in(data, ["updateIssueComment", "issueComment"]) do
@@ -1348,9 +1378,6 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       _ -> {:error, :github_agent_report_update_failed}
     end
   end
-
-  defp agent_report_body(marker, phase, report),
-    do: marker <> "\n## Symphony " <> String.capitalize(phase) <> " report\n\n" <> Jason.encode!(report, pretty: true) <> "\n<!-- symphony:report:end -->"
 
   defp replace_owned_comment_block(current, marker, end_marker, replacement) do
     with {start, _} <- :binary.match(current, marker),

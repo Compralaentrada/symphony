@@ -221,6 +221,9 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "body" => "delivery"
     }
 
+    report = %{"outcome" => "merged", "summary" => "Merge verified.", "sha" => sha}
+    markdown = "## Finalize report\n\nMerge verified.\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
+
     {:ok, remote} = Agent.start_link(fn -> %{status: "Human Review", issue_state: "OPEN", events: []} end)
 
     request_fun = fn query, _variables, _settings ->
@@ -269,7 +272,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
                "handoff",
                %{
                  "outcome" => "merged",
-                 "report" => %{"outcome" => "merged", "summary" => "Merge verified.", "sha" => sha}
+                 "report" => report,
+                 "body" => markdown
                },
                tracker_settings: tracker_settings(),
                projects_request: request_fun
@@ -392,7 +396,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       %{
         "id" => "qa-attempt-2-comment",
         "url" => "https://github.com/octo/app/issues/#{number}#qa-attempt-2",
-        "body" => "<!-- symphony:report:start:#{issue_id}:1:qa:2 -->\n\n## Symphony Qa report\n\n#{Jason.encode!(qa_report, pretty: true)}\n<!-- symphony:report:end -->",
+        "body" =>
+          "<!-- symphony:report:start:#{issue_id}:1:qa:2 -->\n## QA report\n\nChecks passed on the accepted SHA.\n\n<!-- symphony:report:json\n#{Jason.encode!(qa_report, pretty: true)}\n-->\n<!-- symphony:report:end -->",
         "author" => %{"login" => agent_login}
       },
       %{
@@ -483,7 +488,79 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert Enum.map(qa_reports, & &1["attempt"]) == [1, 2]
     assert hd(qa_reports)["body"] =~ "QA-1"
     assert List.last(qa_reports)["body"] =~ "Host exit status 0 on #{sha}"
+    assert evidence["report_context"]["task"]["current_sha"] == sha
     refute Enum.any?(qa_reports, &String.contains?(&1["body"], old_sha))
+
+    legacy_comments =
+      (first_page_comments ++ second_page_comments)
+      |> Enum.map(fn
+        %{"id" => "qa-attempt-2-comment"} = comment ->
+          Map.put(comment, "body", "<!-- symphony:report:start:#{issue_id}:1:qa:2 -->\n\n## Symphony Qa report\n\n#{Jason.encode!(qa_report, pretty: true)}\n<!-- symphony:report:end -->")
+
+        comment ->
+          comment
+      end)
+
+    legacy_request_fun = fn query, _variables, _settings ->
+      if query =~ "SymphonyPipelineViewer" do
+        {:ok, %{status: 200, body: %{"data" => %{"viewer" => %{"login" => agent_login}}}}}
+      else
+        comments = %{"nodes" => legacy_comments, "pageInfo" => %{"hasNextPage" => false}}
+        body = %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}
+        {:ok, %{status: 200, body: body}}
+      end
+    end
+
+    assert {:ok, _legacy_evidence} =
+             Client.agent_operation(
+               issue,
+               review_context,
+               "read_workpad",
+               %{},
+               tracker_settings: tracker_settings(),
+               projects_request: legacy_request_fun
+             )
+
+    report_marker = "<!-- symphony:report:start:#{issue_id}:1:qa:3 -->"
+
+    malformed_report_comments = fn report_body ->
+      comment = %{
+        "id" => "malformed-qa-report",
+        "url" => "https://github.com/octo/app/issues/#{number}#malformed-qa-report",
+        "body" => "#{report_marker}\n#{report_body}\n<!-- symphony:report:end -->",
+        "author" => %{"login" => agent_login}
+      }
+
+      fn query, _variables, _settings ->
+        response_body =
+          if query =~ "SymphonyPipelineViewer" do
+            %{"data" => %{"viewer" => %{"login" => agent_login}}}
+          else
+            comments = %{"nodes" => [comment], "pageInfo" => %{"hasNextPage" => false}}
+            %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}
+          end
+
+        {:ok, %{status: 200, body: response_body}}
+      end
+    end
+
+    for report_body <- [
+          "not a JSON report",
+          "<!-- symphony:report:json\nnot JSON\n-->",
+          "<!-- symphony:report:json\n{}\n-->\n<!-- symphony:report:json\n{}\n-->"
+        ] do
+      malformed =
+        AgentTool.execute(
+          "github_workflow",
+          %{"operation" => "read_workpad"},
+          agent_context: review_context,
+          tracker_settings: tracker_settings(),
+          projects_request: malformed_report_comments.(report_body)
+        )
+
+      refute malformed["success"]
+      assert Jason.decode!(malformed["output"])["error"]["reason"] == ":qa_evidence_unavailable"
+    end
 
     stale_report =
       AgentTool.execute(
@@ -595,9 +672,9 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert :ok = Store.save_task(task)
     assert :ok = Store.begin_phase(issue_id, 1, "qa", 1)
 
-    {:ok, remote} = Agent.start_link(fn -> %{status: "QA"} end)
+    {:ok, remote} = Agent.start_link(fn -> %{status: "QA", report_body: nil} end)
 
-    request_fun = fn query, _variables, _settings ->
+    request_fun = fn query, variables, _settings ->
       Agent.get_and_update(remote, fn data ->
         cond do
           query =~ "SymphonyProject(" ->
@@ -620,6 +697,9 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
             {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [pr]}}}}}}, data}
 
+          query =~ "SymphonyPipelineViewer" ->
+            {{:ok, %{status: 200, body: %{"data" => %{"viewer" => %{"login" => "agent"}}}}}, data}
+
           query =~ "SymphonyPipelineReportComments" ->
             comments = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
             {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}}}, data}
@@ -627,7 +707,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
           query =~ "SymphonyAddIssueComment" ->
             comment = %{"id" => "IC_qa", "url" => "https://github.com/octo/app/issues/#{number}#issuecomment-1"}
             body = %{"data" => %{"addComment" => %{"commentEdge" => %{"node" => comment}}}}
-            {{:ok, %{status: 200, body: body}}, data}
+            {{:ok, %{status: 200, body: body}}, %{data | report_body: variables["body"]}}
 
           query =~ "SymphonySetProjectStatus" ->
             body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
@@ -640,7 +720,17 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     end
 
     finding = %{"id" => "QA-1", "reproduction" => "Run the failing check.", "criterion" => "The acceptance criterion passes."}
-    report = %{"outcome" => "defects_found", "summary" => "QA found a defect.", "findings" => [finding], "next_step" => "Fix the defect.", "sha" => sha}
+
+    report = %{
+      "outcome" => "defects_found",
+      "summary" => "QA found a defect.",
+      "findings" => [finding],
+      "next_step" => "Fix the defect.",
+      "sha" => sha,
+      "checks" => [%{"name" => "mix test", "status" => "passed", "evidence" => "exit status 0"}]
+    }
+
+    markdown = "## QA report\n\nQA found a defect.\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
 
     context = %{
       issue: issue,
@@ -648,20 +738,106 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       generation: 1,
       attempt: 1,
       task: task,
-      host_checks: [%{"name" => "mix test", "status" => "passed", "evidence" => "exit status 0"}]
+      host_checks: [%{"name" => "mix test", "status" => "passed", "evidence" => "exit status 0"}],
+      tracker_kind: "github_projects"
     }
 
-    assert {:ok, %{"outcome" => "defects_found", "project_item" => %{"status" => "Building"}}} =
-             Client.agent_operation(
-               issue,
-               context,
-               "handoff",
-               %{"outcome" => "defects_found", "report" => report},
-               tracker_settings: tracker_settings(),
-               projects_request: request_fun
-             )
+    handoff =
+      AgentTool.execute(
+        "github_workflow",
+        %{"operation" => "handoff", "outcome" => "defects_found", "report" => report, "body" => markdown},
+        agent_context: context,
+        tracker_settings: tracker_settings(),
+        projects_request: request_fun
+      )
+
+    assert handoff["success"], handoff["output"]
+    assert handoff["evidence"]["project_item"]["status"] == "Building"
 
     assert Agent.get(remote, & &1.status) == "Building"
+
+    assert Agent.get(remote, & &1.report_body) ==
+             "<!-- symphony:report:start:#{issue_id}:1:qa:1 -->\n#{markdown}\n<!-- symphony:report:end -->"
+
+    workpad_result =
+      AgentTool.execute(
+        "github_workflow",
+        %{"operation" => "read_workpad"},
+        agent_context: context,
+        tracker_settings: tracker_settings(),
+        projects_request: request_fun
+      )
+
+    assert workpad_result["success"], workpad_result["output"]
+    workpad = workpad_result["evidence"]
+    assert workpad["report_context"]["task"]["required_checks"] == ["mix test"]
+    assert workpad["report_context"]["host_checks"] == context.host_checks
+    assert workpad["report_context"]["qa_text"]["checks_failed"] == "One or more required host checks failed or were missing."
+
+    mismatched =
+      AgentTool.execute(
+        "github_workflow",
+        %{
+          "operation" => "handoff",
+          "outcome" => "defects_found",
+          "report" => report,
+          "body" =>
+            String.replace(
+              markdown,
+              Jason.encode!(report, pretty: true),
+              Jason.encode!(Map.put(report, "summary", "Different hidden summary."), pretty: true)
+            )
+        },
+        agent_context: context,
+        tracker_settings: tracker_settings(),
+        projects_request: fn _query, _variables, _settings -> flunk("invalid reports must fail before GitHub writes") end
+      )
+
+    refute mismatched["success"]
+    assert Jason.decode!(mismatched["output"])["error"]["reason"] == ":github_agent_report_json_mismatch"
+
+    visible_json =
+      AgentTool.execute(
+        "github_workflow",
+        %{
+          "operation" => "handoff",
+          "outcome" => "defects_found",
+          "report" => report,
+          "body" => "## QA report\n\n#{Jason.encode!(report, pretty: true)}\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
+        },
+        agent_context: context,
+        tracker_settings: tracker_settings(),
+        projects_request: fn _query, _variables, _settings -> flunk("visible report JSON must fail before GitHub writes") end
+      )
+
+    refute visible_json["success"]
+    assert Jason.decode!(visible_json["output"])["error"]["reason"] == ":visible_github_agent_report_json"
+
+    invalid_handoff = fn body, current_report ->
+      AgentTool.execute(
+        "github_workflow",
+        %{"operation" => "handoff", "outcome" => "defects_found", "report" => current_report, "body" => body},
+        agent_context: context,
+        tracker_settings: tracker_settings(),
+        projects_request: fn _query, _variables, _settings -> flunk("invalid reports must fail before GitHub writes") end
+      )
+    end
+
+    unsafe_report = Map.put(report, "summary", "Marker --> text must not reveal the report.")
+    unsafe_json = Jason.encode!(unsafe_report, pretty: true)
+
+    for {body, current_report, reason} <- [
+          {nil, report, :invalid_github_agent_report_body},
+          {"## QA report\n\nText only.", report, :missing_github_agent_report_json},
+          {markdown <> "\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->", report, :invalid_github_agent_report_json},
+          {"## QA report\n\n<!-- symphony:report:json\nnot JSON\n-->", report, :invalid_github_agent_report_json},
+          {"## QA report\n\n<!-- symphony:report:json\n#{unsafe_json}\n-->", unsafe_report, :unsafe_github_agent_report_json}
+        ] do
+      invalid = invalid_handoff.(body, current_report)
+
+      refute invalid["success"]
+      assert Jason.decode!(invalid["output"])["error"]["reason"] == ":#{reason}"
+    end
   end
 
   test "Review defects return the Project item to Building" do
@@ -775,8 +951,12 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "findings" => [finding],
       "resolutions" => [],
       "next_step" => "Fix the finding.",
-      "sha" => sha
+      "sha" => sha,
+      "branch" => issue.branch_name,
+      "base_branch" => "main"
     }
+
+    markdown = "## Review report\n\nReview found a defect.\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
 
     context = %{issue: issue, lane: :review, generation: 1, attempt: 1, task: task}
 
@@ -790,7 +970,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
                issue,
                context,
                "handoff",
-               %{"outcome" => "defects_found", "report" => report},
+               %{"outcome" => "defects_found", "report" => report, "body" => markdown},
                tracker_settings: tracker_settings(),
                projects_request: request_fun
              )
