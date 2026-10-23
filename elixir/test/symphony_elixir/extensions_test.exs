@@ -6,6 +6,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   alias SymphonyElixir.Linear.Adapter
   alias SymphonyElixir.Tracker.Memory
+  alias SymphonyElixir.Workspace
 
   @endpoint SymphonyElixirWeb.Endpoint
 
@@ -350,9 +351,16 @@ defmodule SymphonyElixir.ExtensionsTest do
            }
 
     conn = get(build_conn(), "/api/v1/MT-RETRY")
+    retry_identity = "PVT_project/PVTI_item/octo/app#7"
 
-    assert %{"status" => "retrying", "retry" => %{"attempt" => 2, "error" => "boom"}} =
-             json_response(conn, 200)
+    assert %{
+             "status" => "retrying",
+             "workspace" => %{"path" => retry_workspace},
+             "retry" => %{"attempt" => 2, "error" => "boom"}
+           } = json_response(conn, 200)
+
+    assert retry_workspace ==
+             Path.join(Config.settings!().workspace.root, Workspace.workspace_key(retry_identity))
 
     conn = get(build_conn(), "/api/v1/MT-BLOCKED")
 
@@ -676,6 +684,7 @@ defmodule SymphonyElixir.ExtensionsTest do
         %{
           issue_id: "issue-retry",
           identifier: "MT-RETRY",
+          execution_identity: "PVT_project/PVTI_item/octo/app#7",
           issue_url: "https://example.org/issues/MT-RETRY",
           attempt: 2,
           due_in_ms: 2_000,
