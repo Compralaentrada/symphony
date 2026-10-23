@@ -9,6 +9,7 @@ correspondiente y ejecuta las fases necesarias con Codex.
 - Coordina varios repositorios desde un único GitHub Project v2 mediante perfiles de repositorio.
 - Ejecuta Build, QA y Review en sesiones separadas y comprueba los comandos `required_checks` del
   repositorio durante QA.
+- Publica informes Markdown en español para issues en español y en inglés para el resto.
 - Guarda checkpoints del pipeline en SQLite para reanudar el trabajo tras un reinicio.
 - Expone el estado operativo en un dashboard y una API JSON.
 - Espera una fusión humana y solo marca una tarea como Done tras confirmar la fusión.
@@ -16,7 +17,12 @@ correspondiente y ejecuta las fases necesarias con Codex.
 En el pipeline de Projects, el estado visible del Project determina el despacho. El flujo normal es
 `Ready → Building → QA → Review → Human Review → Done`; las tareas que requieren intervención
 pueden pasar a `Blocked`. Mover una tarea de `Human Review` a `Ready` solicita correcciones sobre la
-misma rama y PR.
+misma rama y PR. Antes de QA o Review, Symphony comprueba que el `head SHA` de la PR siga siendo el
+que aceptó Build y que el workspace esté limpio en ese SHA. Si una tarea bloqueada en QA o Review
+vuelve de `Blocked` a `Ready` con el head cambiado o sin PR, reinicia en `Build` y repite ambas
+fases. Si falla una comprobación previa, el agente del lane `diagnostic` lee el workpad e inspecciona
+el workspace y la PR antes de documentar el motivo y la recuperación en la issue y el Project.
+Symphony detecta el bloqueo y coordina esa sesión, pero no escribe en GitHub.
 
 El tablero usa el campo `Status` y las opciones canónicas de Symphony: `Backlog`, `Ready`, `Building`,
 `QA`, `Review`, `Human Review`, `Blocked`, `Done` y `Dropped`.
@@ -26,10 +32,10 @@ pipeline multi-repositorio descrito aquí está centrado en GitHub Projects v2.
 
 ## Estado del proyecto
 
-El pipeline y la recuperación durable están implementados. La migración para que cada agente de
-fase sea propietario de sus escrituras de GitHub está aprobada y sigue en curso en la issue
-[#40](https://github.com/Compralaentrada/symphony/issues/40); hasta que termine, Symphony coordina
-esas escrituras.
+El pipeline y la recuperación durable están implementados. En ejecuciones desde GitHub Issues o
+GitHub Projects, el agente de cada tarea es propietario de sus escrituras de issue y PR. En el
+pipeline Projects, Build, QA y Review gestionan las operaciones de su lane mediante herramientas del
+host; Symphony conserva la lectura, el scheduling, los leases, los checkpoints y la reconciliación.
 
 ## Empezar en local
 

@@ -7,13 +7,23 @@ defmodule SymphonyElixir.Workspace do
   alias SymphonyElixir.{Config, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
+  @project_branch_diverged_status 42
+  @project_branch_missing_status 43
+  @project_branch_dirty_status 44
 
   @type worker_host :: String.t() | nil
 
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
-  def create_for_issue(issue_or_identifier, worker_host \\ nil) do
-    issue_context = issue_context(issue_or_identifier)
+  @spec create_for_issue(map() | String.t() | nil, worker_host(), keyword()) ::
+          {:ok, Path.t()} | {:error, term()}
+  def create_for_issue(issue_or_identifier, worker_host \\ nil, opts \\ []) do
+    issue_context =
+      issue_context(issue_or_identifier)
+      |> Map.put(:require_existing_project_branch, Keyword.get(opts, :require_existing_project_branch, false))
+      |> Map.put(:create_project_branch, Keyword.get(opts, :create_project_branch, true))
+
+    refresh_project_branch? = Keyword.get(opts, :refresh_project_branch, false)
 
     try do
       safe_id = workspace_key(issue_or_identifier)
@@ -21,7 +31,7 @@ defmodule SymphonyElixir.Workspace do
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
-        case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+        case prepare_workspace(workspace, issue_context, created?, worker_host, refresh_project_branch?) do
           :ok ->
             {:ok, workspace}
 
@@ -247,7 +257,12 @@ defmodule SymphonyElixir.Workspace do
   end
 
   @spec run_required_check(Path.t(), String.t(), String.t(), map() | String.t() | nil, worker_host()) ::
-          {:ok, String.t()} | {:error, :check_unavailable | :workspace_mismatch | {:check_failed, non_neg_integer()}}
+          {:ok, String.t()}
+          | {:error,
+             :check_unavailable
+             | {:workspace_dirty, String.t(), String.t() | nil}
+             | {:workspace_sha_mismatch, String.t(), String.t() | nil}
+             | {:check_failed, non_neg_integer()}}
   def run_required_check(workspace, command, sha, issue_or_identifier, worker_host)
       when is_binary(workspace) and is_binary(command) and is_binary(sha) do
     with :ok <- verify_required_check_workspace(workspace, sha, issue_or_identifier, worker_host),
@@ -263,16 +278,34 @@ defmodule SymphonyElixir.Workspace do
   defp verify_required_check_workspace(workspace, sha, issue_or_identifier, worker_host) do
     command = """
     actual_sha=$(git rev-parse --verify HEAD 2>/dev/null) || exit 127
+    printf 'actual_sha=%s\\n' "$actual_sha"
     [ "$actual_sha" = #{shell_escape(sha)} ] || exit 125
     status=$(git status --porcelain --untracked-files=all 2>/dev/null) || exit 127
     [ -z "$status" ] || exit 126
     """
 
     case run_hook(command, workspace, issue_context(issue_or_identifier), "required_check", worker_host) do
-      :ok -> :ok
-      {:error, {:workspace_hook_failed, "required_check", 127}} -> {:error, :check_unavailable}
-      {:error, {:workspace_hook_failed, "required_check", _status}} -> {:error, :workspace_mismatch}
-      {:error, _reason} -> {:error, :check_unavailable}
+      :ok ->
+        :ok
+
+      {:error, {:workspace_hook_failed, "required_check", 125, output}} ->
+        {:error, {:workspace_sha_mismatch, sha, actual_sha(output)}}
+
+      {:error, {:workspace_hook_failed, "required_check", 126, output}} ->
+        {:error, {:workspace_dirty, sha, actual_sha(output)}}
+
+      {:error, {:workspace_hook_failed, "required_check", 127, _output}} ->
+        {:error, :check_unavailable}
+
+      {:error, _reason} ->
+        {:error, :check_unavailable}
+    end
+  end
+
+  defp actual_sha(output) do
+    case Regex.run(~r/(?:^|\n)actual_sha=([[:xdigit:]]+)(?:\n|$)/, IO.iodata_to_binary(output), capture: :all_but_first) do
+      [sha] -> sha
+      _ -> nil
     end
   end
 
@@ -281,10 +314,11 @@ defmodule SymphonyElixir.Workspace do
       :ok ->
         :ok
 
-      {:error, {:workspace_hook_failed, "required_check", 127}} ->
+      {:error, {:workspace_hook_failed, "required_check", 127, _output}} ->
         {:error, :check_unavailable}
 
-      {:error, {:workspace_hook_failed, "required_check", status}} when is_integer(status) and status >= 0 ->
+      {:error, {:workspace_hook_failed, "required_check", status, _output}}
+      when is_integer(status) and status >= 0 ->
         {:error, {:check_failed, status}}
 
       {:error, _reason} ->
@@ -344,15 +378,53 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  defp prepare_workspace(workspace, issue_context, created?, worker_host, refresh_project_branch?) do
+    case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+      :ok when not created? and refresh_project_branch? ->
+        maybe_sync_project_branch(workspace, issue_context, worker_host)
+
+      result ->
+        result
+    end
+  end
+
+  defp maybe_sync_project_branch(workspace, %{prepare_command: command} = issue_context, worker_host)
+       when is_binary(command) and command != "" do
+    case run_hook(project_branch_sync_command(issue_context), workspace, issue_context, "before_run", worker_host) do
+      {:error, {:workspace_hook_failed, "before_run", @project_branch_diverged_status, _output}} ->
+        {:error, :project_branch_diverged}
+
+      {:error, {:workspace_hook_failed, "before_run", @project_branch_missing_status, _output}} ->
+        {:error, :project_branch_missing}
+
+      {:error, {:workspace_hook_failed, "before_run", @project_branch_dirty_status, _output}} ->
+        {:error, :project_branch_dirty}
+
+      result ->
+        result
+    end
+  end
+
+  defp maybe_sync_project_branch(_workspace, _issue_context, _worker_host), do: :ok
+
   defp run_project_after_create_hooks(command, workspace, issue_context, worker_host) do
     case run_hook(command, workspace, issue_context, "after_create", worker_host) do
       :ok ->
         run_hook(project_branch_command(issue_context), workspace, issue_context, "after_create", worker_host)
+        |> project_branch_creation_result(issue_context)
 
       error ->
         error
     end
   end
+
+  defp project_branch_creation_result(
+         {:error, {:workspace_hook_failed, "after_create", @project_branch_missing_status, _output}},
+         %{require_existing_project_branch: true}
+       ),
+       do: {:error, :project_branch_missing}
+
+  defp project_branch_creation_result(result, _issue_context), do: result
 
   defp run_legacy_after_create_hook(workspace, issue_context, worker_host) do
     case Config.settings!().hooks.after_create do
@@ -509,9 +581,9 @@ defmodule SymphonyElixir.Workspace do
     :ok
   end
 
-  defp handle_hook_command_result({_output, status}, workspace, issue_context, "required_check") do
+  defp handle_hook_command_result({output, status}, workspace, issue_context, "required_check") do
     Logger.warning("Required workspace check failed #{issue_log_context(issue_context)} workspace=#{workspace} status=#{status}")
-    {:error, {:workspace_hook_failed, "required_check", status}}
+    {:error, {:workspace_hook_failed, "required_check", status, output}}
   end
 
   defp handle_hook_command_result({output, status}, workspace, issue_context, hook_name) do
@@ -687,7 +759,12 @@ defmodule SymphonyElixir.Workspace do
 
   defp project_workspace_profile(_issue), do: nil
 
-  defp project_branch_command(%{branch_name: branch_name, base_branch: base_branch}) do
+  defp project_branch_command(%{
+         branch_name: branch_name,
+         base_branch: base_branch,
+         require_existing_project_branch: require_existing_project_branch?,
+         create_project_branch: create_project_branch?
+       }) do
     work_ref = "refs/remotes/origin/#{branch_name}"
     local_work_ref = "refs/heads/#{branch_name}"
     base_ref = "refs/remotes/origin/#{base_branch}"
@@ -699,6 +776,18 @@ defmodule SymphonyElixir.Workspace do
       "  git switch --quiet --track --force-create #{shell_escape(branch_name)} #{shell_escape("origin/" <> branch_name)}",
       "elif git show-ref --verify --quiet #{shell_escape(local_work_ref)}; then",
       "  git switch --quiet #{shell_escape(branch_name)}",
+      "elif [ #{require_existing_project_branch?} = true ]; then",
+      "  printf '%s\\n' 'SYMPHONY_PROJECT_BRANCH_MISSING' >&2",
+      "  exit #{@project_branch_missing_status}",
+      "elif [ #{create_project_branch?} = false ]; then",
+      "  if git show-ref --verify --quiet #{shell_escape(base_ref)}; then",
+      "    git switch --quiet --detach #{shell_escape("origin/" <> base_branch)}",
+      "  elif git show-ref --verify --quiet #{shell_escape(local_base_ref)}; then",
+      "    git switch --quiet --detach #{shell_escape(base_branch)}",
+      "  else",
+      "    printf '%s\\n' #{shell_escape("Configured base branch not found: " <> base_branch)} >&2",
+      "    exit 1",
+      "  fi",
       "elif git show-ref --verify --quiet #{shell_escape(base_ref)}; then",
       "  git switch --quiet --force-create #{shell_escape(branch_name)} #{shell_escape("origin/" <> base_branch)}",
       "elif git show-ref --verify --quiet #{shell_escape(local_base_ref)}; then",
@@ -706,6 +795,51 @@ defmodule SymphonyElixir.Workspace do
       "else",
       "  printf '%s\\n' #{shell_escape("Configured base branch not found: " <> base_branch)} >&2",
       "  exit 1",
+      "fi"
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp project_branch_sync_command(%{branch_name: branch_name}) do
+    work_ref = "refs/remotes/origin/#{branch_name}"
+    local_work_ref = "refs/heads/#{branch_name}"
+
+    [
+      "set -eu",
+      "git fetch --quiet --prune origin",
+      "switch_task_branch() {",
+      "  if git switch --quiet \"$@\"; then",
+      "    return 0",
+      "  elif [ -n \"$(git status --porcelain)\" ]; then",
+      "    printf '%s\\n' 'SYMPHONY_PROJECT_BRANCH_DIRTY' >&2",
+      "    exit #{@project_branch_dirty_status}",
+      "  else",
+      "    return 1",
+      "  fi",
+      "}",
+      "if git show-ref --verify --quiet #{shell_escape(work_ref)}; then",
+      "  if git show-ref --verify --quiet #{shell_escape(local_work_ref)}; then",
+      "    switch_task_branch #{shell_escape(branch_name)}",
+      "  else",
+      "    switch_task_branch --track --create #{shell_escape(branch_name)} #{shell_escape("origin/" <> branch_name)}",
+      "  fi",
+      "  if git merge-base --is-ancestor HEAD #{shell_escape("origin/" <> branch_name)}; then",
+      "    if ! git merge --quiet --ff-only #{shell_escape("origin/" <> branch_name)}; then",
+      "      if [ -n \"$(git status --porcelain)\" ]; then",
+      "        printf '%s\\n' 'SYMPHONY_PROJECT_BRANCH_DIRTY' >&2",
+      "        exit #{@project_branch_dirty_status}",
+      "      fi",
+      "      exit 1",
+      "    fi",
+      "  elif ! git merge-base --is-ancestor #{shell_escape("origin/" <> branch_name)} HEAD; then",
+      "    printf '%s\\n' 'SYMPHONY_PROJECT_BRANCH_DIVERGED' >&2",
+      "    exit #{@project_branch_diverged_status}",
+      "  fi",
+      "elif git show-ref --verify --quiet #{shell_escape(local_work_ref)}; then",
+      "  switch_task_branch #{shell_escape(branch_name)}",
+      "else",
+      "  printf '%s\\n' 'SYMPHONY_PROJECT_BRANCH_MISSING' >&2",
+      "  exit #{@project_branch_missing_status}",
       "fi"
     ]
     |> Enum.join("\n")

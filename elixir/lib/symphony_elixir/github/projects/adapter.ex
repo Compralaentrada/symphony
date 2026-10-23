@@ -47,8 +47,16 @@ defmodule SymphonyElixir.GitHub.Projects.Adapter do
   @spec agent_tool_specs() :: [map()]
   def agent_tool_specs, do: AgentTool.tool_specs()
 
+  @spec agent_tool_specs(map()) :: [map()]
+  def agent_tool_specs(context), do: AgentTool.tool_specs(context)
+
   @spec execute_agent_tool(String.t(), term(), keyword()) :: map()
   def execute_agent_tool(tool, arguments, opts) do
+    execute_agent_tool(tool, arguments, opts, Keyword.get(opts, :agent_context, %{}))
+  end
+
+  @spec execute_agent_tool(String.t(), term(), keyword(), map()) :: map()
+  def execute_agent_tool(tool, arguments, opts, context) do
     tracker_settings = Keyword.get_lazy(opts, :tracker_settings, fn -> Config.settings!().tracker end)
     provider = tracker_settings.provider
 
@@ -66,7 +74,13 @@ defmodule SymphonyElixir.GitHub.Projects.Adapter do
       | provider: Map.put_new(provider, "repo", default_repo)
     }
 
-    AgentTool.execute(tool, arguments, Keyword.put(opts, :tracker_settings, tracker_settings))
+    AgentTool.execute(
+      tool,
+      arguments,
+      opts
+      |> Keyword.put(:tracker_settings, tracker_settings)
+      |> Keyword.put(:agent_context, context)
+    )
   end
 
   @spec secret_environment_names(map()) :: [String.t()]

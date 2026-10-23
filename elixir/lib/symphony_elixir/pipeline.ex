@@ -1,10 +1,13 @@
 defmodule SymphonyElixir.Pipeline do
   @moduledoc false
 
-  alias SymphonyElixir.{Config, Pipeline.Store, Tracker}
+  alias SymphonyElixir.{Config, Pipeline.Findings, Pipeline.Store, Tracker}
   alias SymphonyElixir.Tracker.Issue
 
-  @phases ~w(build qa review)
+  @phases ~w(build qa review finalize)
+  # shortcut: 30 randomized Tongue samples smooth locale scores; revisit if locale coverage or accuracy needs change.
+  @report_locale_samples 30
+  @report_locale_confidence 0.75
   @statuses %{
     backlog: "Backlog",
     ready: "Ready",
@@ -23,10 +26,17 @@ defmodule SymphonyElixir.Pipeline do
     tracker.kind == "github_projects"
   end
 
+  @spec report_locale(Issue.t()) :: :en | :es
+  def report_locale(%Issue{description: description}) do
+    description = if is_binary(description), do: String.downcase(description), else: ""
+    confidence = Enum.reduce(1..@report_locale_samples, 0.0, fn _, total -> total + Keyword.get(Tongue.detect(description), :es, 0.0) end) / @report_locale_samples
+    if confidence >= @report_locale_confidence, do: :es, else: :en
+  end
+
   @spec reconcile() :: :ok | {:error, term()}
   def reconcile do
     with {:ok, tasks} <- Store.tasks() do
-      Enum.each(tasks, &reconcile_task/1)
+      reconcile_tasks(tasks)
     end
   end
 
@@ -51,10 +61,32 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   @spec finish_phase(Issue.t(), map(), String.t(), pos_integer(), term()) :: :ok | {:error, term()}
+  def finish_phase(%Issue{} = issue, task, phase, attempt, {:system_blocker, result})
+      when phase in ["build", "qa", "review"] and is_map(result) do
+    case normalize_phase_result(result, phase, report_locale(issue)) do
+      {:ok, %{"outcome" => "blocked"} = normalized} ->
+        if Tracker.agent_owned_writes?() do
+          _ = Store.interrupt_phase(issue.id, task["generation"], phase, attempt)
+          {:error, :diagnostic_handoff_required}
+        else
+          persist_blocked_phase(issue, task, phase, attempt, normalized)
+        end
+
+      {:ok, _normalized} ->
+        {:error, :invalid_system_blocker_report}
+
+      {:error, reason} ->
+        _ = Store.interrupt_phase(issue.id, task["generation"], phase, attempt)
+        {:error, reason}
+    end
+  end
+
   def finish_phase(%Issue{} = issue, task, phase, attempt, result) do
-    case normalize_phase_result(result, phase) do
+    case normalize_phase_result(result, phase, report_locale(issue)) do
       {:ok, result} ->
-        finish_valid_phase(issue, task, phase, attempt, result)
+        with :ok <- validate_remote_handoff(phase, result) do
+          finish_valid_phase(issue, task, phase, attempt, result)
+        end
 
       {:error, reason} ->
         _ = Store.interrupt_phase(issue.id, task["generation"], phase, attempt)
@@ -63,7 +95,7 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   @spec block_phase(Issue.t(), map(), String.t(), pos_integer(), String.t()) :: :ok | {:error, term()}
-  def block_phase(%Issue{} = issue, task, phase, attempt, reason) do
+  def block_phase(%Issue{} = issue, task, phase, attempt, reason) when is_binary(reason) do
     result = %{
       "outcome" => "blocked",
       "summary" => "An operator must resolve an intervention before this phase can continue.",
@@ -72,6 +104,11 @@ defmodule SymphonyElixir.Pipeline do
       "sha" => task["current_sha"]
     }
 
+    persist_blocked_phase(issue, task, phase, attempt, result)
+  end
+
+  defp persist_blocked_phase(issue, task, phase, attempt, result) do
+    reason = result["reason"]
     next = task |> Map.put("phase", phase) |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
     operations = report_ops(next, phase, attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
     commit(issue, next, phase, attempt, result, operations)
@@ -79,14 +116,18 @@ defmodule SymphonyElixir.Pipeline do
 
   @spec execute_pending(Issue.t()) :: :ok | {:error, term()}
   def execute_pending(%Issue{} = issue) do
-    case Store.pending_operations(issue.id) do
-      {:ok, operations} -> Enum.reduce_while(operations, :ok, &execute_pending_operation(issue, &1, &2))
-      {:error, _reason} = error -> error
+    if Tracker.agent_owned_writes?() do
+      :ok
+    else
+      case Store.pending_operations(issue.id) do
+        {:ok, operations} -> Enum.reduce_while(operations, :ok, &execute_pending_operation(issue, &1, &2))
+        {:error, _reason} = error -> error
+      end
     end
   end
 
   defp prepare_from_checkpoint(issue, existing) do
-    _ = execute_pending(issue)
+    _ = if(Tracker.agent_owned_writes?(), do: Store.supersede_pending_operations(issue.id), else: execute_pending(issue))
 
     case Store.pending_operations(issue.id) do
       {:ok, []} ->
@@ -155,11 +196,17 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp prepare_task(%{"status" => "blocked"} = task, %Issue{} = issue) do
-    if issue.state == status_value(task, :ready), do: resume_blocked_task(task), else: :ignore
+    if issue.state == status_value(task, :ready), do: resume_blocked_task(task, issue), else: :ignore
   end
 
   defp prepare_task(%{"status" => "human_review"} = task, %Issue{} = issue) do
     if issue.state == status_value(task, :ready), do: resume_human_review_task(task), else: :ignore
+  end
+
+  defp prepare_task(%{"status" => "finalize"} = task, %Issue{} = issue) do
+    if issue.state in [status_value(task, :human_review), status_value(task, :building), status_value(task, :done), "closed"],
+      do: {:ok, task, "finalize"},
+      else: :ignore
   end
 
   defp prepare_task(%{"status" => "building"} = task, %Issue{} = issue) do
@@ -179,6 +226,31 @@ defmodule SymphonyElixir.Pipeline do
 
   defp prepare_task(_task, _issue), do: :ignore
 
+  defp resume_blocked_task(%{"phase" => phase, "current_sha" => current_sha} = task, issue)
+       when phase in ["qa", "review"] and is_binary(current_sha) do
+    case Tracker.pull_request(issue) do
+      {:ok, %{sha: ^current_sha}} ->
+        resume_blocked_task(task)
+
+      {:ok, _pr} ->
+        restart_blocked_task_at_build(task)
+
+      :ignore ->
+        restart_blocked_task_at_build(task)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp resume_blocked_task(%{"phase" => phase} = task, _issue) when phase in ["qa", "review"],
+    do: restart_blocked_task_at_build(task)
+
+  defp resume_blocked_task(task, _issue), do: resume_blocked_task(task)
+
+  defp restart_blocked_task_at_build(task),
+    do: task |> Map.put("phase", "build") |> Map.put("current_sha", nil) |> resume_blocked_task()
+
   defp resume_blocked_task(task) do
     task = Map.put(task, "status", "building")
     with :ok <- Store.save_task(task), do: {:ok, task, task["phase"]}
@@ -193,7 +265,7 @@ defmodule SymphonyElixir.Pipeline do
       |> Map.put("attempts", %{})
       |> Map.put("current_sha", nil)
 
-    operations = [operation(task, "pr_stage", %{"stage" => "draft"})]
+    operations = if Tracker.agent_owned_writes?(), do: [], else: [operation(task, "pr_stage", %{"stage" => "draft"})]
 
     with :ok <- Store.commit_phase(task, "build", 0, %{"outcome" => "requeued"}, operations) do
       {:ok, task, "build"}
@@ -218,7 +290,9 @@ defmodule SymphonyElixir.Pipeline do
   defp finish_valid_phase(issue, task, "build", attempt, %{"outcome" => "ready", "sha" => sha} = result)
        when is_binary(sha) do
     with :ok <- Tracker.validate_pipeline_delivery(issue, task["branch"], sha) do
-      next = %{task | "phase" => "qa", "status" => "qa", "current_sha" => sha}
+      handoff = remote_handoff(result)
+      pr_number = get_in(handoff, ["pull_request", "number"])
+      next = task |> Map.merge(%{"phase" => "qa", "status" => "qa", "current_sha" => sha}) |> maybe_put("pr_number", pr_number)
 
       ops = [
         operation(next, "pull_request", %{
@@ -239,7 +313,7 @@ defmodule SymphonyElixir.Pipeline do
        when is_binary(sha) do
     with :ok <- ensure_current_sha(task, sha),
          :ok <- validate_required_checks(task["required_checks"], result["checks"] || []) do
-      next = %{task | "phase" => "review", "status" => "review"}
+      next = task |> Map.merge(%{"phase" => "review", "status" => "review", "host_checks" => result["_host_checks"] || result["checks"] || []})
       operations = report_ops(next, "qa", attempt, result) ++ [status_op(next, :review, nil, attempt)]
       commit(issue, next, "qa", attempt, result, operations)
     else
@@ -284,6 +358,18 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
+  defp finish_valid_phase(issue, task, "review", attempt, %{"outcome" => "merged", "sha" => sha} = result) do
+    with :ok <- ensure_current_sha(task, sha) do
+      commit(issue, Map.put(task, "status", "done"), "review", attempt, result, [])
+    end
+  end
+
+  defp finish_valid_phase(issue, task, "finalize", attempt, %{"outcome" => "merged", "sha" => sha} = result) do
+    with :ok <- ensure_current_sha(task, sha) do
+      commit(issue, Map.put(task, "status", "done"), "finalize", attempt, result, [])
+    end
+  end
+
   defp finish_valid_phase(issue, task, phase, attempt, %{"outcome" => outcome} = result)
        when phase in ["qa", "review"] and outcome in ["changes_requested", "failed", "defects_found"] do
     rework_phase(issue, task, phase, attempt, result)
@@ -303,18 +389,20 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp pending_findings(task, result) do
-    resolved_ids = MapSet.new(Map.get(result, "resolutions") || [])
+    resolutions = Map.get(result, "resolutions") || []
 
     (Map.get(task, "prior_findings") || [])
     |> Kernel.++(Map.get(result, "findings") || [])
     |> Enum.uniq_by(& &1["id"])
-    |> Enum.reject(&MapSet.member?(resolved_ids, &1["id"]))
+    |> Enum.reject(&Findings.resolved?(&1["id"], resolutions))
   end
 
   defp commit(issue, task, phase, attempt, result, operations) do
+    operations = if Tracker.agent_owned_writes?(), do: [], else: operations
+
     case Store.commit_phase(task, phase, attempt, result, operations) do
       :ok ->
-        _ = execute_pending(issue)
+        if not Tracker.agent_owned_writes?(), do: execute_pending(issue)
         :ok
 
       {:error, _} = error ->
@@ -322,9 +410,22 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp reconcile_task(%{"issue_id" => issue_id} = task) do
-    case Tracker.fetch_issues_by_ids([issue_id]) do
-      {:ok, [issue | _]} ->
+  defp reconcile_tasks([]), do: :ok
+
+  defp reconcile_tasks(tasks) do
+    case Tracker.fetch_issues_by_ids(Enum.map(tasks, & &1["issue_id"])) do
+      {:ok, issues} ->
+        issues_by_id = Map.new(issues, &{&1.id, &1})
+        Enum.each(tasks, &reconcile_task(&1, issues_by_id))
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp reconcile_task(%{"issue_id" => issue_id} = task, issues_by_id) do
+    case Map.get(issues_by_id, issue_id) do
+      %Issue{} = issue ->
         _ = execute_pending(issue)
         reconcile_task_issue(issue, task)
 
@@ -365,21 +466,19 @@ defmodule SymphonyElixir.Pipeline do
   defp reconcile_nonterminal_task(_issue, _task), do: :ok
 
   defp reconcile_unmerged_done(issue, task, status) do
-    case expected_status(status) do
-      nil -> :ok
-      expected -> persist_status(issue, task, expected, "reject_unmerged_done")
-    end
+    _ = {issue, task, status}
+    :ok
   end
 
   defp reconcile_human_review(issue, task) do
     case Tracker.pull_request(issue) do
-      {:ok, %{merged: true, base: base}} ->
-        if base == task["base_branch"], do: complete_merged_task(issue, task), else: :ok
+      {:ok, %{merged: true, base: base, number: number}} ->
+        if base == task["base_branch"], do: complete_merged_task(task, number), else: :ok
 
       {:ok, _pr} ->
         if issue.state in [status_value(task, :ready), status_value(task, :human_review), "closed"],
           do: :ok,
-          else: persist_status(issue, task, :human_review, "reconcile_human_review")
+          else: :ok
 
       _ ->
         :ok
@@ -478,32 +577,17 @@ defmodule SymphonyElixir.Pipeline do
   defp markdown_item(item) when is_binary(item), do: item
   defp markdown_item(item), do: Jason.encode!(item)
 
-  defp persist_status(issue, task, status, salt) do
-    with :ok <- Store.save_task_with_operations(task, [status_op(task, status, nil, salt)]) do
-      execute_pending(issue)
-    end
-  end
-
-  defp complete_merged_task(issue, task) do
-    next = %{task | "status" => "done"}
-    operation = status_op(next, :done, nil, "confirmed_merge")
-
-    with :ok <- Store.save_task_with_operations(next, [operation]) do
-      execute_pending(issue)
-    end
+  defp complete_merged_task(task, number) do
+    next = task |> Map.merge(%{"phase" => "finalize", "status" => "finalize", "pr_number" => number})
+    Store.save_task(next)
   end
 
   defp reconcile_closed_issue(issue, task) do
     case Tracker.pull_request(issue) do
-      {:ok, %{merged: true, base: base}} ->
-        if base == task["base_branch"] do
-          complete_merged_task(issue, task)
-        else
-          drop_task(issue, task, "GitHub issue closed before the pull request was merged into the configured base branch.")
-        end
-
-      {:ok, _pr} ->
-        drop_task(issue, task, close_reason(issue))
+      {:ok, %{merged: true, base: base, number: number, sha: sha}} ->
+        if base == task["base_branch"] and sha == task["current_sha"],
+          do: complete_merged_task(task, number),
+          else: :ok
 
       _ ->
         :ok
@@ -554,25 +638,6 @@ defmodule SymphonyElixir.Pipeline do
 
   defp human_drop_reason(_issue), do: :error
 
-  defp close_reason(issue) do
-    case human_drop_reason(issue) do
-      {:ok, reason} ->
-        reason
-
-      :error ->
-        state_reason = profile_value(issue.native_ref || %{}, :issue_state_reason)
-        if is_binary(state_reason) and state_reason != "", do: "GitHub issue closed with reason #{state_reason} before the PR merged.", else: "GitHub issue closed by a human before the PR merged."
-    end
-  end
-
-  defp expected_status("blocked"), do: :blocked
-  defp expected_status("human_review"), do: :human_review
-  defp expected_status("qa"), do: :qa
-  defp expected_status("review"), do: :review
-  defp expected_status("dropped"), do: :dropped
-  defp expected_status("building"), do: :building
-  defp expected_status(_status), do: nil
-
   defp report_ops(task, phase, attempt, result), do: [report_op(task, phase, attempt, result)]
 
   defp report_op(task, phase, attempt, result) do
@@ -597,16 +662,20 @@ defmodule SymphonyElixir.Pipeline do
 
   @doc false
   @spec normalize_phase_result(term(), String.t()) :: {:ok, map()} | {:error, term()}
-  def normalize_phase_result(result, phase) when is_map(result) do
+  def normalize_phase_result(result, phase), do: normalize_phase_result(result, phase, :en)
+
+  @spec normalize_phase_result(term(), String.t(), :en | :es) :: {:ok, map()} | {:error, term()}
+  def normalize_phase_result(result, phase, locale) when is_map(result) do
     result = Map.new(result, fn {key, value} -> {to_string(key), value} end)
+    result = normalize_remote_result(result, phase)
 
     result =
       if phase in ["qa", "review"] and result["outcome"] == "passed" and result["findings"] not in [nil, []],
         do:
           Map.merge(result, %{
             "outcome" => "changes_requested",
-            "summary" => "#{String.upcase(phase)} reported findings that need correction.",
-            "next_step" => "Fix the findings and submit a new Build delivery."
+            "summary" => findings_summary(locale, phase),
+            "next_step" => findings_next_step(locale)
           }),
         else: result
 
@@ -615,8 +684,16 @@ defmodule SymphonyElixir.Pipeline do
       else: {:error, {:invalid_phase_report, invalid_report_details(phase, result)}}
   end
 
-  def normalize_phase_result(_result, phase),
+  def normalize_phase_result(_result, phase, _locale),
     do: {:error, {:invalid_phase_report, %{phase: phase, report_type: :not_an_object}}}
+
+  defp findings_summary(:es, "qa"), do: "QA encontró hallazgos que requieren corrección."
+  defp findings_summary(:es, _phase), do: "La revisión encontró hallazgos que requieren corrección."
+  defp findings_summary(_locale, "qa"), do: "QA reported findings that need correction."
+  defp findings_summary(_locale, _phase), do: "Review reported findings that need correction."
+
+  defp findings_next_step(:es), do: "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
+  defp findings_next_step(_locale), do: "Fix the findings and submit a new Build delivery."
 
   defp invalid_report_details(phase, result) do
     finding_keys =
@@ -655,7 +732,136 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp valid_report?("review", %{"outcome" => "blocked"} = result), do: is_binary(result["reason"])
+
+  defp valid_report?(phase, %{"outcome" => "merged"} = result) when phase in ["review", "finalize"],
+    do: is_binary(result["sha"]) and is_binary(result["summary"])
+
+  defp valid_report?("finalize", %{"outcome" => "blocked"} = result), do: is_binary(result["reason"])
   defp valid_report?(_phase, _result), do: false
+
+  defp normalize_remote_result(result, "qa") do
+    checks = result["_host_checks"] || result["checks"] || []
+    result = Map.put(result, "checks", checks)
+
+    case remote_handoff(result) do
+      %{"outcome" => outcome} when is_binary(outcome) -> Map.put(result, "outcome", outcome)
+      _ -> result
+    end
+  end
+
+  defp normalize_remote_result(result, phase) when phase in ["build", "review", "finalize"] do
+    case remote_handoff(result) do
+      %{"outcome" => outcome} when is_binary(outcome) -> Map.put(result, "outcome", outcome)
+      _ -> result
+    end
+  end
+
+  defp normalize_remote_result(result, _phase), do: result
+
+  defp validate_remote_handoff(phase, result) do
+    if Tracker.agent_owned_writes?(), do: validate_agent_handoff_evidence(phase, result), else: :ok
+  end
+
+  defp validate_agent_handoff_evidence(phase, result) do
+    handoff = remote_handoff(result)
+
+    with :ok <- validate_handoff_comment(handoff, result),
+         :ok <- validate_handoff_outcome(handoff, result),
+         :ok <- validate_phase_pull_request(phase, handoff, result),
+         :ok <- validate_merge_evidence(phase, handoff, result) do
+      validate_project_evidence(phase, handoff)
+    end
+  end
+
+  defp validate_handoff_comment(%{"comment" => %{"id" => id, "url" => url}}, _result)
+       when is_binary(id) and is_binary(url),
+       do: :ok
+
+  defp validate_handoff_comment(_handoff, %{"_workflow_errors" => errors}) when is_list(errors) and errors != [] do
+    case List.last(errors) do
+      %{"reason" => ":stale_agent_lease"} ->
+        {:error, :stale_agent_lease}
+
+      %{"operation" => operation, "reason" => reason} when is_binary(operation) and is_binary(reason) ->
+        {:error, {:github_workflow_failed, operation, reason}}
+
+      %{"reason" => reason} when is_binary(reason) ->
+        {:error, {:github_workflow_failed, reason}}
+
+      _ ->
+        {:error, :github_handoff_comment_evidence_missing}
+    end
+  end
+
+  defp validate_handoff_comment(_handoff, _result), do: {:error, :github_handoff_comment_evidence_missing}
+
+  defp validate_handoff_outcome(%{"outcome" => outcome}, %{"outcome" => outcome}), do: :ok
+  defp validate_handoff_outcome(_handoff, _result), do: {:error, :github_handoff_outcome_mismatch}
+
+  defp validate_phase_pull_request("build", %{"outcome" => "ready"} = handoff, result) do
+    pr = handoff["pull_request"]
+
+    if valid_pull_request_evidence?(pr, result["sha"], true),
+      do: :ok,
+      else: {:error, :github_build_pull_request_evidence_missing}
+  end
+
+  defp validate_phase_pull_request(phase, %{"outcome" => outcome} = handoff, result)
+       when phase in ["qa", "review"] and outcome in ["passed", "changes_requested", "failed", "merged"] do
+    pr = handoff["pull_request"]
+
+    if valid_pull_request_evidence?(pr, result["sha"], false),
+      do: :ok,
+      else: {:error, :github_pull_request_evidence_missing}
+  end
+
+  defp validate_phase_pull_request(_phase, _handoff, _result), do: :ok
+
+  defp valid_pull_request_evidence?(pr, sha, require_draft?) do
+    is_map(pr) and is_binary(pr["url"]) and pr["head_sha"] == sha and
+      (not require_draft? or pr["draft"] == true)
+  end
+
+  defp validate_merge_evidence(phase, %{"outcome" => "merged"} = handoff, result)
+       when phase in ["review", "finalize"] do
+    pr = handoff["pull_request"]
+    project = handoff["project_item"]
+    closed_issue = handoff["closed_issue"]
+
+    cond do
+      not (is_map(pr) and pr["merged"] == true and pr["head_sha"] == result["sha"]) ->
+        {:error, :github_merge_confirmation_missing}
+
+      not (is_map(closed_issue) and closed_issue["state"] == "CLOSED" and is_map(project) and project["status"] == "Done") ->
+        {:error, :github_merge_finalization_evidence_missing}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_merge_evidence(_phase, _handoff, _result), do: :ok
+
+  defp validate_project_evidence(phase, %{"project_item" => project}) when phase != "finalize" and is_map(project) do
+    if is_binary(project["id"]), do: :ok, else: {:error, :github_project_evidence_missing}
+  end
+
+  defp validate_project_evidence(_phase, _handoff), do: :ok
+
+  defp remote_handoff(%{"_remote_evidence" => evidence}) when is_list(evidence) do
+    Enum.find_value(Enum.reverse(evidence), fn
+      %{"outcome" => _outcome, "comment" => _comment, "project_item" => _project} = handoff -> handoff
+      %{"outcome" => _outcome, "comment" => _comment, "issue" => _issue} = handoff -> handoff
+      %{"evidence" => %{"outcome" => _outcome, "comment" => _comment, "project_item" => _project} = handoff} -> handoff
+      %{"evidence" => %{"outcome" => _outcome, "comment" => _comment, "issue" => _issue} = handoff} -> handoff
+      _ -> nil
+    end)
+  end
+
+  defp remote_handoff(_result), do: nil
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp valid_findings?(findings) when is_list(findings) do
     Enum.all?(findings, fn

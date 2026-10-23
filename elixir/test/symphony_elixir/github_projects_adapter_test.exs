@@ -1,15 +1,16 @@
 defmodule SymphonyElixir.GitHubProjectsAdapterTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.GitHub.Projects.{Adapter, Client}
+  alias SymphonyElixir.GitHub.{AgentTool, Projects.Adapter, Projects.Client}
   alias SymphonyElixir.GitHubProjectsAdapterTest.FakeGitHubProjectsClient
+  alias SymphonyElixir.Pipeline.Store
 
   test "tracker selects the GitHub Projects adapter" do
     assert {:ok, Adapter} =
              Tracker.adapter_for_kind("github_projects")
   end
 
-  test "tracker lifecycle callbacks delegate claim, completion, and intervention blocking" do
+  test "the tracker exposes scoped GitHub tools and does not write through lifecycle callbacks" do
     previous_client = Application.get_env(:symphony_elixir, :github_projects_client_module)
     previous_owner = Application.get_env(:symphony_elixir, :projects_lifecycle_test_owner)
 
@@ -27,9 +28,10 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       restore_application_env(:projects_lifecycle_test_owner, previous_owner)
     end)
 
-    binding = Tracker.bind_agent_tools()
+    issue = %Issue{id: "octo/app#7", identifier: "octo/app#7", native_ref: %{repository: "octo/app"}}
+    binding = Tracker.bind_agent_tools(%{issue: issue, lane: :individual})
     assert binding.adapter == Adapter
-    assert [%{"name" => "github_api"}] = binding.tool_specs
+    assert Enum.map(binding.tool_specs, & &1["name"]) == ["github_api", "github_workflow"]
     assert "GITHUB_TOKEN" in binding.secret_environment_names
 
     assert {:ok, []} = Tracker.fetch_issues_by_states(["Ready"])
@@ -57,6 +59,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
         "github_api",
         %{"method" => "GET", "path" => "/user"},
         tracker_settings: %{provider: %{"repositories" => []}},
+        agent_context: %{issue: issue, lane: :individual},
         github_client: fn _method, _path, _params, _body, opts ->
           assert get_in(opts, [:tracker_settings, :provider, "repo"]) == nil
           {:ok, %{status: 200, body: %{"login" => "test-user"}}}
@@ -65,19 +68,910 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     assert fallback_tool_result["success"]
 
-    issue = %Issue{id: "octo/app#7", identifier: "octo/app#7", state: "Ready"}
+    assert :ignore = Tracker.claim_issue(issue)
+    assert :ignore = Tracker.complete_issue(issue)
+    assert :ignore = Tracker.block_issue(issue, "operator input required")
+    assert :ignore = Tracker.set_pipeline_status(issue, :done)
+    assert :ignore = Tracker.upsert_pull_request(issue, %{})
+    assert :ignore = Tracker.set_pull_request_stage(issue, 1, :draft)
+    assert :ignore = Tracker.publish_phase_report(issue, "marker", "report", "build")
+    refute_received {:projects_claim, _}
+    refute_received {:projects_complete, _}
+    refute_received {:projects_block, _, _}
+    refute_received {:projects_pipeline_status, _, _, _}
+  end
 
-    assert :ok = Tracker.claim_issue(issue)
+  test "Projects adapter forwards legacy lifecycle and pull request callbacks" do
+    previous_client = Application.get_env(:symphony_elixir, :github_projects_client_module)
+    previous_owner = Application.get_env(:symphony_elixir, :projects_lifecycle_test_owner)
+    Application.put_env(:symphony_elixir, :github_projects_client_module, FakeGitHubProjectsClient)
+    Application.put_env(:symphony_elixir, :projects_lifecycle_test_owner, self())
+
+    on_exit(fn ->
+      restore_application_env(:github_projects_client_module, previous_client)
+      restore_application_env(:projects_lifecycle_test_owner, previous_owner)
+    end)
+
+    issue = %Issue{id: "octo/app#8", identifier: "octo/app#8"}
+
+    assert :ok = Adapter.claim_issue(issue)
     assert_receive {:projects_claim, ^issue}
-
-    assert :ok = Tracker.complete_issue(issue)
+    assert :ok = Adapter.complete_issue(issue)
     assert_receive {:projects_complete, ^issue}
+    assert :ok = Adapter.block_issue(issue, "blocked")
+    assert_receive {:projects_block, ^issue, "blocked"}
+    assert :ok = Adapter.set_pipeline_status(issue, :blocked, "blocked")
+    assert_receive {:projects_pipeline_status, ^issue, :blocked, "blocked"}
 
-    assert :ok = Tracker.block_issue(issue, "operator input required")
-    assert_receive {:projects_block, ^issue, "operator input required"}
+    assert :ok = Adapter.validate_pipeline_delivery(issue, "branch", "sha")
+    assert_receive {:projects_delivery, ^issue, "branch", "sha"}
 
-    assert :ok = Tracker.set_pipeline_status(issue, :done)
-    assert_receive {:projects_pipeline_status, ^issue, :done, nil}
+    assert {:ok, %{number: 8}} = Adapter.upsert_pull_request(issue, %{number: 8})
+    assert_receive {:projects_upsert_pull_request, ^issue, %{number: 8}}
+    assert {:ok, %{number: 8}} = Adapter.set_pull_request_stage(issue, 8, :ready)
+    assert_receive {:projects_pull_request_stage, ^issue, 8, :ready}
+    assert {:ok, %{number: 8}} = Adapter.pull_request(issue)
+    assert_receive {:projects_pull_request, ^issue}
+    assert :ok = Adapter.publish_phase_report(issue, "marker", "body", "build")
+    assert_receive {:projects_phase_report, ^issue, "marker", "body", "build"}
+    assert [%{"name" => "github_api"}] = Adapter.agent_tool_specs()
+  end
+
+  test "a stale Build claim does not overwrite a human requeue to Ready" do
+    alias SymphonyElixir.Pipeline.Store
+
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    root = Path.join(System.tmp_dir!(), "symphony-project-claim-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    number = System.unique_integer([:positive])
+    issue_id = "octo/app##{number}"
+    issue = %Issue{id: issue_id, branch_name: "symphony/octo-app-#{number}", state: "Building", native_ref: %{repository: "octo/app", project_status: "Building"}}
+    task = %{"issue_id" => issue_id, "generation" => 1, "phase" => "build", "attempts" => %{"build" => 1}}
+
+    assert :ok = Store.save_task(task)
+    assert :ok = Store.begin_phase(issue_id, 1, "build", 1)
+
+    {:ok, remote_status} = Agent.start_link(fn -> "Ready" end)
+    test_process = self()
+
+    request_fun = fn query, _variables, _settings ->
+      if query =~ "updateProjectV2ItemFieldValue" do
+        send(test_process, :project_status_write_attempted)
+        Agent.update(remote_status, fn _status -> "Building" end)
+        {:ok, %{status: 200, body: %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}}}
+      else
+        status = Agent.get(remote_status, & &1)
+        {:ok, %{status: 200, body: project_response([issue_item("octo/app", number, status)])}}
+      end
+    end
+
+    context = %{
+      issue: issue,
+      lane: :build,
+      generation: 1,
+      attempt: 1,
+      task: task
+    }
+
+    assert {:error, :github_human_decision_changed} =
+             Client.agent_operation(issue, context, "claim", %{},
+               tracker_settings: tracker_settings(),
+               projects_request: request_fun
+             )
+
+    refute_received :project_status_write_attempted
+    assert Agent.get(remote_status, & &1) == "Ready"
+  end
+
+  test "Finalize recovers and verifies the merged PR before closing the issue and moving it to Done" do
+    alias SymphonyElixir.Pipeline.Store
+
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    root = Path.join(System.tmp_dir!(), "symphony-project-finalize-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    number = System.unique_integer([:positive])
+    issue_id = "octo/app##{number}"
+    sha = String.duplicate("a", 40)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: issue_id,
+      branch_name: "symphony/octo-app-#{number}",
+      state: "Human Review",
+      native_ref: %{repository: "octo/app", base_branch: "main", issue_node_id: "I_issue_#{number}"}
+    }
+
+    task = %{"issue_id" => issue_id, "generation" => 1, "phase" => "finalize", "attempts" => %{"finalize" => 1}, "branch" => issue.branch_name, "base_branch" => "main", "current_sha" => sha}
+
+    assert :ok = Store.save_task(task)
+    assert :ok = Store.begin_phase(issue_id, 1, "finalize", 1)
+
+    merged_pr = %{
+      "id" => "PR_pipeline",
+      "number" => 107,
+      "url" => "https://github.com/octo/app/pull/107",
+      "state" => "MERGED",
+      "isDraft" => false,
+      "mergedAt" => "2026-10-21T09:00:00Z",
+      "baseRefName" => "main",
+      "baseRefOid" => "base-sha",
+      "headRefName" => issue.branch_name,
+      "headRefOid" => sha,
+      "reviewDecision" => nil,
+      "body" => "delivery"
+    }
+
+    {:ok, remote} = Agent.start_link(fn -> %{status: "Human Review", issue_state: "OPEN", events: []} end)
+
+    request_fun = fn query, _variables, _settings ->
+      Agent.get_and_update(remote, fn data ->
+        cond do
+          query =~ "SymphonyProject(" ->
+            issue_item = issue_item("octo/app", number, data.status, data.issue_state)
+            {{:ok, %{status: 200, body: project_response([issue_item])}}, data}
+
+          query =~ "SymphonyPipelinePullRequest" ->
+            events = [:pull_request_read | data.events]
+            body = %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [merged_pr]}}}}
+            {{:ok, %{status: 200, body: body}}, %{data | events: events}}
+
+          query =~ "SymphonyPipelineCloseIssue" ->
+            assert Enum.count(data.events, &(&1 == :pull_request_read)) >= 2
+            events = [:issue_closed | data.events]
+            body = %{"data" => %{"closeIssue" => %{"issue" => %{"id" => "I_issue_#{number}", "state" => "CLOSED", "url" => issue.url}}}}
+            {{:ok, %{status: 200, body: body}}, %{data | issue_state: "CLOSED", events: events}}
+
+          query =~ "SymphonyPipelineReportComments" ->
+            comments = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
+            {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}}}, data}
+
+          query =~ "SymphonyAddIssueComment" ->
+            comment = %{"id" => "IC_agent", "url" => "https://github.com/octo/app/issues/#{number}#issuecomment-1"}
+            body = %{"data" => %{"addComment" => %{"commentEdge" => %{"node" => comment}}}}
+            {{:ok, %{status: 200, body: body}}, data}
+
+          query =~ "SymphonySetProjectStatus" ->
+            body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
+            {{:ok, %{status: 200, body: body}}, %{data | status: "Done"}}
+
+          true ->
+            flunk("unexpected GitHub Projects query: #{query}")
+        end
+      end)
+    end
+
+    context = %{issue: issue, lane: :finalize, generation: 1, attempt: 1, task: task}
+
+    assert {:ok, result} =
+             Client.agent_operation(
+               issue,
+               context,
+               "handoff",
+               %{
+                 "outcome" => "merged",
+                 "report" => %{"outcome" => "merged", "summary" => "Merge verified.", "sha" => sha}
+               },
+               tracker_settings: tracker_settings(),
+               projects_request: request_fun
+             )
+
+    assert result["closed_issue"]["state"] == "CLOSED"
+    assert result["pull_request"]["merged"]
+    assert result["pull_request"]["head_sha"] == sha
+    assert result["project_item"]["status"] == "Done"
+    assert Enum.take(Agent.get(remote, &Enum.reverse(&1.events)), 3) == [:pull_request_read, :pull_request_read, :issue_closed]
+  end
+
+  test "Review cannot hand off unresolved prior findings to Human Review" do
+    finding = %{"id" => "QA-1", "reproduction" => "Run the failing case.", "criterion" => "The acceptance criterion passes."}
+    context = %{task: %{"prior_findings" => [finding]}}
+    report = %{"outcome" => "passed", "findings" => [], "resolutions" => []}
+
+    assert %{"outcome" => "changes_requested", "findings" => [^finding]} =
+             Client.normalize_agent_report_for_test(report, "review", context)
+
+    assert %{"outcome" => "passed", "findings" => []} =
+             Client.normalize_agent_report_for_test(%{report | "resolutions" => [finding["id"]]}, "review", context)
+
+    assert %{"outcome" => "passed", "findings" => []} =
+             Client.normalize_agent_report_for_test(
+               %{report | "resolutions" => [finding["id"] <> " — resolved: the check passed after the fix."]},
+               "review",
+               context
+             )
+  end
+
+  test "Build report persists the task branch for later phases" do
+    report = %{"outcome" => "ready", "sha" => String.duplicate("a", 40)}
+
+    task = %{
+      "branch" => "symphony/issue-40",
+      "base_branch" => "main",
+      "required_checks" => ["make -C elixir all"]
+    }
+
+    assert %{
+             "branch" => "symphony/issue-40",
+             "base_branch" => "main",
+             "required_checks" => ["make -C elixir all"]
+           } = Client.normalize_agent_report_for_test(report, "build", %{task: task})
+  end
+
+  test "Review report persists merge metadata for Finalize" do
+    sha = String.duplicate("a", 40)
+    task = %{"branch" => "symphony/issue-40", "base_branch" => "main", "pr_number" => 55, "current_sha" => sha}
+
+    assert %{
+             "branch" => "symphony/issue-40",
+             "base_branch" => "main",
+             "pr_number" => 55,
+             "sha" => ^sha
+           } =
+             Client.normalize_agent_report_for_test(
+               %{"outcome" => "passed", "findings" => []},
+               "review",
+               %{task: task}
+             )
+  end
+
+  test "Review reads QA evidence from the issue workpad and phase reports" do
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    root = Path.join(System.tmp_dir!(), "symphony-project-read-workpad-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    number = System.unique_integer([:positive])
+    issue_id = "octo/app##{number}"
+    sha = String.duplicate("a", 40)
+    old_sha = String.duplicate("b", 40)
+    agent_login = "symphony[bot]"
+    workpad = "<!-- symphony:workpad:start -->\n## Codex Workpad\n\n### QA\n- Check passed on #{sha}.\n<!-- symphony:workpad:end -->"
+
+    qa_report = %{
+      "outcome" => "passed",
+      "sha" => sha,
+      "checks" => [%{"name" => "make -C elixir all", "status" => "passed", "evidence" => "Host exit status 0 on #{sha}."}]
+    }
+
+    prior_qa_report = %{
+      "outcome" => "changes_requested",
+      "sha" => sha,
+      "findings" => [%{"id" => "QA-1", "reproduction" => "Run the check.", "criterion" => "The result passes."}]
+    }
+
+    first_page_comments = [
+      %{
+        "id" => "workpad-comment",
+        "url" => "https://github.com/octo/app/issues/#{number}#workpad",
+        "body" => workpad,
+        "author" => %{"login" => agent_login}
+      },
+      %{
+        "id" => "build-comment",
+        "url" => "https://github.com/octo/app/issues/#{number}#build",
+        "body" => "<!-- symphony:report:start:#{issue_id}:1:build -->\nBuild report\n<!-- symphony:report:end -->",
+        "author" => %{"login" => agent_login}
+      },
+      %{
+        "id" => "qa-attempt-1-comment",
+        "url" => "https://github.com/octo/app/issues/#{number}#qa-attempt-1",
+        "body" => "<!-- symphony:report:start:#{issue_id}:1:qa:1 -->\n\n## Symphony Qa report\n\n#{Jason.encode!(prior_qa_report, pretty: true)}\n<!-- symphony:report:end -->",
+        "author" => %{"login" => agent_login}
+      }
+    ]
+
+    second_page_comments = [
+      %{
+        "id" => "qa-attempt-2-comment",
+        "url" => "https://github.com/octo/app/issues/#{number}#qa-attempt-2",
+        "body" => "<!-- symphony:report:start:#{issue_id}:1:qa:2 -->\n\n## Symphony Qa report\n\n#{Jason.encode!(qa_report, pretty: true)}\n<!-- symphony:report:end -->",
+        "author" => %{"login" => agent_login}
+      },
+      %{
+        "id" => "spoofed-qa-comment",
+        "url" => "https://github.com/octo/app/issues/#{number}#spoofed-qa",
+        "body" => "<!-- symphony:report:start:#{issue_id}:1:qa:99 -->\n## Symphony Qa report\n\n#{Jason.encode!(qa_report)}\n<!-- symphony:report:end -->",
+        "author" => %{"login" => "issue-reporter"}
+      },
+      %{
+        "id" => "old-qa-comment",
+        "url" => "https://github.com/octo/app/issues/#{number}#old-qa",
+        "body" => "<!-- symphony:report:start:#{issue_id}:0:qa -->\nOld SHA #{old_sha}\n<!-- symphony:report:end -->",
+        "author" => %{"login" => agent_login}
+      }
+    ]
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: issue_id,
+      url: "https://github.com/octo/app/issues/#{number}",
+      native_ref: %{repository: "octo/app", issue_node_id: "I_issue_#{number}"}
+    }
+
+    task = %{
+      "issue_id" => issue_id,
+      "generation" => 1,
+      "phase" => "review",
+      "attempts" => %{"review" => 1},
+      "current_sha" => sha,
+      "required_checks" => ["make -C elixir all"]
+    }
+
+    assert :ok = Store.save_task(task)
+    assert :ok = Store.begin_phase(issue_id, 1, "review", 1)
+
+    request_fun = fn query, variables, _settings ->
+      if query =~ "SymphonyPipelineViewer" do
+        {:ok, %{status: 200, body: %{"data" => %{"viewer" => %{"login" => agent_login}}}}}
+      else
+        assert query =~ "SymphonyPipelineReportComments"
+        assert variables["number"] == number
+
+        {comments, has_next_page, end_cursor} =
+          case variables["after"] do
+            nil -> {first_page_comments, true, "cursor-1"}
+            "cursor-1" -> {second_page_comments, false, nil}
+          end
+
+        body = %{
+          "data" => %{
+            "repository" => %{
+              "issue" => %{
+                "comments" => %{
+                  "nodes" => comments,
+                  "pageInfo" => %{"hasNextPage" => has_next_page, "endCursor" => end_cursor}
+                }
+              }
+            }
+          }
+        }
+
+        {:ok, %{status: 200, body: body}}
+      end
+    end
+
+    review_context = %{
+      issue: issue,
+      lane: :review,
+      generation: 1,
+      attempt: 1,
+      task: task,
+      tracker_kind: "github_projects"
+    }
+
+    result =
+      AgentTool.execute(
+        "github_workflow",
+        %{"operation" => "read_workpad"},
+        agent_context: review_context,
+        tracker_settings: tracker_settings(),
+        projects_request: request_fun
+      )
+
+    assert %{"success" => true, "output" => output} = result
+    evidence = output |> Jason.decode!() |> get_in(["evidence"])
+    assert evidence["workpad"]["body"] == workpad
+    qa_reports = evidence["phase_reports"]["qa"]
+    assert Enum.map(qa_reports, & &1["attempt"]) == [1, 2]
+    assert hd(qa_reports)["body"] =~ "QA-1"
+    assert List.last(qa_reports)["body"] =~ "Host exit status 0 on #{sha}"
+    refute Enum.any?(qa_reports, &String.contains?(&1["body"], old_sha))
+
+    stale_report =
+      AgentTool.execute(
+        "github_workflow",
+        %{"operation" => "read_workpad"},
+        agent_context: %{review_context | task: Map.put(task, "current_sha", old_sha)},
+        tracker_settings: tracker_settings(),
+        projects_request: request_fun
+      )
+
+    assert %{"success" => false} = stale_report
+    assert Jason.decode!(stale_report["output"])["error"]["reason"] == ":qa_evidence_unavailable"
+
+    assert %{"success" => false} =
+             AgentTool.execute(
+               "github_workflow",
+               %{"operation" => "read_workpad"},
+               agent_context: %{review_context | task: Map.put(task, "required_checks", ["mix test"])},
+               tracker_settings: tracker_settings(),
+               projects_request: request_fun
+             )
+  end
+
+  test "QA findings turn a passed report into a correction handoff" do
+    finding = %{"id" => "QA-2", "reproduction" => "Run the failing check.", "criterion" => "The acceptance criterion passes."}
+
+    report = %{
+      "outcome" => "passed",
+      "summary" => "QA passed.",
+      "findings" => [finding],
+      "next_step" => "Continue to Review."
+    }
+
+    context = %{
+      task: %{"required_checks" => ["mix test"]},
+      host_checks: [%{"name" => "mix test", "status" => "passed", "evidence" => "exit status 0"}]
+    }
+
+    assert %{
+             "outcome" => "changes_requested",
+             "summary" => "QA reported findings that need correction.",
+             "next_step" => "Fix the findings and submit a new Build delivery.",
+             "findings" => [^finding]
+           } = Client.normalize_agent_report_for_test(report, "qa", context)
+  end
+
+  test "QA-generated report values follow the issue locale" do
+    finding = %{"id" => "QA-3", "reproduction" => "Ejecutar la comprobación fallida.", "criterion" => "La comprobación pasa."}
+    base = %{report_locale: :es, task: %{"required_checks" => ["mix test"]}}
+    failed = Map.put(base, :host_checks, [%{"name" => "mix test", "status" => "failed"}])
+    unavailable = Map.put(base, :host_checks, [%{"name" => "mix test", "status" => "unavailable"}])
+    passed = Map.put(base, :host_checks, [%{"name" => "mix test", "status" => "passed", "evidence" => "exit status 0"}])
+
+    assert %{
+             "outcome" => "changes_requested",
+             "summary" => "Falló alguna comprobación requerida o falta evidencia para confirmarla."
+           } = Client.normalize_agent_report_for_test(%{"outcome" => "passed"}, "qa", failed)
+
+    assert %{
+             "outcome" => "blocked",
+             "reason" => "Symphony no pudo ejecutar todas las comprobaciones requeridas."
+           } = Client.normalize_agent_report_for_test(%{"outcome" => "passed"}, "qa", unavailable)
+
+    assert %{
+             "outcome" => "changes_requested",
+             "summary" => "QA encontró hallazgos que requieren corrección.",
+             "next_step" => "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
+           } = Client.normalize_agent_report_for_test(%{"outcome" => "passed", "findings" => [finding]}, "qa", passed)
+  end
+
+  test "QA defects return the Project item to Building" do
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    root = Path.join(System.tmp_dir!(), "symphony-project-qa-defects-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    number = System.unique_integer([:positive])
+    issue_id = "octo/app##{number}"
+    sha = String.duplicate("a", 40)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: issue_id,
+      url: "https://github.com/octo/app/issues/#{number}",
+      branch_name: "symphony/octo-app-#{number}",
+      state: "QA",
+      native_ref: %{repository: "octo/app", base_branch: "main", project_status: "QA", issue_node_id: "I_issue_#{number}"}
+    }
+
+    task = %{
+      "issue_id" => issue_id,
+      "generation" => 1,
+      "phase" => "qa",
+      "attempts" => %{"qa" => 1},
+      "branch" => issue.branch_name,
+      "base_branch" => "main",
+      "current_sha" => sha,
+      "required_checks" => ["mix test"]
+    }
+
+    assert :ok = Store.save_task(task)
+    assert :ok = Store.begin_phase(issue_id, 1, "qa", 1)
+
+    {:ok, remote} = Agent.start_link(fn -> %{status: "QA"} end)
+
+    request_fun = fn query, _variables, _settings ->
+      Agent.get_and_update(remote, fn data ->
+        cond do
+          query =~ "SymphonyProject(" ->
+            item = issue_item("octo/app", number, data.status)
+            {{:ok, %{status: 200, body: project_response([item])}}, data}
+
+          query =~ "SymphonyPipelinePullRequest" ->
+            pr = %{
+              "id" => "PR_#{number}",
+              "number" => number,
+              "url" => "https://github.com/octo/app/pull/#{number}",
+              "state" => "OPEN",
+              "isDraft" => true,
+              "mergedAt" => nil,
+              "baseRefName" => "main",
+              "headRefName" => issue.branch_name,
+              "headRefOid" => sha,
+              "body" => ""
+            }
+
+            {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [pr]}}}}}}, data}
+
+          query =~ "SymphonyPipelineReportComments" ->
+            comments = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
+            {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}}}, data}
+
+          query =~ "SymphonyAddIssueComment" ->
+            comment = %{"id" => "IC_qa", "url" => "https://github.com/octo/app/issues/#{number}#issuecomment-1"}
+            body = %{"data" => %{"addComment" => %{"commentEdge" => %{"node" => comment}}}}
+            {{:ok, %{status: 200, body: body}}, data}
+
+          query =~ "SymphonySetProjectStatus" ->
+            body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
+            {{:ok, %{status: 200, body: body}}, %{data | status: "Building"}}
+
+          true ->
+            flunk("unexpected GitHub Projects query: #{query}")
+        end
+      end)
+    end
+
+    finding = %{"id" => "QA-1", "reproduction" => "Run the failing check.", "criterion" => "The acceptance criterion passes."}
+    report = %{"outcome" => "defects_found", "summary" => "QA found a defect.", "findings" => [finding], "next_step" => "Fix the defect.", "sha" => sha}
+
+    context = %{
+      issue: issue,
+      lane: :qa,
+      generation: 1,
+      attempt: 1,
+      task: task,
+      host_checks: [%{"name" => "mix test", "status" => "passed", "evidence" => "exit status 0"}]
+    }
+
+    assert {:ok, %{"outcome" => "defects_found", "project_item" => %{"status" => "Building"}}} =
+             Client.agent_operation(
+               issue,
+               context,
+               "handoff",
+               %{"outcome" => "defects_found", "report" => report},
+               tracker_settings: tracker_settings(),
+               projects_request: request_fun
+             )
+
+    assert Agent.get(remote, & &1.status) == "Building"
+  end
+
+  test "Review defects return the Project item to Building" do
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    root = Path.join(System.tmp_dir!(), "symphony-project-review-defects-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    number = System.unique_integer([:positive])
+    issue_id = "octo/app##{number}"
+    sha = String.duplicate("b", 40)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: issue_id,
+      url: "https://github.com/octo/app/issues/#{number}",
+      branch_name: "symphony/octo-app-#{number}",
+      state: "Review",
+      native_ref: %{
+        repository: "octo/app",
+        base_branch: "main",
+        project_status: "Review",
+        issue_node_id: "I_issue_#{number}"
+      }
+    }
+
+    task = %{
+      "issue_id" => issue_id,
+      "generation" => 1,
+      "phase" => "review",
+      "attempts" => %{"review" => 1},
+      "branch" => issue.branch_name,
+      "base_branch" => "main",
+      "current_sha" => sha
+    }
+
+    assert :ok = Store.save_task(task)
+    assert :ok = Store.begin_phase(issue_id, 1, "review", 1)
+    {:ok, remote} = Agent.start_link(fn -> %{status: "Review", draft: false} end)
+
+    request_fun = fn query, _variables, _settings ->
+      Agent.get_and_update(remote, fn data ->
+        cond do
+          query =~ "SymphonyProject(" ->
+            {{:ok, %{status: 200, body: project_response([issue_item("octo/app", number, data.status)])}}, data}
+
+          query =~ "SymphonyPipelinePullRequest" ->
+            pr = %{
+              "id" => "PR_#{number}",
+              "number" => number,
+              "url" => "https://github.com/octo/app/pull/#{number}",
+              "state" => "OPEN",
+              "isDraft" => data.draft,
+              "mergedAt" => nil,
+              "baseRefName" => "main",
+              "headRefName" => issue.branch_name,
+              "headRefOid" => sha,
+              "body" => ""
+            }
+
+            {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [pr]}}}}}}, data}
+
+          query =~ "SymphonyPipelineReportComments" ->
+            comments = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
+            {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}}}, data}
+
+          query =~ "SymphonyAddIssueComment" ->
+            comment = %{"id" => "IC_review", "url" => "https://github.com/octo/app/issues/#{number}#issuecomment-1"}
+            body = %{"data" => %{"addComment" => %{"commentEdge" => %{"node" => comment}}}}
+            {{:ok, %{status: 200, body: body}}, data}
+
+          query =~ "SymphonyConvertPipelinePullRequestToDraft" ->
+            pr = %{
+              "id" => "PR_#{number}",
+              "number" => number,
+              "url" => "https://github.com/octo/app/pull/#{number}",
+              "state" => "OPEN",
+              "isDraft" => true,
+              "mergedAt" => nil,
+              "baseRefName" => "main",
+              "headRefName" => issue.branch_name,
+              "headRefOid" => sha
+            }
+
+            body = %{"data" => %{"convertPullRequestToDraft" => %{"pullRequest" => pr}}}
+            {{:ok, %{status: 200, body: body}}, %{data | draft: true}}
+
+          query =~ "SymphonySetProjectStatus" ->
+            body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
+            {{:ok, %{status: 200, body: body}}, %{data | status: "Building"}}
+
+          true ->
+            flunk("unexpected GitHub Projects query: #{query}")
+        end
+      end)
+    end
+
+    finding = %{"id" => "REV-1", "reproduction" => "Run the affected path.", "criterion" => "The review criterion passes."}
+
+    report = %{
+      "outcome" => "defects_found",
+      "summary" => "Review found a defect.",
+      "findings" => [finding],
+      "resolutions" => [],
+      "next_step" => "Fix the finding.",
+      "sha" => sha
+    }
+
+    context = %{issue: issue, lane: :review, generation: 1, attempt: 1, task: task}
+
+    assert {:ok,
+            %{
+              "outcome" => "defects_found",
+              "project_item" => %{"status" => "Building"},
+              "pull_request" => %{"draft" => true}
+            }} =
+             Client.agent_operation(
+               issue,
+               context,
+               "handoff",
+               %{"outcome" => "defects_found", "report" => report},
+               tracker_settings: tracker_settings(),
+               projects_request: request_fun
+             )
+
+    assert Agent.get(remote, & &1.status) == "Building"
+    assert Agent.get(remote, & &1.draft)
+  end
+
+  test "Projects follow-up REST requests use the configured GitHub Enterprise host" do
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    previous_req_options = Application.get_env(:req, :default_options)
+    root = Path.join(System.tmp_dir!(), "symphony-project-enterprise-follow-up-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+    owner = self()
+
+    plug = fn conn ->
+      send(owner, {:github_rest_request, conn.host, conn.request_path})
+
+      conn
+      |> Plug.Conn.put_resp_header("content-type", "application/json")
+      |> Plug.Conn.resp(503, "{}")
+    end
+
+    Application.put_env(:req, :default_options, plug: plug, retry: false)
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      case previous_req_options do
+        nil -> Application.delete_env(:req, :default_options)
+        options -> Application.put_env(:req, :default_options, options)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    issue = %Issue{
+      id: "octo/app#42",
+      identifier: "octo/app#42",
+      url: "https://github.com/octo/app/issues/42",
+      native_ref: %{repository: "octo/app"}
+    }
+
+    context = %{issue: issue, lane: :individual, generation: 1, attempt: 1, lease_token: "enterprise-agent"}
+    assert :ok = Store.begin_agent_lease(issue.id, context.lease_token)
+
+    assert {:error, {:github_follow_up_search_failed, 503}} =
+             Client.agent_operation(
+               issue,
+               context,
+               "create_follow_up_issue",
+               %{"title" => "Track follow-up", "body" => "Follow-up details"},
+               tracker_settings: tracker_settings(%{"graphql_url" => "https://github.enterprise.example/api/graphql"})
+             )
+
+    assert_received {:github_rest_request, "github.enterprise.example", "/api/v3/search/issues"}
+  end
+
+  test "uncertain follow-up creation searches with the raw marker before linking the existing issue" do
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    root = Path.join(System.tmp_dir!(), "symphony-project-follow-up-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    issue = %Issue{
+      id: "octo/app#42",
+      identifier: "octo/app#42",
+      url: "https://github.com/octo/app/issues/42",
+      native_ref: %{repository: "octo/app", issue_node_id: "I_parent"}
+    }
+
+    context = %{issue: issue, lane: :individual, generation: 1, attempt: 1, lease_token: "follow-up-agent"}
+    assert :ok = Store.begin_agent_lease(issue.id, context.lease_token)
+
+    {:ok, remote} =
+      Agent.start_link(fn ->
+        %{follow_up: nil, linked?: false, project_added?: false, creates: 0, links: 0, project_adds: 0}
+      end)
+
+    github_rest = fn method, path, params, body, _settings ->
+      Agent.get_and_update(remote, fn data ->
+        case {method, path} do
+          {"GET", "/search/issues"} ->
+            query = params["q"]
+            assert query =~ "repo:octo/app in:body <!-- symphony:follow-up:octo/app#42:1:individual:"
+            refute query =~ "%"
+            [marker] = Regex.run(~r/<!-- symphony:follow-up:[^>]+-->/, query)
+
+            items =
+              if data.follow_up && marker && String.contains?(data.follow_up["body"], marker),
+                do: [data.follow_up],
+                else: []
+
+            {{:ok, %{status: 200, body: %{"items" => items}}}, data}
+
+          {"POST", "/repos/octo/app/issues"} ->
+            follow_up = %{
+              "id" => 77,
+              "node_id" => "I_issue_43",
+              "number" => 43,
+              "html_url" => "https://github.com/octo/app/issues/43",
+              "url" => "https://api.github.com/repos/octo/app/issues/43",
+              "repository" => %{"nameWithOwner" => "octo/app"},
+              "body" => body["body"]
+            }
+
+            {{:error, :timeout}, %{data | follow_up: follow_up, creates: data.creates + 1}}
+
+          {"GET", "/repos/octo/app/issues/42/sub_issues"} ->
+            linked = if data.linked?, do: [data.follow_up], else: []
+            {{:ok, %{status: 200, body: linked}}, data}
+
+          {"POST", "/repos/octo/app/issues/42/sub_issues"} ->
+            {{:ok, %{status: 201, body: data.follow_up}}, %{data | linked?: true, links: data.links + 1}}
+        end
+      end)
+    end
+
+    projects_request = fn query, variables, _settings ->
+      Agent.get_and_update(remote, fn data ->
+        cond do
+          query =~ "addProjectV2ItemById" ->
+            assert variables["contentId"] == "I_issue_43"
+            item = %{"id" => "PVTI_follow_up"}
+            response = %{status: 200, body: %{"data" => %{"addProjectV2ItemById" => %{"item" => item}}}}
+            updated = %{data | project_added?: true, project_adds: data.project_adds + 1}
+            {{:ok, response}, updated}
+
+          query =~ "SymphonyProject(" ->
+            items = if data.project_added?, do: [issue_item("octo/app", 43, "Ready")], else: []
+            {{:ok, %{status: 200, body: project_response(items)}}, data}
+
+          true ->
+            flunk("unexpected GitHub Projects query: #{query}")
+        end
+      end)
+    end
+
+    assert {:ok, evidence} =
+             Client.agent_operation(
+               issue,
+               context,
+               "create_follow_up_issue",
+               %{"title" => "Track follow-up", "body" => "Follow-up details"},
+               tracker_settings: tracker_settings(),
+               github_rest: github_rest,
+               projects_request: projects_request
+             )
+
+    assert {:ok, retried_evidence} =
+             Client.agent_operation(
+               issue,
+               %{context | attempt: 2},
+               "create_follow_up_issue",
+               %{"title" => "Track follow-up", "body" => "Follow-up details"},
+               tracker_settings: tracker_settings(),
+               github_rest: github_rest,
+               projects_request: projects_request
+             )
+
+    assert evidence["id"] == "octo/app#43"
+    assert evidence["linked"]
+    assert evidence["project_item"] == %{"id" => "PVTI_43", "status" => "Ready"}
+    assert retried_evidence == evidence
+    assert Agent.get(remote, & &1.linked?)
+    assert Agent.get(remote, & &1.project_added?)
+    assert Agent.get(remote, & &1.creates) == 1
+    assert Agent.get(remote, & &1.links) == 1
+    assert Agent.get(remote, & &1.project_adds) == 1
+    assert :ok = Store.end_agent_lease(issue.id, context.lease_token)
   end
 
   test "Projects configuration reports missing owner without exposing a token" do
@@ -191,10 +1085,10 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
   test "refreshes a Symphony-owned PR body and preserves a human-edited body" do
     settings = tracker_settings(%{"repositories" => [%{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]}]})
     issue = %SymphonyElixir.Tracker.Issue{id: "octo/app#7", branch_name: "symphony/octo-app-7", native_ref: %{repository: "octo/app"}}
-    body = "<!-- symphony:delivery -->\n\nFixes octo/app#7\n\n## Summary\nUpdated it."
+    body = "<!-- symphony:delivery:start -->\n\nFixes octo/app#7\n\n## Summary\nUpdated it.\n<!-- symphony:delivery:end -->"
     attrs = %{branch: issue.branch_name, base: "main", sha: "sha-seven", body: body}
 
-    for {existing_body, should_update?} <- [{"<!-- symphony:delivery -->\n\nOld report", true}, {"Human-edited PR description", false}] do
+    for {existing_body, should_update?} <- [{"<!-- symphony:delivery:start -->\n\nOld report\n<!-- symphony:delivery:end -->", true}, {"Human-edited PR description", false}] do
       calls = Agent.start_link(fn -> [] end) |> elem(1)
 
       request_fun = fn query, variables, _settings ->
@@ -242,6 +1136,67 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert issue.dispatchable
     assert issue.requeueable
     assert issue.labels == ["bug"]
+  end
+
+  test "Project readiness rejects a missing Status field without writing to GitHub" do
+    response = project_response([issue_item("octo/app", 7, "Ready")])
+    response = update_in(response, ["data", "organization", "projectV2", "fields", "nodes"], fn _ -> [] end)
+    owner = self()
+
+    assert {:error, {:github_projects_configuration_error, message}} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn query, _variables, _settings ->
+               send(owner, {:projects_readiness_query, query})
+               {:ok, %{status: 200, body: response}}
+             end)
+
+    assert message =~ "Project status field \"Status\" was not found"
+    assert_received {:projects_readiness_query, query}
+    assert query =~ "query SymphonyProject"
+    refute query =~ "mutation"
+    refute_received {:projects_readiness_query, _query}
+  end
+
+  test "Project readiness reports each missing canonical option without writing to GitHub" do
+    canonical_options = ["Backlog", "Ready", "Building", "QA", "Review", "Human Review", "Blocked", "Done", "Dropped"]
+    owner = self()
+
+    for missing_option <- canonical_options do
+      response =
+        project_response([issue_item("octo/app", 7, "Ready")])
+        |> update_in(
+          ["data", "organization", "projectV2", "fields", "nodes", Access.at(0), "options"],
+          &Enum.reject(&1, fn option -> option["name"] == missing_option end)
+        )
+
+      assert {:error, {:github_projects_configuration_error, message}} =
+               Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn query, _variables, _settings ->
+                 send(owner, {:projects_readiness_query, query})
+                 {:ok, %{status: 200, body: response}}
+               end)
+
+      assert message == "Project status field \"Status\" is missing canonical options: #{missing_option}."
+      assert_received {:projects_readiness_query, query}
+      assert query =~ "query SymphonyProject"
+      refute query =~ "mutation"
+      refute_received {:projects_readiness_query, _query}
+    end
+  end
+
+  test "incomplete GitHub Project responses fail readiness without returning issues or writing" do
+    response = %{"errors" => [%{"message" => "GitHub returned an incomplete Project response."}]}
+    owner = self()
+
+    assert {:error, {:github_projects_api_error, message}} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn query, _variables, _settings ->
+               send(owner, {:projects_readiness_query, query})
+               {:ok, %{status: 200, body: response}}
+             end)
+
+    assert message == "GitHub returned an incomplete Project response."
+    assert_received {:projects_readiness_query, query}
+    assert query =~ "query SymphonyProject"
+    refute query =~ "mutation"
+    refute_received {:projects_readiness_query, _query}
   end
 
   test "pipeline Projects polling returns QA, Review, and Human Review items as dispatchable" do
@@ -455,23 +1410,24 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     refute message =~ "test-token"
   end
 
-  test "closed linked issues become terminal and their Project item moves to Done" do
+  test "closed linked issues become terminal without writing Project status" do
+    calls = Agent.start_link(fn -> [] end) |> elem(1)
+
     assert {:ok, [issue]} =
              Client.fetch_issues_by_states_for_test(["Ready", "Building"], tracker_settings(), fn
                query, variables, _settings ->
-                 if query =~ "updateProjectV2ItemFieldValue" do
-                   assert variables["optionId"] == "option-done"
-                   {:ok, %{status: 200, body: %{"data" => %{"updated" => true}}}}
-                 else
-                   {:ok, %{status: 200, body: project_response([issue_item("octo/app", 7, "Ready", "CLOSED")])}}
-                 end
+                 Agent.update(calls, &[{query, variables} | &1])
+                 {:ok, %{status: 200, body: project_response([issue_item("octo/app", 7, "Ready", "CLOSED")])}}
              end)
 
     assert issue.state == "closed"
     refute issue.dispatchable
+    refute Enum.any?(Agent.get(calls, & &1), fn {query, _} -> query =~ "updateProjectV2ItemFieldValue" or query =~ "addComment" end)
   end
 
-  test "closed linked issues without a Project status still move to Done" do
+  test "closed linked issues without a Project status are observed without writes" do
+    calls = Agent.start_link(fn -> [] end) |> elem(1)
+
     closed_item =
       "octo/app"
       |> issue_item(7, "Ready", "CLOSED")
@@ -480,19 +1436,16 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert {:ok, [issue]} =
              Client.fetch_issues_by_states_for_test(["closed"], tracker_settings(), fn
                query, variables, _settings ->
-                 if query =~ "updateProjectV2ItemFieldValue" do
-                   assert variables["optionId"] == "option-done"
-                   {:ok, %{status: 200, body: %{"data" => %{"updated" => true}}}}
-                 else
-                   {:ok, %{status: 200, body: project_response([closed_item])}}
-                 end
+                 Agent.update(calls, &[{query, variables} | &1])
+                 {:ok, %{status: 200, body: project_response([closed_item])}}
              end)
 
     assert issue.state == "closed"
     refute issue.dispatchable
+    refute Enum.any?(Agent.get(calls, & &1), fn {query, _} -> query =~ "updateProjectV2ItemFieldValue" or query =~ "addComment" end)
   end
 
-  test "an unconfigured repository is blocked with an actionable issue comment" do
+  test "an unconfigured repository is ignored without writing Project status or comments" do
     calls = Agent.start_link(fn -> [] end) |> elem(1)
 
     assert {:ok, []} =
@@ -500,19 +1453,11 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
                query, variables, _settings ->
                  Agent.update(calls, &[{query, variables} | &1])
 
-                 if query =~ "updateProjectV2ItemFieldValue" or query =~ "addComment" do
-                   {:ok, %{status: 200, body: %{"data" => %{"updated" => true}}}}
-                 else
-                   {:ok, %{status: 200, body: project_response([issue_item("other/repo", 8, "Ready")])}}
-                 end
+                 {:ok, %{status: 200, body: project_response([issue_item("other/repo", 8, "Ready")])}}
              end)
 
     calls = Agent.get(calls, &Enum.reverse/1)
-    assert Enum.count(calls, fn {query, _} -> query =~ "updateProjectV2ItemFieldValue" end) == 1
-    assert Enum.count(calls, fn {query, _} -> query =~ "addComment" end) == 1
-    {_, comment} = Enum.find(calls, fn {query, _} -> query =~ "addComment" end)
-    assert comment["body"] =~ "No repository profile is configured for other/repo"
-    assert comment["body"] =~ "tracker.provider.repositories"
+    refute Enum.any?(calls, fn {query, _} -> query =~ "updateProjectV2ItemFieldValue" or query =~ "addComment" end)
   end
 
   test "issues with the same number in different repositories have distinct identities" do
@@ -810,6 +1755,18 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest.FakeGitHubProjectsClient do
   def complete_issue(issue), do: notify({:projects_complete, issue})
   def block_issue(issue, reason), do: notify({:projects_block, issue, reason})
   def set_pipeline_status(issue, status, reason), do: notify({:projects_pipeline_status, issue, status, reason})
+  def validate_pipeline_delivery(issue, branch, sha), do: notify({:projects_delivery, issue, branch, sha})
+
+  def upsert_pull_request(issue, attrs),
+    do: notify({:projects_upsert_pull_request, issue, attrs}, {:ok, %{number: attrs.number}})
+
+  def set_pull_request_stage(issue, number, stage),
+    do: notify({:projects_pull_request_stage, issue, number, stage}, {:ok, %{number: number}})
+
+  def pull_request(issue), do: notify({:projects_pull_request, issue}, {:ok, %{number: 8}})
+
+  def publish_phase_report(issue, marker, body, phase),
+    do: notify({:projects_phase_report, issue, marker, body, phase})
 
   defp notify(message) do
     send(Application.fetch_env!(:symphony_elixir, :projects_lifecycle_test_owner), message)

@@ -11,7 +11,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   @spec bind() :: map()
-  def bind do
-    Tracker.bind_agent_tools()
+  @spec bind(keyword()) :: map()
+  def bind(opts \\ []) do
+    Tracker.bind_agent_tools(Keyword.get(opts, :agent_context, %{}))
   end
 end

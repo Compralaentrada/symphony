@@ -38,8 +38,15 @@ defmodule SymphonyElixir.GitHub.Adapter do
   @spec agent_tool_specs() :: [map()]
   def agent_tool_specs, do: AgentTool.tool_specs()
 
+  @spec agent_tool_specs(map()) :: [map()]
+  def agent_tool_specs(context), do: AgentTool.tool_specs(context)
+
   @spec execute_agent_tool(String.t(), term(), keyword()) :: map()
   def execute_agent_tool(tool, arguments, opts), do: AgentTool.execute(tool, arguments, opts)
+
+  @spec execute_agent_tool(String.t(), term(), keyword(), map()) :: map()
+  def execute_agent_tool(tool, arguments, opts, context),
+    do: AgentTool.execute(tool, arguments, Keyword.put(opts, :agent_context, context))
 
   @spec secret_environment_names(map()) :: [String.t()]
   def secret_environment_names(tracker_settings), do: Client.secret_environment_names(tracker_settings)

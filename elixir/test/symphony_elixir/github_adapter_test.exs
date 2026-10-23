@@ -69,9 +69,21 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     assert GitHubAdapter.execute_agent_tool(
              "github_api",
              %{"method" => "GET", "path" => "/user"},
+             agent_context: agent_context("octo/repo", 42),
              github_client: fn _method, _path, _params, _body, _opts ->
                {:ok, %{status: 200, body: %{"login" => "octocat"}}}
              end
+           )["success"]
+
+    assert GitHubAdapter.execute_agent_tool(
+             "github_api",
+             %{"method" => "GET", "path" => "/user"},
+             [
+               github_client: fn _method, _path, _params, _body, _opts ->
+                 {:ok, %{status: 200, body: %{"login" => "octocat"}}}
+               end
+             ],
+             agent_context("octo/repo", 42)
            )["success"]
   end
 
@@ -238,36 +250,58 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
              )
   end
 
-  test "github_api preserves REST status and body while rejecting unsafe arguments" do
+  test "github_api is read-only and scoped to the task repository" do
     test_pid = self()
     tracker_settings = tracker_settings()
+    context = agent_context("octo/repo", 42)
 
     response =
       GitHubAgentTool.execute(
         "github_api",
         %{
-          "method" => "post",
-          "path" => " /repos/octo/repo/issues/42/comments ",
+          "method" => "get",
+          "path" => " /repos/octo/repo/issues/42 ",
           "params" => %{"per_page" => 10},
-          "body" => %{"body" => "hello"}
+          "body" => nil
         },
+        agent_context: context,
         tracker_settings: tracker_settings,
         github_client: fn method, path, params, body, opts ->
           send(test_pid, {:github_tool_called, method, path, params, body, opts})
-          {:ok, %{status: 201, body: %{"id" => 9}}}
+          {:ok, %{status: 200, body: %{"number" => 42}}}
         end
       )
 
-    assert_received {:github_tool_called, "POST", "/repos/octo/repo/issues/42/comments", %{"per_page" => 10}, %{"body" => "hello"}, [tracker_settings: ^tracker_settings]}
+    assert_received {:github_tool_called, "GET", "/repos/octo/repo/issues/42", %{"per_page" => 10}, nil, opts}
+    assert Keyword.fetch!(opts, :tracker_settings) == tracker_settings
+    assert Keyword.fetch!(opts, :agent_context) == context
 
     assert response["success"] == true
-    assert Jason.decode!(response["output"]) == %{"status" => 201, "body" => %{"id" => 9}}
+    assert Jason.decode!(response["output"]) == %{"status" => 200, "body" => %{"number" => 42}}
     assert response["contentItems"] == [%{"type" => "inputText", "text" => response["output"]}]
+
+    for arguments <- [
+          %{"method" => "POST", "path" => "/repos/octo/repo/issues/42/comments"},
+          %{"method" => "GET", "path" => "/repos/other/repo/issues/42"}
+        ] do
+      denied =
+        GitHubAgentTool.execute(
+          "github_api",
+          arguments,
+          agent_context: context,
+          github_client: fn _method, _path, _params, _body, _opts ->
+            flunk("out-of-scope GitHub calls must not reach the client")
+          end
+        )
+
+      assert denied["success"] == false
+    end
 
     failure =
       GitHubAgentTool.execute(
         "github_api",
         %{"method" => "GET", "path" => "/repos/octo/repo/issues/404"},
+        agent_context: context,
         github_client: fn _method, _path, _params, _body, _opts ->
           {:ok, %{status: 404, body: %{"message" => "Not Found"}}}
         end
@@ -302,6 +336,8 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
   end
 
   test "github_api reports unsupported tools, malformed calls, and client failures" do
+    context = agent_context("octo/repo", 42)
+
     unsupported = GitHubAgentTool.execute("not_github_api", %{}, [])
     assert unsupported["success"] == false
     assert Jason.decode!(unsupported["output"])["error"]["supportedTools"] == ["github_api"]
@@ -329,6 +365,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
       GitHubAgentTool.execute(
         "github_api",
         %{"method" => "GET", "path" => "/user"},
+        agent_context: context,
         github_client: fn _method, _path, _params, _body, _opts ->
           {:ok, %{status: "not-an-integer", body: %{}}}
         end
@@ -347,6 +384,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
           GitHubAgentTool.execute(
             "github_api",
             %{"method" => "GET", "path" => "/user"},
+            agent_context: agent_context("octo/repo", 42),
             github_client: fn _method, _path, _params, _body, _opts ->
               {:error, reason}
             end
@@ -362,6 +400,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
       GitHubAgentTool.execute(
         "github_api",
         %{"method" => "GET", "path" => "/user"},
+        agent_context: agent_context("octo/repo", 42),
         github_client: fn _method, _path, _params, _body, _opts ->
           {:ok, %{status: 200, body: self()}}
         end
@@ -410,6 +449,17 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
         ),
       active_states: ["open"],
       terminal_states: ["closed"]
+    }
+  end
+
+  defp agent_context(repository, number) do
+    %{
+      issue: %Issue{
+        id: "#{repository}##{number}",
+        identifier: "#{repository}##{number}",
+        native_ref: %{"repo" => repository, "number" => number}
+      },
+      lane: :individual
     }
   end
 
