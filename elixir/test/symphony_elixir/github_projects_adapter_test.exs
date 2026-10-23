@@ -334,7 +334,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert Enum.take(Agent.get(remote, &Enum.reverse(&1.events)), 3) == [:pull_request_read, :pull_request_read, :issue_closed]
   end
 
-  test "merge gate requires approved checks and current SHA and base evidence without merging" do
+  test "merge gate merges only with approved checks and current SHA and base evidence" do
     previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
     root = Path.join(System.tmp_dir!(), "symphony-project-merge-gate-#{System.unique_integer([:positive])}")
     Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
@@ -350,8 +350,13 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     {result, queries} = run_merge_gate(%{})
     expected_sha = String.duplicate("a", 40)
-    assert {:ok, %{"outcome" => "passed", "sha" => ^expected_sha, "pull_request" => %{"head_sha" => ^expected_sha}}} = result
-    assert Enum.all?(queries, &String.starts_with?(String.trim_leading(&1), "query "))
+    assert {:ok, %{"outcome" => "merged", "sha" => ^expected_sha, "pull_request" => %{"head_sha" => ^expected_sha, "merged" => true}}} = result
+    assert Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
+    assert Enum.any?(queries, &(&1 =~ "SymphonyPipelinePullRequest"))
+
+    {already_merged, queries} = run_merge_gate(%{pr_state: "MERGED"})
+    assert {:ok, %{"outcome" => "merged", "pull_request" => %{"merged" => true}}} = already_merged
+    refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
 
     for {scenario, expected_error} <- [
           {%{host_check_status: "failed"}, :host_checks_not_verified},
@@ -1903,14 +1908,15 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
         query =~ "SymphonyPipelineMergeGate" ->
           current_base_sha = Map.get(options, :current_base_sha, "base-current")
+          pr_state = Map.get(options, :pr_state, "OPEN")
 
           pull_request = %{
             "id" => "PR_#{number}",
             "number" => number,
             "url" => "https://github.com/octo/app/pull/#{number}",
-            "state" => "OPEN",
+            "state" => pr_state,
             "isDraft" => false,
-            "mergedAt" => nil,
+            "mergedAt" => if(pr_state == "MERGED", do: "2026-10-23T08:00:00Z"),
             "baseRefName" => "main",
             "baseRefOid" => Map.get(options, :pr_base_sha, current_base_sha),
             "headRefName" => branch,
@@ -1923,7 +1929,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
           {:ok, %{status: 200, body: body}}
 
         query =~ "SymphonyPipelineMergePullRequest" ->
-          flunk("merge gate must not start a merge")
+          body = %{"data" => %{"mergePullRequest" => %{"pullRequest" => %{"mergedAt" => "2026-10-23T08:00:00Z"}}}}
+          {:ok, %{status: 200, body: body}}
 
         query =~ "SymphonyPipelinePullRequest" ->
           merged_pull_request = %{

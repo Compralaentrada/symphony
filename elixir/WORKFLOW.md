@@ -45,7 +45,7 @@ codex:
     type: dangerFullAccess
 ---
 
-The installation-level `merge_policy` front matter key accepts `human` (the default) or `auto`. A configured top-level value takes precedence over `tracker.provider.merge_policy`; when omitted, an explicit provider value remains supported. Setting `auto` opts Review into requesting the deterministic merge gate. Symphony never approves PRs automatically.
+The installation-level `merge_policy` front matter key accepts `human` (the default) or `auto`. A configured top-level value takes precedence over `tracker.provider.merge_policy`; when omitted, an explicit provider value remains supported. With `auto`, Review requests the deterministic merge gate; when the reviewed head SHA, base SHA, and required checks pass, Symphony merges and verifies the PR before closing the issue and moving its Project item to Done. Symphony never approves PRs automatically.
 
 You are working on a GitHub issue dispatched from the configured GitHub Projects v2 board.
 
