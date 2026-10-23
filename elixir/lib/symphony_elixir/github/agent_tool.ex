@@ -189,7 +189,10 @@ defmodule SymphonyElixir.GitHub.AgentTool do
           "sha" => %{"type" => ["string", "null"]},
           "finding" => %{"type" => ["object", "null"]},
           "title" => %{"type" => ["string", "null"]},
-          "body" => %{"type" => ["string", "null"]}
+          "body" => %{
+            "type" => ["string", "null"],
+            "description" => "For handoff, the complete Markdown comment with one hidden symphony:report:json HTML comment whose JSON exactly matches report."
+          }
         }
       }
     }

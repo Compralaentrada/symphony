@@ -245,6 +245,9 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert prompt =~ "read_workpad"
       assert prompt =~ "Before any other GitHub write or code edit"
       assert prompt =~ "claims an item dispatched from Ready by moving it to Building"
+      assert prompt =~ "complete human-readable Markdown comment in `body`"
+      assert prompt =~ "symphony:report:json"
+      assert prompt =~ "report_context.task"
       refute prompt =~ "symphony/mt-build-foreign-turn"
     after
       File.rm_rf(test_root)
@@ -415,6 +418,8 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert length(prompts) == 2
       assert hd(prompts) =~ "Each finding must include the exact keys id, reproduction, and criterion as non-empty strings."
       assert hd(prompts) =~ "read_workpad"
+      assert hd(prompts) =~ "report_context.host_checks"
+      assert hd(prompts) =~ "complete human-readable Markdown comment in `body`"
       refute hd(prompts) =~ "echo required-check-secret"
       refute hd(prompts) =~ "host-evidence-secret"
       assert hd(prompts) =~ "Use the Humanizer guidance for report values"
@@ -549,6 +554,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       review_prompt = get_in(initial_turn, ["params", "input", Access.at(0), "text"])
       assert review_prompt =~ "Do not invoke the repository's `code-review` skill or its Markdown report format"
       assert review_prompt =~ "read_workpad"
+      assert review_prompt =~ "report_context.task"
       refute review_prompt =~ "finding-from-task"
       refute review_prompt =~ "symphony/branch-from-task"
       refute review_prompt =~ report["sha"]

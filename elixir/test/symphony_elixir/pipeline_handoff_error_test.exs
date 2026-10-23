@@ -81,6 +81,8 @@ defmodule SymphonyElixir.PipelineHandoffErrorTest do
       "sha" => sha
     }
 
+    markdown = "## Build report\n\nBuild completed.\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
+
     tool_call =
       Jason.encode!(%{
         "id" => 101,
@@ -90,7 +92,7 @@ defmodule SymphonyElixir.PipelineHandoffErrorTest do
           "callId" => "handoff-call",
           "threadId" => "build-thread",
           "turnId" => "build-turn",
-          "arguments" => %{"operation" => "handoff", "outcome" => "ready", "report" => report}
+          "arguments" => %{"operation" => "handoff", "outcome" => "ready", "report" => report, "body" => markdown}
         }
       })
 

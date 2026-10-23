@@ -476,6 +476,7 @@ defmodule SymphonyElixir.AgentRunner do
       |> Kernel.<>(
         "\n\n" <>
           phase_instructions(phase, opts) <>
+          "\nEvery GitHub `handoff` must include the structured `report` and the complete human-readable Markdown comment in `body`. Put the report JSON only in one hidden HTML comment: `<!-- symphony:report:json` on its own line, the JSON object, then `-->` on its own line. Escape any `-->` inside JSON string values as `--\\u003e` so the HTML comment stays hidden. Its decoded object must exactly match `report`, including the handoff outcome and any phase-specific report fields your instructions require you to copy from `read_workpad`'s `report_context`. Keep the rest of the comment readable Markdown." <>
           "\nUse the Humanizer guidance for report values. Write report values in #{report_language} (Spanish only for Spanish issues; English otherwise). Keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details." <>
           "\nThe phase report JSON contract overrides any skill's preferred presentation format."
       )
@@ -567,9 +568,9 @@ defmodule SymphonyElixir.AgentRunner do
     Pipeline phase: Build.
     Before any other GitHub write or code edit, call `github_workflow` with operation `claim`; stop if the claim is rejected. This claims an item dispatched from Ready by moving it to Building.
     Then read the issue's workpad and current-generation phase reports with `github_workflow` operation `read_workpad` before editing. Use those task records for prior findings and decisions. Work on the branch already checked out for this task and push your work to origin.
-    Implement the issue using the accepted task context recorded on the issue. The host records the branch, base branch, required checks, and pushed SHA in the Build report for later phases.
+    Implement the issue using the accepted task context recorded on the issue. Copy branch, base branch, and required checks from `read_workpad`'s `report_context.task` into your report; include the pushed SHA.
     Before editing, create or update the persistent issue workpad with `github_workflow` operation `workpad` and record the plan.
-    After pushing, call `github_workflow` with operation `handoff`, outcome `ready`, and your complete report; the host verifies the SHA, creates or updates the draft PR, posts your report, and moves the Project item to QA.
+    After pushing, call `github_workflow` with operation `handoff`, outcome `ready`, and your complete report and Markdown body; the host verifies the SHA, creates or updates the draft PR, and moves the Project item to QA.
     For `no_changes` or `blocked`, hand off that result with a concise reason. Never merge a PR.
     Finish with exactly one JSON object containing outcome (ready, no_changes, or blocked), summary, criteria, changes, checks, risks, next_step, reason when blocked or no_changes, and sha after pushing.
     criteria, changes, checks, and risks must be JSON arrays, even when empty. Put each risk in its own string element.
@@ -580,15 +581,15 @@ defmodule SymphonyElixir.AgentRunner do
   defp pipeline_phase_instructions(:qa, _opts) do
     """
     Pipeline phase: independent QA. Read the issue's workpad and current-generation Build reports with `github_workflow` operation `read_workpad`; use the saved task records to identify the accepted commit, branch, required checks, and prior findings.
-    Symphony runs the configured host checks on the accepted SHA and records their evidence in your QA report. Do not modify files or invent check results. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings.
+    Symphony runs the configured host checks on the accepted SHA. `read_workpad` returns the authoritative `report_context.host_checks`, required checks, and locale-specific canonical QA text; copy the checks exactly into your report and hidden JSON. Do not modify files or invent check results. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings.
     Update the persistent workpad with QA evidence and findings using `github_workflow` operation `workpad`.
-    Call `github_workflow` with operation `handoff` and your QA report. Symphony adds the authoritative host-check evidence before saving the report and advances only when every required check passed. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
+    Call `github_workflow` with operation `handoff`, your QA report, and the complete Markdown body. Choose the outcome using the required checks and authoritative host evidence in `report_context`; use its canonical QA text when Symphony's check or finding rules change the summary, reason, or next step. Symphony advances only when every required check passed. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end
 
   defp pipeline_phase_instructions(:review, _opts) do
     """
-    Pipeline phase: autonomous code review. Read the issue's workpad and all current-generation QA reports with `github_workflow` operation `read_workpad` before reviewing. Use those task records to identify the accepted commit, branch, QA findings, and findings to resolve.
+    Pipeline phase: autonomous code review. Read the issue's workpad and all current-generation QA reports with `github_workflow` operation `read_workpad` before reviewing. Use those task records and `report_context.task` to identify the accepted commit, branch, QA findings, and findings to resolve. Include the task's branch, base branch, PR number, and current SHA in your report, plus every prior finding not explicitly resolved.
     Use the QA report's host-check evidence for its recorded SHA; do not require a separate GitHub status context for Symphony's host-run check.
     Do not invoke the repository's `code-review` skill or its Markdown report format; perform this review directly under the pipeline's JSON contract.
     The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
@@ -723,7 +724,7 @@ defmodule SymphonyElixir.AgentRunner do
       release = if Config.settings!().tracker.kind == "github", do: " After the handoff, release your claim.", else: ""
 
       prompt <>
-        "\n\nFor this GitHub task, create or update the persistent issue workpad with `github_workflow` operation `workpad`, then claim the issue before working. Preserve branch #{issue.branch_name}, push it to origin, and hand off the complete report with outcome `ready` so the host can verify the SHA, create or update the draft PR, and publish the report. For `blocked` or `no_changes`, hand off that result with a reason and do not create a PR. Use `github_workflow` for every GitHub write; the default merge policy is human review." <>
+        "\n\nFor this GitHub task, create or update the persistent issue workpad with `github_workflow` operation `workpad`, then claim the issue before working. Preserve branch #{issue.branch_name}, push it to origin, and hand off the complete report with outcome `ready` and a human-readable Markdown `body` containing one hidden `symphony:report:json` HTML comment. Put the marker on its own line, the exact report JSON next, and `-->` on its own line; escape any `-->` in JSON strings as `--\\u003e` and make the decoded JSON match `report`. The host verifies the SHA and creates or updates the draft PR. For `blocked` or `no_changes`, hand off that result with a reason and do not create a PR. Use `github_workflow` for every GitHub write; the default merge policy is human review." <>
         release
     else
       prompt

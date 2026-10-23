@@ -111,7 +111,10 @@ defmodule SymphonyElixir.GitHubAgentWorkflowTest do
       "sha" => String.duplicate("a", 40)
     }
 
-    first = AgentTool.execute("github_workflow", %{"operation" => "handoff", "report" => report}, opts)
+    markdown = "## Implementation report\n\nImplemented the feature.\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
+    handoff = %{"operation" => "handoff", "report" => report, "body" => markdown}
+
+    first = AgentTool.execute("github_workflow", handoff, opts)
 
     Agent.update(state, fn data ->
       update_in(data.pull_requests, fn [pull_request] -> [Map.update!(pull_request, "body", &(&1 <> "\n\nHuman PR note"))] end)
@@ -122,7 +125,7 @@ defmodule SymphonyElixir.GitHubAgentWorkflowTest do
       end)
     end)
 
-    second = AgentTool.execute("github_workflow", %{"operation" => "handoff", "report" => report}, opts)
+    second = AgentTool.execute("github_workflow", handoff, opts)
 
     assert first["success"], first["output"]
     assert second["success"], second["output"]
@@ -133,6 +136,11 @@ defmodule SymphonyElixir.GitHubAgentWorkflowTest do
     assert Enum.count(Agent.get(state, & &1.comments), &String.contains?(&1["body"] || "", "symphony:report")) == 1
     assert Enum.any?(Agent.get(state, & &1.comments), &(&1["body"] == "Human note"))
     assert Enum.any?(Agent.get(state, & &1.comments), &String.contains?(&1["body"] || "", "Human appendix"))
+    report_comment = Enum.find(Agent.get(state, & &1.comments), &(&1["id"] == "agent-2"))
+
+    assert report_comment["body"] ==
+             "<!-- symphony:report:start:#{issue.id}:1:individual -->\n#{markdown}\n<!-- symphony:report:end -->\n\nHuman appendix"
+
     refute first["output"] =~ "private-token"
 
     assert :ok = Store.end_agent_lease(issue.id, context.lease_token)
