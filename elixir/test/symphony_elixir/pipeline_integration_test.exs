@@ -210,7 +210,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     table =
       start_board([issue], %{
         issue.id => %{
-          build: [build("sha-one"), build("sha-two")],
+          build: [build("sha-one", issue.id), build("sha-two", issue.id)],
           qa: [qa("sha-one"), qa("sha-two")],
           review: [review("sha-one"), review("sha-two")]
         }
@@ -282,7 +282,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
         native_ref: Map.merge(issue.native_ref, %{project_status: statuses.ready, status_values: Map.new(legacy_statuses, fn {key, value} -> {Atom.to_string(key), value} end)})
     }
 
-    table = start_board([issue], %{issue.id => %{build: [build("sha-nine")], qa: [qa("sha-nine")], review: [review("sha-nine")]}})
+    table = start_board([issue], %{issue.id => %{build: [build("sha-nine", issue.id)], qa: [qa("sha-nine")], review: [review("sha-nine")]}})
     path = pipeline_database!(table)
     orchestrator = start_orchestrator()
 
@@ -306,7 +306,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     table =
       start_board([issue], %{
         issue.id => %{
-          build: [build("sha-fourteen-old"), build("sha-fourteen-new")],
+          build: [build("sha-fourteen-old", issue.id), build("sha-fourteen-new", issue.id)],
           qa: [qa("sha-fourteen-old"), qa("sha-fourteen-new")],
           review: [blocked(), review("sha-fourteen-new")]
         }
@@ -338,7 +338,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     table =
       start_board([issue], %{
         issue.id => %{
-          build: [build("sha-forty-three-old"), build("sha-forty-three-new")],
+          build: [build("sha-forty-three-old", issue.id), build("sha-forty-three-new", issue.id)],
           qa: [blocked(), qa("sha-forty-three-new")],
           review: [review("sha-forty-three-new")]
         }
@@ -393,14 +393,14 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     table =
       start_board([no_changes, blocked, transient, missing_check, unavailable_check], %{
         no_changes.id => %{build: [no_changes()]},
-        blocked.id => %{build: [blocked(), build("sha-three")], qa: [qa("sha-three")], review: [review("sha-three")]},
-        transient.id => %{build: [{:error, :temporary_failure}, build("sha-four")], qa: [qa("sha-four")], review: [review("sha-four")]},
+        blocked.id => %{build: [blocked(), build("sha-three", blocked.id)], qa: [qa("sha-three")], review: [review("sha-three")]},
+        transient.id => %{build: [{:error, :temporary_failure}, build("sha-four", transient.id)], qa: [qa("sha-four")], review: [review("sha-four")]},
         missing_check.id => %{
-          build: [build("sha-six-old"), build("sha-six-fixed")],
+          build: [build("sha-six-old", missing_check.id), build("sha-six-fixed", missing_check.id)],
           qa: [qa_missing_check("sha-six-old"), qa("sha-six-fixed")],
           review: [Map.put(review("sha-six-fixed"), "resolutions", ["required-check:sh ./check.sh"])]
         },
-        unavailable_check.id => %{build: [build("sha-ten")], qa: [qa_missing_check("sha-ten")]}
+        unavailable_check.id => %{build: [build("sha-ten", unavailable_check.id)], qa: [qa_missing_check("sha-ten")]}
       })
 
     path = pipeline_database!(table, retry_backoff_ms: 1)
@@ -455,7 +455,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
   test "uncertain PR and report responses reconcile after orchestrator restarts without duplicates" do
     issue = issue("octo/app#5", 5)
-    table = start_board([issue], %{issue.id => %{build: [build("sha-five")], qa: [qa("sha-five")], review: [review("sha-five")]}})
+    table = start_board([issue], %{issue.id => %{build: [build("sha-five", issue.id)], qa: [qa("sha-five")], review: [review("sha-five")]}})
     path = pipeline_database!(table, retry_backoff_ms: 300_000)
     :ets.insert(table, {:uncertain_pr_once, true})
     :ets.insert(table, {:uncertain_report_once, true})
@@ -583,7 +583,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
   test "PR creation revalidates the pushed SHA after Build commits its outbox" do
     issue = issue("octo/app#7", 7)
-    table = start_board([issue], %{issue.id => %{build: [build("sha-seven")]}})
+    table = start_board([issue], %{issue.id => %{build: [build("sha-seven", issue.id)]}})
     path = pipeline_database!(table, retry_backoff_ms: 300_000)
     :ets.insert(table, {:change_sha_after_validation, true})
 
@@ -605,7 +605,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     table =
       start_board([issue], %{
         issue.id => %{
-          build: [build("sha-eight")],
+          build: [build("sha-eight", issue.id)],
           qa: [incomplete, qa("sha-eight")],
           review: [review("sha-eight")]
         }
@@ -628,7 +628,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     table =
       start_board([issue], %{
         issue.id => %{
-          build: [build("dirty"), build("clean")],
+          build: [build("dirty", issue.id), build("clean", issue.id)],
           qa: [qa("dirty"), qa("clean")],
           review: [Map.put(review("clean"), "resolutions", ["workspace-dirty"])]
         }
@@ -660,7 +660,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     table =
       start_board([issue], %{
         issue.id => %{
-          build: [build("first"), build("fixed"), build("fixed-two")],
+          build: [build("first", issue.id), build("fixed", issue.id), build("fixed-two", issue.id)],
           qa: [qa_with_finding, qa("fixed"), qa("fixed-two")],
           review: [
             review("fixed"),
@@ -693,7 +693,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     table =
       start_board([issue], %{
         issue.id => %{
-          build: [build("first"), build("fixed")],
+          build: [build("first", issue.id), build("fixed", issue.id)],
           qa: [qa("first"), qa("fixed")],
           review: [review_with_finding, Map.put(review("fixed"), "resolutions", [finding["id"]])]
         }
@@ -819,10 +819,33 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     }
   end
 
-  defp build(sha) do
+  defp build(sha, issue_id) do
     %{
       "outcome" => "ready",
       "summary" => "Implemented the task.",
+      "pull_request_body" => """
+      Fixes ##{issue_id |> String.split("#") |> List.last()}
+
+      #### Context
+
+      Implements the assigned issue.
+
+      #### TL;DR
+
+      Implements the issue.
+
+      #### Summary
+
+      - Updated the implementation.
+
+      #### Alternatives
+
+      - Kept the existing implementation pattern.
+
+      #### Test Plan
+
+      - [x] Required checks passed.
+      """,
       "criteria" => ["Acceptance criterion completed."],
       "changes" => ["Updated implementation."],
       "checks" => [],

@@ -570,9 +570,10 @@ defmodule SymphonyElixir.AgentRunner do
     Then read the issue's workpad and current-generation phase reports with `github_workflow` operation `read_workpad` before editing. Use those task records for prior findings and decisions. Work on the branch already checked out for this task and push your work to origin.
     Implement the issue using the accepted task context recorded on the issue. Copy branch, base branch, and required checks from `read_workpad`'s `report_context.task` into your report; include the pushed SHA.
     Before editing, create or update the persistent issue workpad with `github_workflow` operation `workpad` and record the plan.
-    After pushing, call `github_workflow` with operation `handoff`, outcome `ready`, and your complete report and Markdown body; the host verifies the SHA, creates or updates the draft PR, and moves the Project item to QA.
+    Before handoff, read `.github/pull_request_template.md` in the task repository and write a complete PR description in `report.pull_request_body`: keep every section in template order, respect its length guidance, replace every placeholder, and include `Fixes #<issue-number>` on its own line. Set `body_file=$(mktemp)`, save that exact description without Symphony delivery markers to `$body_file`, and run `(cd elixir && mise exec -- mix pr_body.check --file "$body_file")`.
+    After pushing, call `github_workflow` with operation `handoff`, outcome `ready`, and your report plus the separate issue-comment Markdown body. The comment body must contain one hidden `symphony:report:json` HTML comment whose JSON matches the report, including `pull_request_body`; the host validates and writes `report.pull_request_body` as the draft PR description, then moves the Project item to QA.
     For `no_changes` or `blocked`, hand off that result with a concise reason. Never merge a PR.
-    Finish with exactly one JSON object containing outcome (ready, no_changes, or blocked), summary, criteria, changes, checks, risks, next_step, reason when blocked or no_changes, and sha after pushing.
+    Finish with exactly one JSON object containing outcome (ready, no_changes, or blocked), summary, criteria, changes, checks, risks, next_step, reason when blocked or no_changes, sha after pushing, and pull_request_body for ready.
     criteria, changes, checks, and risks must be JSON arrays, even when empty. Put each risk in its own string element.
     Use sha null only for no_changes or blocked.
     """
@@ -723,8 +724,15 @@ defmodule SymphonyElixir.AgentRunner do
     if Config.settings!().tracker.kind in ["github", "github_projects"] and not Keyword.has_key?(opts, :phase) do
       release = if Config.settings!().tracker.kind == "github", do: " After the handoff, release your claim.", else: ""
 
+      github_instructions = """
+      For this GitHub task, create or update the persistent issue workpad with `github_workflow` operation `workpad`, then claim the issue before working. Preserve branch #{issue.branch_name}, push it to origin, and read `.github/pull_request_template.md` in the task repository.
+      Put the complete PR description in `report.pull_request_body`, keep every section in template order, follow its length guidance, replace all placeholders, include `Fixes #<issue-number>` for this issue, and omit Symphony delivery markers. Set `body_file=$(mktemp)`, save that exact text to `$body_file`, and run `(cd elixir && mise exec -- mix pr_body.check --file "$body_file")`.
+      Then hand off outcome `ready` with a separate human-readable Markdown issue-comment `body` containing one hidden `symphony:report:json` HTML comment. Put the marker on its own line, the exact report JSON next, and `-->` on its own line; escape any `-->` in JSON strings as `--\\u003e` and make the decoded JSON match `report`, including `pull_request_body`. The host validates and writes that description to the draft PR. For `blocked` or `no_changes`, hand off that result with a reason and do not create a PR. Use `github_workflow` for every GitHub write; the default merge policy is human review.
+      """
+
       prompt <>
-        "\n\nFor this GitHub task, create or update the persistent issue workpad with `github_workflow` operation `workpad`, then claim the issue before working. Preserve branch #{issue.branch_name}, push it to origin, and hand off the complete report with outcome `ready` and a human-readable Markdown `body` containing one hidden `symphony:report:json` HTML comment. Put the marker on its own line, the exact report JSON next, and `-->` on its own line; escape any `-->` in JSON strings as `--\\u003e` and make the decoded JSON match `report`. The host verifies the SHA and creates or updates the draft PR. For `blocked` or `no_changes`, hand off that result with a reason and do not create a PR. Use `github_workflow` for every GitHub write; the default merge policy is human review." <>
+        "\n\n" <>
+        github_instructions <>
         release
     else
       prompt

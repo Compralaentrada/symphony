@@ -14,6 +14,14 @@ defmodule SymphonyElixir.GitHubAgentToolPermissionsTest do
     assert workflow_operations(review) == ["read_workpad", "workpad", "handoff", "create_follow_up_issue", "request_merge"]
     refute "request_merge" in workflow_operations(individual)
     refute "read_workpad" in workflow_operations(individual)
+
+    report_schema =
+      build
+      |> Enum.find(&(&1["name"] == "github_workflow"))
+      |> get_in(["inputSchema", "properties", "report", "properties", "pull_request_body"])
+
+    assert report_schema["type"] == "string"
+    assert report_schema["description"] =~ ".github/pull_request_template.md"
   end
 
   test "GitHub reads are bound to the task repository and raw writes are unavailable" do
