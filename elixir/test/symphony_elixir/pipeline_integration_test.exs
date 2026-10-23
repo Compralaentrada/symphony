@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.PipelineIntegrationTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Codex.Skills
   alias SymphonyElixir.Config
   alias SymphonyElixir.Pipeline
   alias SymphonyElixir.Pipeline.Store
@@ -18,6 +19,61 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert [{:fetch_issues_by_ids_calls, 1}] = :ets.lookup(table, :fetch_issues_by_ids_calls)
     assert [{{:fetch_issues_by_ids_call, 1}, ids}] = :ets.lookup(table, {:fetch_issues_by_ids_call, 1})
     assert MapSet.new(ids) == MapSet.new(Enum.map(issues, & &1.id))
+  end
+
+  test "persists the phase skill snapshot across runtime restarts" do
+    issue = issue("octo/app#19", 19)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+
+    assert {:ok, task, "build"} = Pipeline.prepare(issue)
+    expected_skills = task["effective_config"]["skills"]
+    assert [%{"name" => "ponytail", "version" => "v5.3.2"}] = expected_skills["build"]
+
+    set_project_state(table, issue.id, "Backlog")
+
+    for _ <- 1..2 do
+      orchestrator = start_orchestrator()
+      Process.sleep(30)
+      stop_orchestrator(orchestrator)
+    end
+
+    assert {:ok, persisted} = Store.get_task(issue.id)
+    assert persisted["effective_config"]["skills"] == expected_skills
+  end
+
+  test "a skill readiness mismatch leaves the Project item unclaimed" do
+    issue = %{issue("octo/app#18", 18) | native_ref: nil}
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    workspace = Path.join(Config.local_workspace_root(), Workspace.workspace_key(issue))
+    skill_dir = Path.join([workspace, ".agents", "skills", "ponytail"])
+    source = Path.expand("../../..", __DIR__) |> Path.join(".agents/skills/ponytail")
+    File.mkdir_p!(Path.dirname(skill_dir))
+    File.cp_r!(source, skill_dir)
+    skill_path = Path.join(skill_dir, "SKILL.md")
+    File.write!(skill_path, File.read!(skill_path) <> "\nchanged\n")
+    on_exit(fn -> File.rm_rf!(workspace) end)
+
+    orchestrator = start_orchestrator(SymphonyElixir.PipelineIntegrationTest.RealSkillPreflightAgent)
+
+    assert await(fn -> match?({:ok, %{"skill_readiness" => %{"status" => "failed"}}}, Store.get_task(issue.id)) end)
+
+    assert project_state(table, issue.id) == "Ready"
+    assert lookup(table, {:agent_calls, issue.id, :build}) == nil
+    assert {:ok, %{"effective_config" => %{"skills" => %{"build" => [%{"version" => "v5.3.2"}]}}}} = Store.get_task(issue.id)
+    assert {:ok, %{"skill_readiness" => %{"reason" => reason, "next_step" => next_step}}} = Store.get_task(issue.id)
+    assert reason =~ "ponytail"
+    assert next_step =~ "v5.3.2"
+    stop_orchestrator(orchestrator)
+  end
+
+  test "workspace skill readiness verifies the pinned checksum list" do
+    issue = %Issue{labels: []}
+    repository = Path.expand("../../..", __DIR__)
+    snapshot = Skills.snapshot_for_phase(issue, :build)
+
+    assert :ok = Workspace.verify_skill_snapshot(repository, snapshot, nil)
   end
 
   test "report locale uses Spanish only for Spanish issue descriptions" do
@@ -1078,6 +1134,13 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
       await(predicate, attempts - 1)
     end
   end
+end
+
+defmodule SymphonyElixir.PipelineIntegrationTest.RealSkillPreflightAgent do
+  def preflight_skills(issue, task, phase, worker_host),
+    do: SymphonyElixir.AgentRunner.preflight_skills(issue, task, phase, worker_host)
+
+  def run(_issue, _recipient, _opts), do: {:error, :preflight_should_have_stopped_claim}
 end
 
 defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
