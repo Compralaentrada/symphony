@@ -8,6 +8,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   alias SymphonyElixir.Pipeline.Findings
   alias SymphonyElixir.Pipeline.Store
   alias SymphonyElixir.PRBody
+  alias SymphonyElixir.QAReport
   alias SymphonyElixir.Tracker.Issue
 
   @default_graphql_url "https://api.github.com/graphql"
@@ -909,6 +910,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
     with {:ok, body} <- AgentReport.normalize_body(Map.get(arguments, "body"), report, submitted_report),
          :ok <- validate_agent_pr_body(lane, report, issue),
+         :ok <- validate_agent_handoff_report(lane, report, context),
          :ok <- AgentReport.validate_body(body, report),
          {:ok, status} <- handoff_status(lane, report, settings),
          {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
@@ -959,20 +961,26 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp normalize_agent_report(report, "qa", context) do
-    checks = normalize_report_list(context[:host_checks])
+    checks = context[:host_checks] |> normalize_report_list() |> Enum.map(&Map.put(&1, "source", "host"))
     required = get_in(context, [:task, "required_checks"]) || []
-    report = Map.put(report, "checks", checks)
+    report = Map.put(report, "host_checks", checks)
 
     cond do
-      not required_checks_passed?(required, checks) and Enum.any?(checks, &(&1["status"] == "unavailable")) ->
+      report["outcome"] == "blocked" ->
+        report
+
+      required_checks_status(required, checks) == :unavailable ->
         report
         |> Map.put("outcome", "blocked")
+        |> Map.put("summary", qa_text(context, :checks_unavailable))
         |> Map.put("reason", qa_text(context, :checks_unavailable))
+        |> Map.put("next_step", qa_text(context, :checks_recovery))
 
-      not required_checks_passed?(required, checks) ->
+      required_checks_status(required, checks) == :failed ->
         report
         |> Map.put("outcome", "changes_requested")
         |> Map.put("summary", qa_text(context, :checks_failed))
+        |> Map.put("next_step", qa_text(context, :next_step))
 
       report["outcome"] == "passed" and report["findings"] not in [nil, []] ->
         Map.merge(report, %{
@@ -1007,14 +1015,45 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp normalize_agent_report(report, _lane, _context), do: report
 
+  defp validate_agent_handoff_report("qa", report, context) do
+    task = context[:task] || %{}
+    required = task["required_checks"] || []
+
+    cond do
+      report["sha"] != task["current_sha"] -> {:error, :qa_report_sha_mismatch}
+      not valid_agent_report?(report) -> {:error, :invalid_qa_report}
+      not QAReport.valid?(report, required, context[:issue] && context[:issue].description) -> {:error, :invalid_qa_report}
+      true -> :ok
+    end
+  end
+
+  defp validate_agent_handoff_report(_lane, _report, _context), do: :ok
+
+  defp valid_agent_report?(report) do
+    report["outcome"] in ["passed", "changes_requested", "blocked", "failed", "defects_found"] and
+      present_report_value?(report["summary"]) and present_report_value?(report["sha"]) and
+      is_list(report["changes"]) and is_list(report["findings"]) and is_binary(report["next_step"]) and
+      Enum.all?(report["findings"], fn
+        %{"id" => id, "reproduction" => reproduction, "criterion" => criterion} ->
+          Enum.all?([id, reproduction, criterion], &present_report_value?/1)
+
+        _ ->
+          false
+      end) and (report["outcome"] != "blocked" or present_report_value?(report["reason"]))
+  end
+
+  defp present_report_value?(value), do: is_binary(value) and String.trim(value) != ""
+
   defp qa_text(%{report_locale: :es}, :checks_unavailable), do: "Symphony no pudo ejecutar todas las comprobaciones requeridas."
   defp qa_text(%{report_locale: :es}, :checks_failed), do: "Falló alguna comprobación requerida o falta evidencia para confirmarla."
   defp qa_text(%{report_locale: :es}, :findings), do: "QA encontró hallazgos que requieren corrección."
   defp qa_text(%{report_locale: :es}, :next_step), do: "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
+  defp qa_text(%{report_locale: :es}, :checks_recovery), do: "Repara el entorno o la herramienta y vuelve a ejecutar QA sobre el mismo SHA; Builder no necesita cambiar código."
   defp qa_text(_context, :checks_unavailable), do: "Symphony could not execute every configured required check."
   defp qa_text(_context, :checks_failed), do: "One or more required host checks failed or were missing."
   defp qa_text(_context, :findings), do: "QA reported findings that need correction."
   defp qa_text(_context, :next_step), do: "Fix the findings and submit a new Build delivery."
+  defp qa_text(_context, :checks_recovery), do: "Repair the environment or tool, then rerun QA on the same SHA; Builder code changes are not required."
 
   @doc false
   @spec normalize_agent_report_for_test(map(), String.t(), map()) :: map()
@@ -1173,7 +1212,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          viewer when is_binary(viewer) <- get_in(viewer_data, ["viewer", "login"]),
          comments = Enum.filter(comments, &(get_in(&1, ["author", "login"]) == viewer)),
          phase_reports = current_generation_phase_reports(issue, context[:generation] || 0, comments),
-         :ok <- validate_review_qa_report(context, phase_reports) do
+         :ok <- validate_review_qa_report(context, phase_reports, issue.description) do
       workpad = Enum.find(comments, &String.contains?(&1["body"] || "", "<!-- symphony:workpad:start -->"))
 
       {:ok,
@@ -1204,23 +1243,24 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     end)
   end
 
-  defp validate_review_qa_report(%{lane: lane, task: task}, phase_reports)
+  defp validate_review_qa_report(%{lane: lane, task: task}, phase_reports, issue_description)
        when lane in [:review, "review"] and is_map(task) do
     with %{"body" => body} <- latest_phase_report(phase_reports, "qa"),
          {:ok, report} <- decode_phase_report_comment(body),
          true <- report["outcome"] == "passed",
          true <- report["sha"] == task["current_sha"],
-         true <- required_checks_passed?(task["required_checks"] || [], report["checks"] || []) do
+         true <- QAReport.valid?(report, task["required_checks"] || [], issue_description),
+         true <- required_checks_passed?(task["required_checks"] || [], report["host_checks"] || []) do
       :ok
     else
       _ -> {:error, :qa_evidence_unavailable}
     end
   end
 
-  defp validate_review_qa_report(%{lane: lane}, _phase_reports) when lane in [:review, "review"],
+  defp validate_review_qa_report(%{lane: lane}, _phase_reports, _issue_description) when lane in [:review, "review"],
     do: {:error, :qa_evidence_unavailable}
 
-  defp validate_review_qa_report(_context, _phase_reports), do: :ok
+  defp validate_review_qa_report(_context, _phase_reports, _issue_description), do: :ok
 
   defp latest_phase_report(phase_reports, phase), do: phase_reports |> Map.get(phase, []) |> List.last()
 
@@ -1484,11 +1524,42 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp normalize_report_list(_values), do: []
 
   defp required_checks_passed?(required, checks) when is_list(required) and is_list(checks) do
-    passed = MapSet.new(checks, fn check -> if check["status"] == "passed" and is_binary(check["evidence"]) and String.trim(check["evidence"]) != "", do: check["name"] end)
+    passed =
+      MapSet.new(checks, fn check ->
+        if check["source"] == "host" and check["status"] == "passed" and is_binary(check["evidence"]) and
+             String.trim(check["evidence"]) != "",
+           do: check["name"]
+      end)
+
     Enum.all?(required, &MapSet.member?(passed, &1))
   end
 
   defp required_checks_passed?(_required, _checks), do: false
+
+  defp required_checks_status(required, checks) when is_list(required) and is_list(checks) do
+    statuses = Enum.map(required, &required_check_status(&1, checks))
+
+    cond do
+      Enum.member?(statuses, :unavailable) -> :unavailable
+      Enum.member?(statuses, :failed) -> :failed
+      true -> :passed
+    end
+  end
+
+  defp required_checks_status(_required, _checks), do: :unavailable
+
+  defp required_check_status(command, checks) do
+    case Enum.find(checks, &(&1["name"] == command and &1["source"] == "host")) do
+      %{"status" => "passed", "evidence" => evidence} ->
+        if present_report_value?(evidence), do: :passed, else: :unavailable
+
+      %{"status" => "failed"} ->
+        :failed
+
+      _ ->
+        :unavailable
+    end
+  end
 
   defp delivery_body(report), do: PRBody.delivery_block(report["pull_request_body"])
 

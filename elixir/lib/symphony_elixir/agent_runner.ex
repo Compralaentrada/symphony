@@ -345,13 +345,14 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_pipeline_host_check(workspace, issue, worker_host, command, current_sha) do
     case SymphonyElixir.Workspace.run_required_check(workspace, command, current_sha, issue, worker_host) do
       {:ok, evidence} ->
-        %{"name" => command, "status" => "passed", "evidence" => evidence}
+        %{"name" => command, "status" => "passed", "evidence" => evidence, "source" => "host"}
 
       {:error, {:check_failed, status}} ->
         %{
           "name" => command,
           "status" => "failed",
-          "evidence" => "Symphony ran the configured check at SHA #{current_sha}; host exit status #{status}."
+          "evidence" => "Symphony ran the configured check at SHA #{current_sha}; host exit status #{status}.",
+          "source" => "host"
         }
 
       {:error, {:workspace_sha_mismatch, expected_sha, observed_sha}} ->
@@ -359,7 +360,8 @@ defmodule SymphonyElixir.AgentRunner do
           "name" => command,
           "status" => "failed",
           "finding_id" => "workspace-sha-mismatch",
-          "evidence" => "Symphony did not run the check because workspace HEAD was #{observed_sha || "unavailable"}, not accepted SHA #{expected_sha}."
+          "evidence" => "Symphony did not run the check because workspace HEAD was #{observed_sha || "unavailable"}, not accepted SHA #{expected_sha}.",
+          "source" => "host"
         }
 
       {:error, {:workspace_dirty, expected_sha, observed_sha}} ->
@@ -367,11 +369,18 @@ defmodule SymphonyElixir.AgentRunner do
           "name" => command,
           "status" => "failed",
           "finding_id" => "workspace-dirty",
-          "evidence" => "Symphony did not run the check because the workspace had local changes at SHA #{observed_sha || "unavailable"}; accepted SHA was #{expected_sha}."
+          "evidence" => "Symphony did not run the check because the workspace had local changes at SHA #{observed_sha || "unavailable"}; accepted SHA was #{expected_sha}.",
+          "source" => "host"
         }
 
       {:error, :check_unavailable} ->
-        %{"name" => command, "status" => "unavailable", "evidence" => "Symphony could not execute the required check."}
+        %{
+          "name" => command,
+          "status" => "unavailable",
+          "evidence" => "Symphony could not execute the required check.",
+          "reason" => "The configured command is unavailable in the task host.",
+          "source" => "host"
+        }
     end
   end
 
@@ -608,7 +617,7 @@ defmodule SymphonyElixir.AgentRunner do
     case AppServer.run_turn(session, prompt, issue, app_server_opts) do
       {:ok, _turn} ->
         with {:ok, report} <- decode_phase_report(phase_report_text(Process.get(message_key))) do
-          Pipeline.normalize_phase_result(report, Atom.to_string(phase), report_locale)
+          Pipeline.normalize_phase_result(report, Atom.to_string(phase), report_locale, issue.description)
         end
 
       error ->
@@ -635,7 +644,7 @@ defmodule SymphonyElixir.AgentRunner do
     evidence = evidence_key |> Process.get([]) |> Enum.reverse()
     workflow_errors = workflow_errors_key |> Process.get([]) |> Enum.reverse()
     workflow_errors = if handoff_comment_evidence?(evidence), do: Enum.reject(workflow_errors, &(&1["operation"] == "handoff")), else: workflow_errors
-    report = if phase == :qa, do: Map.put(report, "checks", Keyword.get(opts, :host_checks, [])), else: report
+    report = if phase == :qa, do: Map.put(report, "host_checks", Keyword.get(opts, :host_checks, [])), else: report
 
     report =
       report
@@ -677,9 +686,13 @@ defmodule SymphonyElixir.AgentRunner do
   defp pipeline_phase_instructions(:qa, _opts) do
     """
     Pipeline phase: independent QA. Read the issue's workpad and current-generation Build reports with `github_workflow` operation `read_workpad`; use the saved task records to identify the accepted commit, branch, required checks, and prior findings.
-    Symphony runs the configured host checks on the accepted SHA. `read_workpad` returns the authoritative `report_context.host_checks`, required checks, and locale-specific canonical QA text; copy the checks exactly into your report and hidden JSON. Do not modify files or invent check results. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings.
+    Symphony runs the configured host checks on the accepted SHA. `read_workpad` returns authoritative `report_context.host_checks`, required checks, and locale-specific canonical QA text. Copy host evidence exactly into the report and hidden JSON; identify it as host evidence, not agent work. Do not modify files or invent check results.
+    Do not modify files or invent results. For every acceptance criterion, record its exact text, status, concrete procedure, and evidence references. Each reference must identify an agent check by id or a host check as `host:<exact command>`. A summary never covers an untested criterion.
+    Record agent checks with their layer (`unit`, `component`, `e2e`, or `manual`), exact command when applicable, status, reproducible result, evidence reference, and whether they are required. Use only `passed`, `failed`, `unstable`, `skipped`, or `unavailable`; skipped, unstable, and unavailable checks need a reason. A required check that is not passed cannot approve QA.
+    Keep Symphony-run results in `host_checks`; they are host evidence, not agent work. Include the accepted SHA. Analyze uncovered scenarios with impact and missing coverage, order high-risk gaps first, and consider errors, limits, permissions, and determinism when relevant.
+    If environment, access, or tooling prevents verification, use outcome `blocked`, state what is missing, and give an actionable recovery step for the environment/tool. Do not request a code change from Builder for an operational blocker. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings.
     Update the persistent workpad with QA evidence and findings using `github_workflow` operation `workpad`.
-    Call `github_workflow` with operation `handoff`, your QA report, and the complete Markdown body. Choose the outcome using the required checks and authoritative host evidence in `report_context`; use its canonical QA text when Symphony's check or finding rules change the summary, reason, or next step. Symphony advances only when every required check passed. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
+    Call `github_workflow` with operation `handoff`, your QA report, and the complete human-readable Markdown comment in `body` containing one hidden `symphony:report:json` comment. The decoded JSON must match the normalized report, including authoritative `host_checks`; escape `-->` inside JSON strings as `--\\u003e`. Choose the outcome using required checks and authoritative host evidence; use canonical QA text when host rules change the summary, reason, or next step. Symphony advances only when every required check passed. Finish with exactly one JSON object containing outcome, summary, criteria, changes, checks, gaps, findings, next_step, reason, and sha equal to the accepted commit.
     """
   end
 
@@ -905,9 +918,53 @@ defmodule SymphonyElixir.AgentRunner do
       case phase do
         :qa ->
           %{
-            "criteria" => string_array_schema(),
+            "criteria" => %{
+              "type" => "array",
+              "items" => %{
+                "type" => "object",
+                "properties" => %{
+                  "criterion" => %{"type" => "string"},
+                  "status" => qa_status_schema(),
+                  "procedure" => %{"type" => "string"},
+                  "evidence" => string_array_schema()
+                },
+                "required" => ["criterion", "status", "procedure", "evidence"],
+                "additionalProperties" => false
+              }
+            },
             "changes" => string_array_schema(),
-            "checks" => string_array_schema()
+            "checks" => %{
+              "type" => "array",
+              "items" => %{
+                "type" => "object",
+                "properties" => %{
+                  "id" => %{"type" => "string"},
+                  "layer" => %{"type" => "string", "enum" => ["unit", "component", "e2e", "manual"]},
+                  "command" => %{"type" => ["string", "null"]},
+                  "status" => qa_status_schema(),
+                  "result" => %{"type" => "string"},
+                  "evidence" => %{"type" => "string"},
+                  "required" => %{"type" => "boolean"},
+                  "reason" => %{"type" => ["string", "null"]}
+                },
+                "required" => ["id", "layer", "command", "status", "result", "evidence", "required", "reason"],
+                "additionalProperties" => false
+              }
+            },
+            "gaps" => %{
+              "type" => "array",
+              "items" => %{
+                "type" => "object",
+                "properties" => %{
+                  "scenario" => %{"type" => "string"},
+                  "impact" => %{"type" => "string"},
+                  "missing_coverage" => %{"type" => "string"},
+                  "priority" => %{"type" => "string", "enum" => ["high", "medium", "low"]}
+                },
+                "required" => ["scenario", "impact", "missing_coverage", "priority"],
+                "additionalProperties" => false
+              }
+            }
           }
 
         :review ->
@@ -927,6 +984,8 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp string_array_schema, do: %{"type" => "array", "items" => %{"type" => "string"}}
+
+  defp qa_status_schema, do: %{"type" => "string", "enum" => ["passed", "failed", "unstable", "skipped", "unavailable"]}
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
