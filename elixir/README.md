@@ -32,6 +32,11 @@ Local runs discover repo-local Codex skills from `.agents/skills` in the workspa
 Symphony checks selected skills before launching Codex and reports a missing `SKILL.md` path; pinned
 sources and fingerprints are listed in [`../.agents/skills/SOURCES.md`](../.agents/skills/SOURCES.md).
 
+In the Projects pipeline, Symphony owns the Build, QA, and Review role prompts and base skill
+assignments; installation `WORKFLOW.md` front matter cannot remap them. Task-specific skills are
+selected from issue context. Interactive skills such as Impeccable remain available to standalone
+sessions but are not forced into unattended phases.
+
 During single-run app-server sessions, the selected tracker adapter may advertise provider-native
 tools. Linear serves `linear_graphql`, GitHub Issues and GitHub Projects v2 serve the read-only
 `github_api` plus the task-scoped `github_workflow`, Jira Cloud serves `jira_rest`, Asana serves

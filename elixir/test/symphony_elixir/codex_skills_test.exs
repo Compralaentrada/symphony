@@ -138,8 +138,8 @@ defmodule SymphonyElixir.Codex.SkillsTest do
 
     frontend_copy_issue = %Issue{labels: ["frontend", "customer-facing"]}
 
-    assert Skills.select(frontend_copy_issue, :build) == ["ponytail", "impeccable", "humanizer"]
-    assert Skills.select(frontend_copy_issue, :qa) == ["impeccable", "humanizer"]
-    assert Skills.select(frontend_copy_issue, :review) == ["impeccable", "humanizer"]
+    assert Skills.select(frontend_copy_issue, :build) == ["ponytail", "humanizer"]
+    assert Skills.select(frontend_copy_issue, :qa) == ["humanizer"]
+    assert Skills.select(frontend_copy_issue, :review) == ["humanizer"]
   end
 end

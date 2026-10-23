@@ -261,10 +261,10 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert prompt =~ "symphony:report:json"
       assert prompt =~ "report_context.task"
       assert prompt =~ "- `ponytail`"
-      assert prompt =~ "- `impeccable`"
       assert prompt =~ "- `humanizer`"
       refute prompt =~ "- `tdd`"
       refute prompt =~ "- `code-review`"
+      refute prompt =~ "- `impeccable`"
       refute prompt =~ "symphony/mt-build-foreign-turn"
     after
       File.rm_rf(test_root)
@@ -403,7 +403,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         description: "Examiner la modification acceptée et fournir le rapport QA.",
         state: "QA",
         url: "https://example.org/issues/MT-QA-PHASE-REPORT",
-        labels: ["backend"]
+        labels: ["backend", "customer-facing"]
       }
 
       host_checks = [
@@ -441,11 +441,11 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       refute hd(prompts) =~ "echo required-check-secret"
       refute hd(prompts) =~ "host-evidence-secret"
       assert hd(prompts) =~ "Write report values in English"
-      refute hd(prompts) =~ "Use these repo-local skills when their conditions apply:"
+      assert hd(prompts) =~ "Use these repo-local skills when their conditions apply:"
       refute hd(prompts) =~ "- `ponytail`"
       refute hd(prompts) =~ "- `tdd`"
       refute hd(prompts) =~ "- `code-review`"
-      refute hd(prompts) =~ "- `humanizer`"
+      assert hd(prompts) =~ "- `humanizer`"
       refute hd(prompts) =~ "- `impeccable`"
       assert Enum.at(prompts, 1) =~ "The previous response did not match the pipeline's required phase report."
       assert Enum.all?(turn_starts, &is_map(get_in(&1, ["params", "outputSchema"])))
@@ -550,7 +550,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         description: "Publish readable Markdown in GitHub comments, not raw JSON. Review the accepted commit and return the phase report.",
         state: "Review",
         url: "https://example.org/issues/MT-PHASE-REPORT",
-        labels: ["backend"]
+        labels: ["backend", "customer-facing"]
       }
 
       result =
@@ -585,11 +585,11 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert review_prompt =~
                "The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result."
 
-      refute review_prompt =~ "Use these repo-local skills when their conditions apply:"
+      assert review_prompt =~ "Use these repo-local skills when their conditions apply:"
       refute review_prompt =~ "- `ponytail`"
       refute review_prompt =~ "- `tdd`"
       refute review_prompt =~ "- `code-review`"
-      refute review_prompt =~ "- `humanizer`"
+      assert review_prompt =~ "- `humanizer`"
       refute review_prompt =~ "- `impeccable`"
 
       assert get_in(correction_turn, ["params", "input", Access.at(0), "text"]) =~ "Do not include headings, bullets, Markdown, code fences, or text outside the JSON object."

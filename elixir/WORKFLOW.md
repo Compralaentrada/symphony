@@ -101,6 +101,11 @@ Before planning, inspect the relevant skills under `.agents/skills` and `.codex/
 - Use repository skills such as `commit`, `push`, or `pull` when they fit the current repo and branch.
 - Do not download skills during a run or force an irrelevant skill into the task.
 
+For Projects pipeline sessions, Symphony fixes the Build, QA, and Review role prompts and base skill
+assignments. Installation front matter cannot remap them; task-specific skills are selected from
+issue context. Interactive skills such as Impeccable remain available to standalone sessions but are
+not forced into unattended phases.
+
 ## Instructions
 
 1. This is an unattended orchestration session. Do not ask a human for follow-up actions.

@@ -25,10 +25,9 @@ defmodule SymphonyElixir.Codex.Skills do
   def select(%Issue{} = issue, phase) when is_map_key(@phase_skills, phase) do
     labels = normalized_labels(issue)
     code_skills = if Enum.member?(labels, "writing-only") or Enum.member?(labels, "text-only"), do: [], else: @phase_skills[phase]
-    frontend_skill = if Enum.any?(@frontend_labels, &Enum.member?(labels, &1)), do: ["impeccable"], else: []
     writing_skill = if Enum.any?(@writing_labels, &Enum.member?(labels, &1)), do: ["humanizer"], else: []
 
-    Enum.uniq(code_skills ++ frontend_skill ++ writing_skill)
+    Enum.uniq(code_skills ++ writing_skill)
   end
 
   def select(%Issue{}, phase) when phase in @skill_free_phases, do: []
