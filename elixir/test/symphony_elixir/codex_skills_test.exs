@@ -126,4 +126,20 @@ defmodule SymphonyElixir.Codex.SkillsTest do
              "humanizer"
            ]
   end
+
+  test "selects pipeline skills by fixed phase and applicable task labels" do
+    backend_issue = %Issue{labels: ["backend"]}
+
+    assert Skills.select(backend_issue, :build) == ["ponytail"]
+    assert Skills.select(backend_issue, :qa) == []
+    assert Skills.select(backend_issue, :review) == []
+    assert Skills.select(backend_issue, :diagnostic) == []
+    assert Skills.select(backend_issue, :unknown_phase) == []
+
+    frontend_copy_issue = %Issue{labels: ["frontend", "customer-facing"]}
+
+    assert Skills.select(frontend_copy_issue, :build) == ["ponytail", "impeccable", "humanizer"]
+    assert Skills.select(frontend_copy_issue, :qa) == ["impeccable", "humanizer"]
+    assert Skills.select(frontend_copy_issue, :review) == ["impeccable", "humanizer"]
+  end
 end

@@ -216,6 +216,17 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         codex_command: "#{codex_binary} app-server"
       )
 
+      workflow_path = Workflow.workflow_file_path()
+      workflow = File.read!(workflow_path)
+
+      File.write!(
+        workflow_path,
+        String.replace(workflow, "---\ntracker:", "---\nphase_skills:\n  build:\n    - tdd\ntracker:", global: false)
+      )
+
+      assert :ok = WorkflowStore.force_reload()
+      assert {:ok, %{config: %{"phase_skills" => %{"build" => ["tdd"]}}}} = Workflow.current()
+
       issue = %Issue{
         id: "issue-build-foreign-turn",
         identifier: "MT-BUILD-FOREIGN-TURN",
@@ -223,7 +234,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         description: "Implement the change and return the Build phase report.",
         state: "Ready",
         url: "https://example.org/issues/MT-BUILD-FOREIGN-TURN",
-        labels: ["backend"]
+        labels: ["frontend", "customer-facing"]
       }
 
       assert %{"outcome" => "ready", "summary" => "Build completed"} =
@@ -242,12 +253,18 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
 
       assert length(turn_starts) == 1
       prompt = get_in(hd(turn_starts), ["params", "input", Access.at(0), "text"])
+      assert prompt =~ "Pipeline phase: Build."
       assert prompt =~ "read_workpad"
       assert prompt =~ "Before any other GitHub write or code edit"
       assert prompt =~ "claims an item dispatched from Ready by moving it to Building"
       assert prompt =~ "complete human-readable Markdown comment in `body`"
       assert prompt =~ "symphony:report:json"
       assert prompt =~ "report_context.task"
+      assert prompt =~ "- `ponytail`"
+      assert prompt =~ "- `impeccable`"
+      assert prompt =~ "- `humanizer`"
+      refute prompt =~ "- `tdd`"
+      refute prompt =~ "- `code-review`"
       refute prompt =~ "symphony/mt-build-foreign-turn"
     after
       File.rm_rf(test_root)
@@ -417,14 +434,19 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
 
       assert length(prompts) == 2
       assert hd(prompts) =~ "Each finding must include the exact keys id, reproduction, and criterion as non-empty strings."
+      assert hd(prompts) =~ "Pipeline phase: independent QA."
       assert hd(prompts) =~ "read_workpad"
       assert hd(prompts) =~ "report_context.host_checks"
       assert hd(prompts) =~ "complete human-readable Markdown comment in `body`"
       refute hd(prompts) =~ "echo required-check-secret"
       refute hd(prompts) =~ "host-evidence-secret"
-      assert hd(prompts) =~ "Use the Humanizer guidance for report values"
       assert hd(prompts) =~ "Write report values in English"
+      refute hd(prompts) =~ "Use these repo-local skills when their conditions apply:"
+      refute hd(prompts) =~ "- `ponytail`"
+      refute hd(prompts) =~ "- `tdd`"
       refute hd(prompts) =~ "- `code-review`"
+      refute hd(prompts) =~ "- `humanizer`"
+      refute hd(prompts) =~ "- `impeccable`"
       assert Enum.at(prompts, 1) =~ "The previous response did not match the pipeline's required phase report."
       assert Enum.all?(turn_starts, &is_map(get_in(&1, ["params", "outputSchema"])))
       assert get_in(hd(turn_starts), ["params", "outputSchema", "properties", "findings", "items", "required"]) == ["id", "reproduction", "criterion"]
@@ -552,6 +574,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert length(turn_starts) == 2
       [initial_turn, correction_turn] = turn_starts
       review_prompt = get_in(initial_turn, ["params", "input", Access.at(0), "text"])
+      assert review_prompt =~ "Pipeline phase: autonomous code review."
       assert review_prompt =~ "Do not invoke the repository's `code-review` skill or its Markdown report format"
       assert review_prompt =~ "read_workpad"
       assert review_prompt =~ "report_context.task"
@@ -561,6 +584,13 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
 
       assert review_prompt =~
                "The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result."
+
+      refute review_prompt =~ "Use these repo-local skills when their conditions apply:"
+      refute review_prompt =~ "- `ponytail`"
+      refute review_prompt =~ "- `tdd`"
+      refute review_prompt =~ "- `code-review`"
+      refute review_prompt =~ "- `humanizer`"
+      refute review_prompt =~ "- `impeccable`"
 
       assert get_in(correction_turn, ["params", "input", Access.at(0), "text"]) =~ "Do not include headings, bullets, Markdown, code fences, or text outside the JSON object."
 
