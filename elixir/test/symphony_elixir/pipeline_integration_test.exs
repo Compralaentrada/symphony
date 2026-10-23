@@ -1788,14 +1788,13 @@ defmodule SymphonyElixir.PipelineIntegrationTest.DiagnosticAgent do
     if Keyword.get(opts, :diagnostic, false) do
       run_diagnostic(issue, opts)
     else
-      {:phase_result,
-       {:system_blocker,
-        %{
-          "outcome" => "blocked",
-          "summary" => "The host could not verify the accepted workspace SHA.",
-          "reason" => "The host could not verify the accepted workspace SHA.",
-          "next_step" => "Inspect the saved phase evidence and current PR."
-        }}}
+      {:system_blocker,
+       %{
+         "outcome" => "blocked",
+         "summary" => "The host could not verify the accepted workspace SHA.",
+         "reason" => "The host could not verify the accepted workspace SHA.",
+         "next_step" => "Inspect the saved phase evidence and current PR."
+       }}
     end
   end
 

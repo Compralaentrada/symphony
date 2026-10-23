@@ -375,6 +375,7 @@ defmodule SymphonyElixir.CoreTest do
 
     hook_marker = Path.join(test_root, "before-run-started")
     hook_fifo = Path.join(test_root, "before-run-blocker")
+    hook_pid_file = Path.join(test_root, "before-run-pids")
     runtime_supervisor_name = Module.concat(__MODULE__, "AgentRuntimeSupervisor#{issue_suffix}")
     task_supervisor_name = Module.concat(__MODULE__, "TaskSupervisor#{issue_suffix}")
     orchestrator_name = Module.concat(__MODULE__, "RestartOrchestrator#{issue_suffix}")
@@ -393,6 +394,15 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     on_exit(fn ->
+      if File.exists?(hook_pid_file) do
+        hook_pid_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.each(fn pid ->
+          if Regex.match?(~r/^\d+$/, pid), do: System.cmd("/bin/kill", ["-TERM", pid], stderr_to_stdout: true)
+        end)
+      end
+
       if pid = Process.whereis(runtime_supervisor_name) do
         GenServer.stop(pid)
       end
@@ -414,7 +424,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_kind: "memory",
       workspace_root: test_root,
       poll_interval_ms: 10,
-      hook_before_run: "mkfifo \"#{hook_fifo}\"; : > \"#{hook_marker}\"; read _ < \"#{hook_fifo}\"",
+      hook_before_run: "printf '%s\\n' \"$$\" >> '#{hook_pid_file}'; mkfifo \"#{hook_fifo}\"; : > \"#{hook_marker}\"; read _ < \"#{hook_fifo}\"",
       hook_timeout_ms: 60_000
     )
 
@@ -485,6 +495,30 @@ defmodule SymphonyElixir.CoreTest do
 
     assert is_pid(second_worker_pid)
     assert Process.alive?(second_worker_pid)
+
+    hook_pids =
+      eventually_value(fn ->
+        case File.read(hook_pid_file) do
+          {:ok, contents} ->
+            case String.split(contents, "\n", trim: true) do
+              [first, second | _] -> {first, second}
+              _ -> nil
+            end
+
+          _ ->
+            nil
+        end
+      end)
+
+    assert {first_hook_pid, second_hook_pid} = hook_pids
+    assert {_, 0} = System.cmd("/bin/kill", ["-0", second_hook_pid], stderr_to_stdout: true)
+
+    assert eventually_value(fn ->
+             case System.cmd("/bin/kill", ["-0", first_hook_pid], stderr_to_stdout: true) do
+               {_, 0} -> nil
+               _ -> true
+             end
+           end)
   end
 
   test "linear issue state reconciliation fetch with no running issues is a no-op" do
