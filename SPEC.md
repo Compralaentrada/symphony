@@ -1638,6 +1638,37 @@ Minimum endpoints:
     }
     ```
 
+Optional pipeline endpoint:
+
+- `GET /api/v1/delivery`
+  - Returns persisted pipeline tasks with a current lookup in the configured tracker by each task's
+    stable issue ID.
+  - The nested `task` contains the local pipeline record. `tracker_issue.issue` contains the
+    tracker's current `id`, `identifier`, `title`, `url`, and `state` when found. Its `lookup` is
+    `found`, `missing`, or `error`; `issue` is `null` for `missing` and `error`. The tracker state
+    is never inferred from the stored task.
+  - A local journal read failure returns `503` with error code `delivery_unavailable`.
+
+  ```json
+  {
+    "tasks": [
+      {
+        "task": { "issue_id": "abc123", "phase": "qa", "status": "qa" },
+        "tracker_issue": {
+          "lookup": "found",
+          "issue": {
+            "id": "abc123",
+            "identifier": "MT-649",
+            "title": "Review pipeline delivery",
+            "url": "https://tracker.example/issues/MT-649",
+            "state": "Human Review"
+          }
+        }
+      }
+    ]
+  }
+  ```
+
 API design notes:
 
 - The JSON shapes above are the RECOMMENDED baseline for interoperability and debugging ergonomics.
