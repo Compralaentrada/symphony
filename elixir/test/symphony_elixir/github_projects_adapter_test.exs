@@ -286,7 +286,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert Enum.take(Agent.get(remote, &Enum.reverse(&1.events)), 3) == [:pull_request_read, :pull_request_read, :issue_closed]
   end
 
-  test "merge gate requires approved checks and current SHA and base evidence" do
+  test "merge gate requires approved checks and current SHA and base evidence without merging" do
     previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
     root = Path.join(System.tmp_dir!(), "symphony-project-merge-gate-#{System.unique_integer([:positive])}")
     Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
@@ -301,8 +301,9 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     end)
 
     {result, queries} = run_merge_gate(%{})
-    assert {:ok, %{"outcome" => "merged"}} = result
-    assert Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
+    expected_sha = String.duplicate("a", 40)
+    assert {:ok, %{"outcome" => "passed", "sha" => ^expected_sha, "pull_request" => %{"head_sha" => ^expected_sha}}} = result
+    assert Enum.all?(queries, &String.starts_with?(String.trim_leading(&1), "query "))
 
     for {scenario, expected_error} <- [
           {%{host_check_status: "failed"}, :host_checks_not_verified},
@@ -1856,14 +1857,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
           {:ok, %{status: 200, body: body}}
 
         query =~ "SymphonyPipelineMergePullRequest" ->
-          merged = %{
-            "id" => "PR_#{number}",
-            "number" => number,
-            "url" => "https://github.com/octo/app/pull/#{number}",
-            "mergedAt" => "2026-10-23T08:00:00Z"
-          }
-
-          {:ok, %{status: 200, body: %{"data" => %{"mergePullRequest" => %{"pullRequest" => merged}}}}}
+          flunk("merge gate must not start a merge")
 
         query =~ "SymphonyPipelinePullRequest" ->
           merged_pull_request = %{

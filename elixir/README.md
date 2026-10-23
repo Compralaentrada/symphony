@@ -62,7 +62,8 @@ this line confirms the decision to discard the work.
 
 With `merge_policy: auto`, Review invokes the deterministic merge gate. It requires the reviewed PR
 head SHA, the current base SHA, and successful required checks. The gate stops when GitHub cannot
-confirm any of that state.
+confirm any of that state. It returns evidence only; Symphony does not initiate a merge or write to
+the PR.
 
 Pipeline phase reports use Markdown in Spanish when the issue is Spanish, and English for English,
 unsupported, or ambiguous issue languages. Reports omit empty sections and distinguish blocked

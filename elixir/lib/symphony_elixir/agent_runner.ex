@@ -595,7 +595,7 @@ defmodule SymphonyElixir.AgentRunner do
     The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
     Do not modify files. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
     Update the persistent workpad with review findings and resolutions using `github_workflow` operation `workpad`.
-    With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`, then call `request_merge`; if the host confirms the merge, hand off outcome `merged` so the host verifies the merge before closing the issue and moving the item to Done. If the gate rejects the request, leave the PR in Human Review.
+    With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`, then call `request_merge` to evaluate the deterministic gate. This operation only reads GitHub state and returns evidence; it never merges or writes to the PR. Whether the gate passes or rejects, the PR remains in Human Review for a person to decide.
     Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end
