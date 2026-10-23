@@ -117,6 +117,14 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   }
   """
 
+  @merge_mutation """
+  mutation SymphonyPipelineMergePullRequest($pullRequestId: ID!, $expectedHeadOid: GitObjectID!) {
+    mergePullRequest(input: { pullRequestId: $pullRequestId, expectedHeadOid: $expectedHeadOid }) {
+      pullRequest { id number url mergedAt baseRefName headRefOid }
+    }
+  }
+  """
+
   @close_issue_mutation """
   mutation SymphonyPipelineCloseIssue($issueId: ID!) {
     closeIssue(input: { issueId: $issueId }) { issue { id state stateReason url } }
@@ -1502,11 +1510,13 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          :ok <- ensure_merge_checks(task),
          {:ok, data} <- graphql(request_fun, @merge_query, variables, settings),
          %{} = pr <- find_pull_request(data, branch, base),
-         :ok <- merge_gate(pr, task, get_in(data, ["repository", "ref", "target", "oid"])) do
+         :ok <- merge_gate(pr, task, get_in(data, ["repository", "ref", "target", "oid"])),
+         :ok <- merge_if_open(pr, task, settings, request_fun),
+         {:ok, merged_pr} <- confirmed_merged_pull_request(issue, branch, base, settings, request_fun) do
       {:ok,
        %{
-         "outcome" => "passed",
-         "pull_request" => %{"head_sha" => pr["headRefOid"], "base_sha" => pr["baseRefOid"]},
+         "outcome" => "merged",
+         "pull_request" => pr_evidence(merged_pr),
          "sha" => task["current_sha"]
        }}
     else
@@ -1568,6 +1578,32 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       pr["state"] == "MERGED" and is_binary(pr["mergedAt"]) -> :ok
       pr["state"] == "OPEN" and pr["isDraft"] == false -> :ok
       true -> {:error, :pull_request_not_mergeable}
+    end
+  end
+
+  defp merge_if_open(%{"state" => "MERGED"}, _task, _settings, _request_fun), do: :ok
+
+  defp merge_if_open(pr, task, settings, request_fun) do
+    with {:ok, data} <-
+           graphql(
+             request_fun,
+             @merge_mutation,
+             %{"pullRequestId" => pr["id"], "expectedHeadOid" => task["current_sha"]},
+             settings
+           ),
+         %{"pullRequest" => %{"mergedAt" => merged_at}} when is_binary(merged_at) <- data["mergePullRequest"] do
+      :ok
+    else
+      {:error, _reason} = error -> error
+      _ -> {:error, :pull_request_merge_not_confirmed}
+    end
+  end
+
+  defp confirmed_merged_pull_request(issue, branch, base, settings, request_fun) do
+    case pull_request(issue, settings, request_fun) do
+      {:ok, %{merged: true, branch: ^branch, base: ^base} = pr} -> {:ok, pr}
+      {:ok, _} -> {:error, :pull_request_merge_not_confirmed}
+      {:error, _reason} = error -> error
     end
   end
 
