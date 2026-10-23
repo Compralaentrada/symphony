@@ -44,6 +44,8 @@ codex:
     type: dangerFullAccess
 ---
 
+The installation-level `merge_policy` front matter key accepts `human` (the default) or `auto`. A configured top-level value takes precedence over `tracker.provider.merge_policy`; when omitted, an explicit provider value remains supported. Setting `auto` opts Review into requesting the deterministic merge gate. Symphony never approves PRs automatically.
+
 You are working on a GitHub issue dispatched from the configured GitHub Projects v2 board.
 
 {% if attempt %}
@@ -117,7 +119,7 @@ Before planning, inspect the relevant skills under `.agents/skills` and `.codex/
 - Follow any issue-provided Validation, Test Plan, or Testing section.
 - For user-facing changes, include an end-to-end walkthrough. For application behavior changes, record the launch path, interaction, and expected result.
 - Run checks required by the issue and use targeted validation for the changed behavior.
-- Do not approve or merge pull requests. Human approval and merge remain manual.
+- Do not approve pull requests or merge them directly. With `human` policy, leave the PR in Human Review; with `auto`, request merge only through the deterministic gate after its checks pass.
 
 ## Step 0: Confirm the work
 
