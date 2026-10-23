@@ -657,6 +657,7 @@ defmodule SymphonyElixir.Orchestrator do
     case Map.get(state.running, issue_id) do
       %{identifier: identifier} = running_entry ->
         consecutive_absences = Map.get(running_entry, :consecutive_missing_refreshes, 0) + 1
+        session_id = running_entry_session_id(running_entry)
 
         action =
           if consecutive_absences >= 2,
@@ -664,7 +665,7 @@ defmodule SymphonyElixir.Orchestrator do
             else: "retaining active agent until confirmed"
 
         Logger.info(
-          "Issue omitted from successful running-state refresh: issue_id=#{issue_id} issue_identifier=#{identifier} consecutive_absences=#{consecutive_absences} normalized_issue_count=#{normalized_issue_count}; #{action}"
+          "Issue omitted from successful running-state refresh: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} consecutive_absences=#{consecutive_absences} normalized_issue_count=#{normalized_issue_count}; #{action}"
         )
 
         state = %{
@@ -694,7 +695,9 @@ defmodule SymphonyElixir.Orchestrator do
         consecutive_absences = Map.get(running_entry, :consecutive_missing_refreshes, 0)
 
         if consecutive_absences > 0 do
-          Logger.info("Issue recovered after successful running-state refresh: #{issue_context(issue)} consecutive_absences=#{consecutive_absences}; keeping active agent")
+          session_id = running_entry_session_id(running_entry)
+
+          Logger.info("Issue recovered after successful running-state refresh: #{issue_context(issue)} session_id=#{session_id} consecutive_absences=#{consecutive_absences}; keeping active agent")
         end
 
         running_entry = running_entry |> Map.put(:issue, issue) |> Map.delete(:consecutive_missing_refreshes)

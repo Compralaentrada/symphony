@@ -38,6 +38,10 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert await(fn -> Map.get(:sys.get_state(orchestrator_name).running[issue.id] || %{}, :workspace_path) != nil end)
     workspace = :sys.get_state(orchestrator_name).running[issue.id].workspace_path
 
+    session_id = "thread-live-turn-live"
+    send(orchestrator_pid, {:codex_worker_update, issue.id, %{event: :session_started, session_id: session_id, timestamp: DateTime.utc_now()}})
+    assert await(fn -> :sys.get_state(orchestrator_name).running[issue.id].session_id == session_id end)
+
     assert File.exists?(database_path)
     assert {:ok, %{"status" => "building"}} = Store.get_task(issue.id)
     assert :sys.get_state(orchestrator_name).running[issue.id].pid == agent_pid
@@ -49,6 +53,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     first_omission_log = capture_log(fn -> refresh!(orchestrator_name, table) end)
 
     assert first_omission_log =~ issue.identifier
+    assert first_omission_log =~ "session_id=#{session_id}"
     assert first_omission_log =~ "consecutive_absences=1"
     assert first_omission_log =~ "normalized_issue_count=0"
     assert_running_agent(orchestrator_name, issue, agent_pid, workspace, 1)
@@ -58,6 +63,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     recovery_log = capture_log(fn -> refresh!(orchestrator_name, table) end)
 
     assert recovery_log =~ "Issue recovered after successful running-state refresh"
+    assert recovery_log =~ "session_id=#{session_id}"
     assert_running_agent(orchestrator_name, issue, agent_pid, workspace, 0)
 
     :ets.insert(table, {:fetch_issues_by_ids_responses, [{:ok, [issue]}, {:error, :econnreset}]})
@@ -73,6 +79,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     confirmed_omission_log = capture_log(fn -> refresh!(orchestrator_name, table) end)
 
     assert confirmed_omission_log =~ "consecutive_absences=2"
+    assert confirmed_omission_log =~ "session_id=#{session_id}"
     assert confirmed_omission_log =~ "normalized_issue_count=0"
     assert await(fn -> not Process.alive?(agent_pid) end)
 
