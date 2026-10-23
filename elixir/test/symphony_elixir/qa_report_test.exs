@@ -49,6 +49,14 @@ defmodule SymphonyElixir.QAReportTest do
     assert ["Primer criterio."] =
              QAReport.criteria_from_description("## Criterios de aceptación\n- Primer criterio.")
 
+    mixed_description =
+      "## Acceptance Criteria\nThe search respects the configured limit.\n- The search returns matching results."
+
+    assert ["The search respects the configured limit.", "The search returns matching results."] =
+             QAReport.criteria_from_description(mixed_description)
+
+    refute QAReport.valid?(report(), [], mixed_description)
+
     assert [] = QAReport.criteria_from_description("## Acceptance Criteria\n\n## Verification\n- Run tests.")
 
     assert ["The result is clearly reported."] =

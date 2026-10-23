@@ -1,7 +1,9 @@
 defmodule SymphonyElixir.Pipeline do
   @moduledoc false
 
-  alias SymphonyElixir.{Config, Pipeline.Findings, Pipeline.Store, QAReport, Tracker}
+  require Logger
+
+  alias SymphonyElixir.{Config, Pipeline.Findings, Pipeline.Store, PRBody, QAReport, Tracker}
   alias SymphonyElixir.Tracker.Issue
 
   @phases ~w(build qa review finalize)
@@ -31,6 +33,18 @@ defmodule SymphonyElixir.Pipeline do
     description = if is_binary(description), do: String.downcase(description), else: ""
     confidence = Enum.reduce(1..@report_locale_samples, 0.0, fn _, total -> total + Keyword.get(Tongue.detect(description), :es, 0.0) end) / @report_locale_samples
     if confidence >= @report_locale_confidence, do: :es, else: :en
+  end
+
+  @spec delivery_tasks() :: {:ok, [map()]} | {:error, term()}
+  def delivery_tasks do
+    with {:ok, tasks} <- Store.tasks() do
+      issue_ids = Enum.map(tasks, & &1["issue_id"])
+
+      tracker_issues =
+        if issue_ids == [], do: {:ok, []}, else: Tracker.fetch_issues_by_ids(issue_ids)
+
+      {:ok, project_delivery_tasks(tasks, tracker_issues)}
+    end
   end
 
   @spec reconcile() :: :ok | {:error, term()}
@@ -145,14 +159,56 @@ defmodule SymphonyElixir.Pipeline do
 
     case Store.pending_operations(issue.id) do
       {:ok, []} ->
-        case prepare_task(existing, issue) do
-          {:ok, _task, _phase} = prepared -> finish_prepare(issue, prepared)
-          other -> other
-        end
+        prepare_from_checkpoint_without_pending(issue, existing)
 
       _ ->
         :ignore
     end
+  end
+
+  defp prepare_from_checkpoint_without_pending(issue, existing) do
+    case checkpoint_state_mismatch(existing, issue) do
+      {:mismatch, reason} ->
+        block_checkpoint_mismatch(existing, issue, reason)
+
+      :ok ->
+        case prepare_task(existing, issue) do
+          {:ok, _task, _phase} = prepared -> finish_prepare(issue, prepared)
+          other -> other
+        end
+    end
+  end
+
+  defp project_delivery_tasks(tasks, {:ok, issues}) do
+    issues_by_id = Map.new(issues, &{&1.id, &1})
+
+    Enum.map(tasks, fn task ->
+      tracker_issue =
+        case Map.get(issues_by_id, task["issue_id"]) do
+          %Issue{} = issue ->
+            %{
+              "lookup" => "found",
+              "issue" => %{
+                "id" => issue.id,
+                "identifier" => issue.identifier,
+                "title" => issue.title,
+                "url" => issue.url,
+                "state" => issue.state
+              }
+            }
+
+          nil ->
+            %{"lookup" => "missing", "issue" => nil}
+        end
+
+      %{"task" => task, "tracker_issue" => tracker_issue}
+    end)
+  end
+
+  defp project_delivery_tasks(tasks, {:error, _reason}) do
+    Enum.map(tasks, fn task ->
+      %{"task" => task, "tracker_issue" => %{"lookup" => "error", "issue" => nil}}
+    end)
   end
 
   defp finish_prepare(issue, prepared) do
@@ -266,7 +322,7 @@ defmodule SymphonyElixir.Pipeline do
     do: task |> Map.put("phase", "build") |> Map.put("current_sha", nil) |> resume_blocked_task()
 
   defp resume_blocked_task(task) do
-    task = Map.put(task, "status", "building")
+    task = task |> Map.put("status", "building") |> Map.delete("blocked_reason")
     with :ok <- Store.save_task(task), do: {:ok, task, task["phase"]}
   end
 
@@ -308,7 +364,8 @@ defmodule SymphonyElixir.Pipeline do
 
   defp finish_valid_phase(issue, task, "build", attempt, %{"outcome" => "ready", "sha" => sha} = result)
        when is_binary(sha) do
-    with :ok <- Tracker.validate_pipeline_delivery(issue, task["branch"], sha) do
+    with :ok <- PRBody.validate_agent_body(result["pull_request_body"], issue.id),
+         :ok <- Tracker.validate_pipeline_delivery(issue, task["branch"], sha) do
       handoff = remote_handoff(result)
       pr_number = get_in(handoff, ["pull_request", "number"])
       next = task |> Map.merge(%{"phase" => "qa", "status" => "qa", "current_sha" => sha}) |> maybe_put("pr_number", pr_number)
@@ -318,7 +375,7 @@ defmodule SymphonyElixir.Pipeline do
           "branch" => task["branch"],
           "base" => task["base_branch"],
           "sha" => sha,
-          "body" => pull_request_body(issue, result)
+          "body" => PRBody.delivery_block(result["pull_request_body"])
         }),
         report_op(next, "build", attempt, result),
         status_op(next, :qa, nil, attempt)
@@ -510,7 +567,46 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp reconcile_nonterminal_task(_issue, _task), do: :ok
+  defp reconcile_nonterminal_task(issue, task) do
+    case checkpoint_state_mismatch(task, issue) do
+      {:mismatch, reason} -> block_checkpoint_mismatch(task, issue, reason)
+      :ok -> :ok
+    end
+  end
+
+  defp checkpoint_state_mismatch(%{"status" => status} = task, %Issue{state: issue_state})
+       when status in ["building", "qa", "review", "finalize"] do
+    expected_states =
+      case status do
+        "building" -> [status_value(task, :ready), status_value(task, :building)]
+        "qa" -> [status_value(task, :qa)]
+        "review" -> [status_value(task, :review)]
+        "finalize" -> [status_value(task, :human_review), status_value(task, :building), status_value(task, :done), "closed"]
+      end
+
+    if issue_state in expected_states or issue_state in [status_value(task, :done), status_value(task, :dropped), "closed"] do
+      :ok
+    else
+      phase = task["phase"] || status
+      {:mismatch, "Pipeline checkpoint is #{String.capitalize(to_string(phase))} but tracker state is #{issue_state}; review the workpad and move the item to Ready to resume safely."}
+    end
+  end
+
+  defp checkpoint_state_mismatch(_task, _issue), do: :ok
+
+  defp block_checkpoint_mismatch(task, issue, reason) do
+    blocked = task |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
+
+    case Store.save_task(blocked) do
+      :ok ->
+        Logger.warning("Pipeline checkpoint mismatch for issue_id=#{issue.id} issue_identifier=#{issue.identifier}: #{reason}; leaving tracker state unchanged")
+        :ignore
+
+      {:error, _reason} = error ->
+        Logger.error("Unable to persist pipeline checkpoint mismatch for issue_id=#{issue.id} issue_identifier=#{issue.identifier}: #{inspect(error)}")
+        error
+    end
+  end
 
   defp reconcile_unmerged_done(issue, task, status) do
     _ = {issue, task, status}
@@ -575,54 +671,6 @@ defmodule SymphonyElixir.Pipeline do
 
   defp ensure_pull_request_sha(%{sha: sha}, sha) when is_binary(sha), do: :ok
   defp ensure_pull_request_sha(_pr, _sha), do: {:error, :pull_request_head_sha_mismatch}
-
-  defp pull_request_body(issue, result) do
-    """
-    <!-- symphony:delivery -->
-
-    Fixes #{issue.id}
-
-    ## Summary
-
-    #{result["summary"]}
-
-    ## Acceptance criteria
-
-    #{markdown_items(result["criteria"])}
-
-    ## Changes
-
-    #{markdown_items(result["changes"])}
-
-    ## Checks
-
-    #{markdown_items(result["checks"])}
-
-    ## Evidence
-
-    - Build SHA: `#{result["sha"]}`
-
-    ## Risks and limitations
-
-    #{markdown_items(result["risks"])}
-
-    ## Next step
-
-    #{result["next_step"]}
-    """
-    |> String.trim()
-  end
-
-  defp markdown_items(items) when is_list(items) do
-    case items do
-      [] -> "- None reported."
-      items -> Enum.map_join(items, "\n", &("- " <> markdown_item(&1)))
-    end
-  end
-
-  defp markdown_items(_items), do: "- None reported."
-  defp markdown_item(item) when is_binary(item), do: item
-  defp markdown_item(item), do: Jason.encode!(item)
 
   defp complete_merged_task(task, number) do
     next = task |> Map.merge(%{"phase" => "finalize", "status" => "finalize", "pr_number" => number})

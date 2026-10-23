@@ -7,6 +7,7 @@ defmodule SymphonyElixir.GitHub.Client do
   alias SymphonyElixir.Config
   alias SymphonyElixir.GitHub.AgentReport
   alias SymphonyElixir.Pipeline.Store
+  alias SymphonyElixir.PRBody
   alias SymphonyElixir.Tracker.Issue
 
   @default_api_url "https://api.github.com"
@@ -393,10 +394,11 @@ defmodule SymphonyElixir.GitHub.Client do
   defp agent_handoff(issue, context, arguments, settings, request_fun) do
     report = normalize_report(arguments["report"])
     outcome = arguments["outcome"] || report["outcome"]
-    report = Map.put(report, "outcome", outcome)
-    agent_body = Map.get(arguments, "body")
+    submitted_report = Map.put(report, "outcome", outcome)
+    report = submitted_report
 
-    with :ok <- validate_agent_handoff(context, outcome, report),
+    with {:ok, agent_body} <- AgentReport.normalize_body(Map.get(arguments, "body"), submitted_report, submitted_report),
+         :ok <- validate_agent_handoff(issue, context, outcome, report),
          :ok <- AgentReport.validate_body(agent_body, report),
          {:ok, current_issue} <- current_issue(issue, settings, request_fun),
          :ok <- ensure_issue_open(current_issue),
@@ -415,12 +417,12 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp validate_agent_handoff(context, outcome, report) do
+  defp validate_agent_handoff(issue, context, outcome, report) do
     lane = to_string(context.lane)
 
     with :ok <- validate_handoff_lane(lane),
          :ok <- validate_handoff_outcome(outcome),
-         :ok <- validate_build_report_for_outcome(outcome, report),
+         :ok <- validate_build_report_for_outcome(outcome, report, issue),
          :ok <- validate_handoff_reason(outcome, report) do
       validate_diagnostic_handoff(lane, outcome)
     end
@@ -432,10 +434,10 @@ defmodule SymphonyElixir.GitHub.Client do
   defp validate_handoff_outcome(outcome) when outcome in ["ready", "blocked", "no_changes"], do: :ok
   defp validate_handoff_outcome(_outcome), do: {:error, :invalid_github_handoff_outcome}
 
-  defp validate_build_report_for_outcome("ready", report),
-    do: if(valid_build_report?(report), do: :ok, else: {:error, :invalid_github_build_report})
+  defp validate_build_report_for_outcome("ready", report, issue),
+    do: if(valid_build_report?(report, issue), do: :ok, else: {:error, :invalid_github_build_report})
 
-  defp validate_build_report_for_outcome(_outcome, _report), do: :ok
+  defp validate_build_report_for_outcome(_outcome, _report, _issue), do: :ok
 
   defp validate_handoff_reason(outcome, report) when outcome in ["blocked", "no_changes"],
     do: if(is_binary(report["reason"]), do: :ok, else: {:error, :github_handoff_reason_required})
@@ -446,10 +448,11 @@ defmodule SymphonyElixir.GitHub.Client do
   defp validate_diagnostic_handoff("diagnostic", _outcome), do: {:error, :invalid_github_diagnostic_handoff}
   defp validate_diagnostic_handoff(_lane, _outcome), do: :ok
 
-  defp valid_build_report?(report) do
+  defp valid_build_report?(report, issue) do
     is_binary(report["summary"]) and is_binary(report["sha"]) and
       Regex.match?(~r/^[0-9a-fA-F]{40}$/, report["sha"]) and
-      Enum.all?(["criteria", "changes", "checks", "risks"], &is_list(report[&1]))
+      Enum.all?(["criteria", "changes", "checks", "risks"], &is_list(report[&1])) and
+      PRBody.validate_agent_body(report["pull_request_body"], issue.id) == :ok
   end
 
   defp current_issue(issue, settings, request_fun) do
@@ -542,7 +545,7 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp create_or_update_agent_pull_request(nil, issue, branch, base, report, settings, request_fun) do
     title = issue.title || issue.identifier
-    body = delivery_body(issue, report)
+    body = delivery_body(report)
     request_body = %{"title" => title, "head" => branch, "base" => base, "body" => body, "draft" => true}
 
     case request_with_settings("POST", "/repos/#{settings.repo}/pulls", %{}, request_body, settings, request_fun, false) do
@@ -567,10 +570,10 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp update_agent_pull_request_body(pull_request, issue, report, settings, request_fun) do
+  defp update_agent_pull_request_body(pull_request, _issue, report, settings, request_fun) do
     body = pull_request["body"] || ""
 
-    case replace_owned_block(body, "<!-- symphony:delivery:start -->", "<!-- symphony:delivery:end -->", delivery_body(issue, report)) do
+    case replace_owned_block(body, "<!-- symphony:delivery:start -->", "<!-- symphony:delivery:end -->", delivery_body(report)) do
       {:ok, updated} when updated == body ->
         :ok
 
@@ -628,34 +631,7 @@ defmodule SymphonyElixir.GitHub.Client do
     }
   end
 
-  defp delivery_body(issue, report) do
-    """
-    <!-- symphony:delivery:start -->
-    Issue: #{issue.url}
-
-    ## Summary
-    #{report["summary"]}
-
-    ## Acceptance criteria
-    #{markdown_items(report["criteria"])}
-
-    ## Changes
-    #{markdown_items(report["changes"])}
-
-    ## Checks
-    #{markdown_items(report["checks"])}
-
-    ## Build SHA
-    `#{report["sha"]}`
-    <!-- symphony:delivery:end -->
-    """
-    |> String.trim()
-  end
-
-  defp markdown_items(items) when is_list(items) and items != [],
-    do: Enum.map_join(items, "\n", &("- " <> if(is_binary(&1), do: &1, else: Jason.encode!(&1))))
-
-  defp markdown_items(_items), do: "- None reported."
+  defp delivery_body(report), do: PRBody.delivery_block(report["pull_request_body"])
 
   defp upsert_agent_comment(issue, marker, end_marker, body, settings, request_fun) do
     with {:ok, number} <- issue_number(issue),

@@ -5,6 +5,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.Linear.Adapter
+  alias SymphonyElixir.Pipeline.Store
   alias SymphonyElixir.Tracker.Memory
 
   @endpoint SymphonyElixirWeb.Endpoint
@@ -18,6 +19,13 @@ defmodule SymphonyElixir.ExtensionsTest do
     def fetch_issues_by_ids(issue_ids) do
       send(self(), {:fetch_issues_by_ids_called, issue_ids})
       {:ok, issue_ids}
+    end
+  end
+
+  defmodule DeliveryTrackerClient do
+    def fetch_issues_by_ids(issue_ids) do
+      send(self(), {:delivery_tracker_ids, issue_ids})
+      Application.fetch_env!(:symphony_elixir, :delivery_tracker_result)
     end
   end
 
@@ -378,6 +386,78 @@ defmodule SymphonyElixir.ExtensionsTest do
              json_response(conn, 202)
   end
 
+  test "delivery api projects persisted tasks with the current tracker issue state" do
+    previous_env =
+      Map.new([:pipeline_database_path, :linear_client_module, :delivery_tracker_result], fn key ->
+        {key, Application.fetch_env(:symphony_elixir, key)}
+      end)
+
+    root = Path.join(System.tmp_dir!(), "symphony-delivery-#{System.unique_integer([:positive])}")
+    path = Path.join(root, "pipeline.sqlite3")
+    File.mkdir_p!(root)
+    Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+    Application.put_env(:symphony_elixir, :linear_client_module, DeliveryTrackerClient)
+
+    on_exit(fn ->
+      File.rm_rf(root)
+
+      Enum.each(previous_env, fn
+        {key, {:ok, value}} -> Application.put_env(:symphony_elixir, key, value)
+        {key, :error} -> Application.delete_env(:symphony_elixir, key)
+      end)
+    end)
+
+    task = %{"issue_id" => "octo/app#7", "phase" => "qa", "status" => "qa"}
+    assert :ok = Store.save_task(task)
+    start_test_endpoint(snapshot_timeout_ms: 50)
+
+    other_issue = %Issue{
+      id: "other/app#7",
+      identifier: "other/app#7",
+      title: "Wrong issue",
+      url: "https://example.org/other/app/issues/7",
+      state: "Ready"
+    }
+
+    current_issue = %Issue{
+      id: "octo/app#7",
+      identifier: "octo/app#7",
+      title: "Current title",
+      url: "https://example.org/octo/app/issues/7",
+      state: "Human Review"
+    }
+
+    Application.put_env(:symphony_elixir, :delivery_tracker_result, {:ok, [other_issue, current_issue]})
+    found = json_response(get(build_conn(), "/api/v1/delivery"), 200)
+    assert_receive {:delivery_tracker_ids, ["octo/app#7"]}
+
+    assert found["tasks"] == [
+             %{
+               "task" => task,
+               "tracker_issue" => %{
+                 "lookup" => "found",
+                 "issue" => %{
+                   "id" => "octo/app#7",
+                   "identifier" => "octo/app#7",
+                   "title" => "Current title",
+                   "url" => "https://example.org/octo/app/issues/7",
+                   "state" => "Human Review"
+                 }
+               }
+             }
+           ]
+
+    Application.put_env(:symphony_elixir, :delivery_tracker_result, {:ok, [other_issue]})
+    missing = json_response(get(build_conn(), "/api/v1/delivery"), 200)
+    assert_receive {:delivery_tracker_ids, ["octo/app#7"]}
+    assert [%{"tracker_issue" => %{"lookup" => "missing", "issue" => nil}}] = missing["tasks"]
+
+    Application.put_env(:symphony_elixir, :delivery_tracker_result, {:error, :tracker_unavailable})
+    errored = json_response(get(build_conn(), "/api/v1/delivery"), 200)
+    assert_receive {:delivery_tracker_ids, ["octo/app#7"]}
+    assert [%{"tracker_issue" => %{"lookup" => "error", "issue" => nil}}] = errored["tasks"]
+  end
+
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
     unavailable_orchestrator = Module.concat(__MODULE__, :UnavailableOrchestrator)
     start_test_endpoint(orchestrator: unavailable_orchestrator, snapshot_timeout_ms: 5)
@@ -499,6 +579,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
     {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Compralaentrada Observability"
     assert html =~ "Operations Dashboard"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"

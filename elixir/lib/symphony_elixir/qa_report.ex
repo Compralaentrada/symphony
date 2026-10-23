@@ -38,16 +38,21 @@ defmodule SymphonyElixir.QAReport do
   def criteria_from_description(_description), do: nil
 
   defp criteria_from_lines(lines) do
-    criteria = Enum.flat_map(lines, &parse_criterion/1)
+    lines
+    |> Enum.chunk_by(&(parse_criterion(&1) != []))
+    |> Enum.flat_map(&criteria_from_chunk/1)
+  end
 
-    if criteria == [] do
-      case lines |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == "")) |> Enum.join(" ") do
-        "" -> []
-        text -> [text]
-      end
-    else
-      criteria
+  defp criteria_from_chunk(chunk) do
+    case Enum.flat_map(chunk, &parse_criterion/1) do
+      [] -> prose_criterion(chunk)
+      criteria -> criteria
     end
+  end
+
+  defp prose_criterion(lines) do
+    text = lines |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == "")) |> Enum.join(" ")
+    if text == "", do: [], else: [text]
   end
 
   defp parse_criterion(line) do

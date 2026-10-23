@@ -96,7 +96,8 @@ else
   gh pr edit --title "$pr_title"
 fi
 
-# Write/edit PR body to match .github/pull_request_template.md before validation.
+# Write/edit the complete PR body to match .github/pull_request_template.md.
+# Include `Fixes #<issue-number>` when merging should close the issue.
 # Example workflow:
 # 1) open the template and draft body content for this PR
 # 2) gh pr edit --body-file /tmp/pr_body.md
