@@ -42,6 +42,11 @@ permissions are restricted by repository, issue, lane, lease, and operation.
 If a claimed issue moves to a configured terminal state, Symphony stops the active agent and cleans
 up its workspace. In GitHub Projects mode, closing the linked GitHub Issue is terminal; Project
 items in Done or Blocked keep their workspace so moving them back to Ready can resume prior work.
+When a successful ID refresh omits a running issue, Symphony keeps the same agent, claim, and
+workspace after the first omission. A visible active refresh clears the counter; a second
+consecutive omission stops the agent and releases its slot while preserving the workspace. Tracker
+read errors do not count as omissions. The log records the issue, consecutive omission count, and
+number of normalized issues returned.
 Before QA or Review starts, Symphony compares the remote PR head and clean workspace with the
 Build-accepted SHA. A missing or changed PR head, a mismatched workspace, or uncommitted workspace
 changes creates a blocker report before the agent starts. When a Blocked item from QA or Review is

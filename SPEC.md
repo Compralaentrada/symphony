@@ -834,8 +834,14 @@ Part B: Tracker state refresh
 - For each running issue:
   - If tracker state is terminal: terminate worker and clean workspace.
   - If tracker state is still active and routable: update the in-memory issue snapshot.
+    - If the issue had prior successful refresh omissions, clear the omission counter and log recovery.
   - If tracker state is active but no longer routable: terminate worker without workspace cleanup.
   - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
+- For each requested ID omitted from a successful refresh, log the issue identifier, consecutive
+  omission count, and number of normalized issues returned. Keep the same agent, claim, slot, and
+  workspace after the first omission. Stop the agent and release its claim and slot after the second
+  consecutive omission, preserving the workspace and remote Project state.
+- A tracker read error does not change omission counts or stop active workers.
 - If state refresh fails, keep workers running and try again on the next tick.
 
 ### 8.6 Startup Terminal Workspace Cleanup
@@ -1896,13 +1902,22 @@ function reconcile_running_issues(state):
     if issue.state in terminal_states:
       state = terminate_running_issue(state, issue.id, cleanup_workspace=true)
     else if issue.state in active_states and issue_routable(issue):
+      misses = get(state.running[issue.id], "consecutive_missing_refreshes", 0)
+      if misses > 0:
+        log_recovery(issue, misses)
+      clear(state.running[issue.id], "consecutive_missing_refreshes")
       state.running[issue.id].issue = issue
     else:
       state = terminate_running_issue(state, issue.id, cleanup_workspace=false)
 
   returned_ids = set(issue.id for issue in refreshed)
   for missing_id in running_ids - returned_ids:
-    state = terminate_running_issue(state, missing_id, cleanup_workspace=false)
+    misses = get(state.running[missing_id], "consecutive_missing_refreshes", 0) + 1
+    log_omission(missing_id, misses, length(refreshed))
+    if misses >= 2:
+      state = terminate_running_issue(state, missing_id, cleanup_workspace=false)
+    else:
+      state.running[missing_id].consecutive_missing_refreshes = misses
 
   return state
 ```
@@ -2142,6 +2157,9 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `dispatchable=false` issues are not eligible
 - Required-label filtering is case-insensitive and applies after adapter normalization
 - Active-state issue refresh updates running entry state
+- One successful ID-refresh omission keeps the same active worker; a second consecutive omission
+  stops it and releases its claim and slot while preserving the workspace
+- A visible active refresh clears the omission counter; tracker errors do not increment it
 - Non-active state stops running agent without workspace cleanup
 - Terminal state stops running agent and cleans workspace
 - Reconciliation with no running issues is a no-op

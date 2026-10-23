@@ -698,7 +698,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "missing running issues stop active agents without cleaning the workspace" do
+  test "two missing running issue refreshes stop the active agent without cleaning the workspace" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -761,6 +761,15 @@ defmodule SymphonyElixir.CoreTest do
         |> Map.put(:claimed, MapSet.new([issue_id]))
         |> Map.put(:retry_attempts, %{})
       end)
+
+      send(pid, :tick)
+      Process.sleep(100)
+      state = :sys.get_state(pid)
+
+      assert state.running[issue_id].pid == agent_pid
+      assert state.running[issue_id].consecutive_missing_refreshes == 1
+      assert MapSet.member?(state.claimed, issue_id)
+      assert Process.alive?(agent_pid)
 
       send(pid, :tick)
       Process.sleep(100)
