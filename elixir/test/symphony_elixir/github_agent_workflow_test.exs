@@ -3,6 +3,7 @@ defmodule SymphonyElixir.GitHubAgentWorkflowTest do
 
   alias SymphonyElixir.GitHub.AgentTool
   alias SymphonyElixir.Pipeline.Store
+  alias SymphonyElixir.PRBody
 
   test "GitHub Issues agents can claim, create a draft PR, and update their report once" do
     initial_state = %{
@@ -103,6 +104,29 @@ defmodule SymphonyElixir.GitHubAgentWorkflowTest do
     report = %{
       "outcome" => "ready",
       "summary" => "Implemented the feature.",
+      "pull_request_body" => """
+      Fixes #42
+
+      #### Context
+
+      Adds the requested feature.
+
+      #### TL;DR
+
+      Adds the feature.
+
+      #### Summary
+
+      - Added the feature.
+
+      #### Alternatives
+
+      - Kept the existing implementation pattern.
+
+      #### Test Plan
+
+      - [x] `mix test`
+      """,
       "criteria" => [],
       "changes" => ["Added the feature."],
       "checks" => [],
@@ -111,7 +135,10 @@ defmodule SymphonyElixir.GitHubAgentWorkflowTest do
       "sha" => String.duplicate("a", 40)
     }
 
-    first = AgentTool.execute("github_workflow", %{"operation" => "handoff", "report" => report}, opts)
+    markdown = "## Implementation report\n\nImplemented the feature.\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
+    handoff = %{"operation" => "handoff", "report" => report, "body" => markdown}
+
+    first = AgentTool.execute("github_workflow", handoff, opts)
 
     Agent.update(state, fn data ->
       update_in(data.pull_requests, fn [pull_request] -> [Map.update!(pull_request, "body", &(&1 <> "\n\nHuman PR note"))] end)
@@ -122,17 +149,29 @@ defmodule SymphonyElixir.GitHubAgentWorkflowTest do
       end)
     end)
 
-    second = AgentTool.execute("github_workflow", %{"operation" => "handoff", "report" => report}, opts)
+    second = AgentTool.execute("github_workflow", handoff, opts)
 
     assert first["success"], first["output"]
     assert second["success"], second["output"]
     assert get_in(first, ["evidence", "pull_request", "draft"])
     assert get_in(first, ["evidence", "pull_request", "head_sha"]) == report["sha"]
     assert length(Agent.get(state, & &1.pull_requests)) == 1
-    assert hd(Agent.get(state, & &1.pull_requests))["body"] =~ "Human PR note"
+    pr_body = hd(Agent.get(state, & &1.pull_requests))["body"]
+    assert String.starts_with?(pr_body, PRBody.delivery_block(report["pull_request_body"]))
+    assert pr_body =~ "Fixes #42"
+    assert pr_body =~ "#### Context"
+    assert pr_body =~ "<!-- symphony:delivery:start -->"
+    assert pr_body =~ "<!-- symphony:delivery:end -->"
+    assert pr_body =~ "Human PR note"
+    refute pr_body =~ "## Acceptance criteria"
     assert Enum.count(Agent.get(state, & &1.comments), &String.contains?(&1["body"] || "", "symphony:report")) == 1
     assert Enum.any?(Agent.get(state, & &1.comments), &(&1["body"] == "Human note"))
     assert Enum.any?(Agent.get(state, & &1.comments), &String.contains?(&1["body"] || "", "Human appendix"))
+    report_comment = Enum.find(Agent.get(state, & &1.comments), &(&1["id"] == "agent-2"))
+
+    assert report_comment["body"] ==
+             "<!-- symphony:report:start:#{issue.id}:1:individual -->\n#{markdown}\n<!-- symphony:report:end -->\n\nHuman appendix"
+
     refute first["output"] =~ "private-token"
 
     assert :ok = Store.end_agent_lease(issue.id, context.lease_token)

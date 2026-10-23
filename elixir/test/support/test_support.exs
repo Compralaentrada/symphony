@@ -72,8 +72,8 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   def required_skill_fixture_hook do
-    "mkdir -p .agents/skills/ponytail .agents/skills/tdd .agents/skills/code-review && " <>
-      "touch .agents/skills/ponytail/SKILL.md .agents/skills/tdd/SKILL.md .agents/skills/code-review/SKILL.md"
+    "mkdir -p .agents/skills/ponytail .agents/skills/tdd .agents/skills/code-review .agents/skills/impeccable .agents/skills/humanizer && " <>
+      "touch .agents/skills/ponytail/SKILL.md .agents/skills/tdd/SKILL.md .agents/skills/code-review/SKILL.md .agents/skills/impeccable/SKILL.md .agents/skills/humanizer/SKILL.md"
   end
 
   def restore_env(key, nil), do: System.delete_env(key)
