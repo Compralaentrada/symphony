@@ -20,6 +20,43 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert MapSet.new(ids) == MapSet.new(Enum.map(issues, & &1.id))
   end
 
+  test "qa-labeled issues start in QA while feature issues keep Build, QA, and Review" do
+    qa_issue = %{issue("octo/app#60", 60) | labels: ["qa"]}
+    feature_issue = %{issue("octo/app#61", 61) | labels: ["feature"]}
+
+    table =
+      start_board([qa_issue, feature_issue], %{
+        qa_issue.id => %{qa: [qa("qa-sha")], review: [review("qa-sha")]},
+        feature_issue.id => %{build: [build("feature-sha", feature_issue.id)], qa: [qa("feature-sha")], review: [review("feature-sha")]}
+      })
+
+    path = pipeline_database!(table, retry_backoff_ms: 300_000)
+    workspace = ensure_test_workspace!(qa_issue)
+    {qa_sha, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: workspace, stderr_to_stdout: true)
+    qa_sha = String.trim(qa_sha)
+
+    :ets.insert(table, {{:remote_sha, qa_issue.id}, qa_sha})
+
+    :ets.insert(
+      table,
+      {{:pull_request, qa_issue.id}, %{number: 160, branch: qa_issue.branch_name, base: "main", sha: qa_sha, draft: true, merged: false, body: "", url: "https://github.com/octo/app/pull/160"}}
+    )
+
+    orchestrator = start_orchestrator()
+
+    assert await(fn ->
+             project_state(table, qa_issue.id) == "Human Review" and
+               project_state(table, feature_issue.id) == "Human Review"
+           end)
+
+    assert report_phases(table, qa_issue.id) == [:qa, :review]
+    assert agent_calls(table, qa_issue.id, :build) == 0
+    assert report_phases(table, feature_issue.id) == [:build, :qa, :review]
+
+    stop_orchestrator(orchestrator)
+    File.rm_rf!(Path.dirname(path))
+  end
+
   test "report locale uses Spanish only for Spanish issue descriptions" do
     for {description, locale} <- [
           {"Implementar soporte para nuevas salas", :es},
@@ -1160,7 +1197,9 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
       |> Map.put("checks", host_checks)
       |> Map.update("findings", check_findings, &(&1 ++ check_findings))
 
-    {:ok, report, host_checks, []}
+    with {:ok, claim} <- workflow(issue, :qa, opts, host_checks, %{"operation" => "claim"}) do
+      {:ok, report, host_checks, [claim]}
+    end
   end
 
   defp prepare_report(table, issue, :review, report, _opts, _workspace),
@@ -1323,13 +1362,15 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
   end
 
   def workflow_operation(context, "claim", _arguments) do
+    target = if context.lane == :qa, do: status_value(:qa), else: status_value(:building)
+
     with :ok <- validate_lease(context),
          issue = context.issue,
          current = fetch_issue(table(), issue.id),
-         true <- current_project_status(current) in [status_value(:ready), status_value(:building)] do
-      current = write_project_status(current, status_value(:building))
+         true <- current_project_status(current) in [status_value(:ready), status_value(:building), target] do
+      current = write_project_status(current, target)
       :ets.insert(table(), {{:issue, issue.id}, current})
-      {:ok, project_item_evidence(issue, current, status_value(:building))}
+      {:ok, project_item_evidence(issue, current, target)}
     else
       false -> {:error, :github_human_decision_changed}
       {:error, _reason} = error -> error

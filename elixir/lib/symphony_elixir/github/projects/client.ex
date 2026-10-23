@@ -405,7 +405,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp dispatch_agent_operation(issue, context, operation, arguments, tracker_settings, settings, request_fun, opts) do
     case operation do
-      "claim" -> agent_claim(issue, tracker_settings, settings, request_fun)
+      "claim" -> agent_claim(issue, context, tracker_settings, settings, request_fun)
       "read_workpad" -> agent_read_workpad(issue, context, settings, request_fun)
       "workpad" -> agent_workpad(issue, arguments, settings, request_fun)
       "handoff" -> agent_handoff(issue, context, arguments, tracker_settings, settings, request_fun)
@@ -887,13 +887,15 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     end
   end
 
-  defp agent_claim(issue, tracker_settings, settings, request_fun) do
+  defp agent_claim(issue, context, tracker_settings, settings, request_fun) do
+    target = if context.lane in [:qa, "qa"], do: settings.statuses.qa, else: settings.statuses.building
+
     with {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
-         :ok <- claimable_project_status(issue, current, settings),
-         :ok <- maybe_set_project_status(current, settings.statuses.building, settings, request_fun),
+         :ok <- claimable_project_status(issue, current, target, settings),
+         :ok <- maybe_set_project_status(current, target, settings, request_fun),
          {:ok, claimed} <- current_project_issue(issue, tracker_settings, request_fun),
-         true <- project_status(claimed) == settings.statuses.building do
-      {:ok, project_evidence(issue, claimed, settings.statuses.building)}
+         true <- project_status(claimed) == target do
+      {:ok, project_evidence(issue, claimed, target)}
     else
       false -> {:error, :github_project_claim_not_verified}
       {:error, _reason} = error -> error
@@ -1429,13 +1431,21 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     end
   end
 
-  defp claimable_project_status(dispatched, current, settings) do
+  defp claimable_project_status(dispatched, current, target, settings) do
     ready = normalize_state(settings.statuses.ready)
     building = normalize_state(settings.statuses.building)
+    qa = normalize_state(settings.statuses.qa)
     dispatched_status = normalize_state(ref_value(dispatched.native_ref || %{}, :project_status))
     current_status = normalize_state(project_status(current))
 
-    if {dispatched_status, current_status} in [{ready, ready}, {ready, building}, {building, building}],
+    allowed_pairs =
+      if normalize_state(target) == qa do
+        [{ready, ready}, {ready, building}, {ready, qa}, {building, building}, {building, qa}, {qa, qa}]
+      else
+        [{ready, ready}, {ready, building}, {building, building}]
+      end
+
+    if {dispatched_status, current_status} in allowed_pairs,
       do: :ok,
       else: {:error, :github_human_decision_changed}
   end

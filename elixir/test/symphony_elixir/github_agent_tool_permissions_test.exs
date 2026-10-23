@@ -10,7 +10,7 @@ defmodule SymphonyElixir.GitHubAgentToolPermissionsTest do
     individual = AgentTool.tool_specs(agent_context(:individual, "auto"))
 
     assert workflow_operations(build) == ["claim", "read_workpad", "workpad", "handoff", "create_follow_up_issue"]
-    assert workflow_operations(qa) == ["read_workpad", "workpad", "handoff", "create_follow_up_issue"]
+    assert workflow_operations(qa) == ["claim", "read_workpad", "workpad", "handoff", "create_follow_up_issue"]
     assert workflow_operations(review) == ["read_workpad", "workpad", "handoff", "create_follow_up_issue", "request_merge"]
     refute "request_merge" in workflow_operations(individual)
     refute "read_workpad" in workflow_operations(individual)

@@ -173,6 +173,51 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert Agent.get(remote_status, & &1) == "Ready"
   end
 
+  test "a direct QA claim moves a Ready Project item to QA" do
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    root = Path.join(System.tmp_dir!(), "symphony-project-qa-claim-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    number = System.unique_integer([:positive])
+    issue_id = "octo/app##{number}"
+    issue = %Issue{id: issue_id, branch_name: "symphony/octo-app-#{number}", state: "Ready", native_ref: %{repository: "octo/app", project_status: "Ready"}}
+    task = %{"issue_id" => issue_id, "generation" => 1, "phase" => "qa", "attempts" => %{"qa" => 1}}
+
+    assert :ok = Store.save_task(task)
+    assert :ok = Store.begin_phase(issue_id, 1, "qa", 1)
+
+    {:ok, remote_status} = Agent.start_link(fn -> "Ready" end)
+
+    request_fun = fn query, _variables, _settings ->
+      if query =~ "updateProjectV2ItemFieldValue" do
+        Agent.update(remote_status, fn _status -> "QA" end)
+        {:ok, %{status: 200, body: %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}}}
+      else
+        status = Agent.get(remote_status, & &1)
+        {:ok, %{status: 200, body: project_response([issue_item("octo/app", number, status)])}}
+      end
+    end
+
+    context = %{issue: issue, lane: :qa, generation: 1, attempt: 1, task: task}
+
+    assert {:ok, %{"project_item" => %{"status" => "QA"}}} =
+             Client.agent_operation(issue, context, "claim", %{},
+               tracker_settings: tracker_settings(),
+               projects_request: request_fun
+             )
+
+    assert Agent.get(remote_status, & &1) == "QA"
+  end
+
   test "Build rejects a malformed PR description before the Projects handoff can write" do
     alias SymphonyElixir.Pipeline.Store
 
