@@ -1528,7 +1528,9 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Stop only for a real external blocker"
     assert prompt =~ "Do not include speculative next steps."
     assert prompt =~ "inspect the relevant skills under `.agents/skills` and `.codex/skills`"
-    assert prompt =~ "Do not approve or merge pull requests."
+    assert prompt =~ "Do not approve pull requests or merge them directly."
+    assert prompt =~ "With `human` policy, leave the PR in Human Review"
+    assert prompt =~ "with `auto`, request merge only through the deterministic gate"
     assert prompt =~ "Follow-up context:"
     assert prompt =~ "follow-up attempt #2"
   end

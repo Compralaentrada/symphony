@@ -144,6 +144,9 @@ describe the supported tracker settings.
 Notes:
 
 - If a value is missing, defaults are used.
+- `merge_policy` accepts `human` (the default) or `auto`; set `auto` explicitly to opt in.
+  A top-level value takes precedence over `tracker.provider.merge_policy`; when omitted, an
+  explicit provider value remains supported. Symphony never approves pull requests automatically.
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
   `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
   `api_key`, `project_slug`, and `assignee` aliases for compatibility.
