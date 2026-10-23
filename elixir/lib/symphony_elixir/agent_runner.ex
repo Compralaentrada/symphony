@@ -676,7 +676,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp pipeline_phase_instructions(:qa, _opts) do
     """
-    Pipeline phase: independent QA. Read the issue's workpad and current-generation Build reports with `github_workflow` operation `read_workpad`; use the saved task records to identify the accepted commit, branch, required checks, and prior findings.
+    Pipeline phase: independent QA. Before any other GitHub write, call `github_workflow` with operation `claim`; stop if the claim is rejected. This moves a requeued Ready item to QA and confirms an item already in QA. Then read the issue's workpad and current-generation Build reports with `github_workflow` operation `read_workpad`; use the saved task records to identify the accepted commit, branch, required checks, and prior findings.
     Symphony runs the configured host checks on the accepted SHA. `read_workpad` returns the authoritative `report_context.host_checks`, required checks, and locale-specific canonical QA text; copy the checks exactly into your report and hidden JSON. Do not modify files or invent check results. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings.
     Update the persistent workpad with QA evidence and findings using `github_workflow` operation `workpad`.
     Call `github_workflow` with operation `handoff`, your QA report, and the complete Markdown body. Choose the outcome using the required checks and authoritative host evidence in `report_context`; use its canonical QA text when Symphony's check or finding rules change the summary, reason, or next step. Symphony advances only when every required check passed. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
@@ -685,7 +685,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp pipeline_phase_instructions(:review, _opts) do
     """
-    Pipeline phase: autonomous code review. Read the issue's workpad and all current-generation QA reports with `github_workflow` operation `read_workpad` before reviewing. Use those task records and `report_context.task` to identify the accepted commit, branch, QA findings, and findings to resolve. Include the task's branch, base branch, PR number, and current SHA in your report, plus every prior finding not explicitly resolved.
+    Pipeline phase: autonomous code review. Before any other GitHub write, call `github_workflow` with operation `claim`; stop if the claim is rejected. This moves a requeued Ready item to Review and confirms an item already in Review. Then read the issue's workpad and all current-generation QA reports with `github_workflow` operation `read_workpad` before reviewing. Use those task records and `report_context.task` to identify the accepted commit, branch, QA findings, and findings to resolve. Include the task's branch, base branch, PR number, and current SHA in your report, plus every prior finding not explicitly resolved.
     Use the QA report's host-check evidence for its recorded SHA; do not require a separate GitHub status context for Symphony's host-run check.
     Do not invoke the repository's `code-review` skill or its Markdown report format; perform this review directly under the pipeline's JSON contract.
     The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.

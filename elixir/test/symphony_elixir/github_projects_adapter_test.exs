@@ -743,8 +743,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       identifier: issue_id,
       url: "https://github.com/octo/app/issues/#{number}",
       branch_name: "symphony/octo-app-#{number}",
-      state: "QA",
-      native_ref: %{repository: "octo/app", base_branch: "main", project_status: "QA", issue_node_id: "I_issue_#{number}"}
+      state: "Ready",
+      native_ref: %{repository: "octo/app", base_branch: "main", project_status: "Ready", issue_node_id: "I_issue_#{number}"}
     }
 
     task = %{
@@ -761,7 +761,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert :ok = Store.save_task(task)
     assert :ok = Store.begin_phase(issue_id, 1, "qa", 1)
 
-    {:ok, remote} = Agent.start_link(fn -> %{status: "QA", report_body: nil} end)
+    {:ok, remote} = Agent.start_link(fn -> %{status: "Ready", report_body: nil} end)
 
     request_fun = fn query, variables, _settings ->
       Agent.get_and_update(remote, fn data ->
@@ -800,7 +800,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
           query =~ "SymphonySetProjectStatus" ->
             body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
-            {{:ok, %{status: 200, body: body}}, %{data | status: "Building"}}
+            status = %{"option-qa" => "QA", "option-building" => "Building"}[variables["optionId"]]
+            {{:ok, %{status: 200, body: body}}, %{data | status: status}}
 
           true ->
             flunk("unexpected GitHub Projects query: #{query}")
@@ -830,6 +831,19 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       host_checks: [%{"name" => "mix test", "status" => "passed", "evidence" => "exit status 0"}],
       tracker_kind: "github_projects"
     }
+
+    claim =
+      AgentTool.execute(
+        "github_workflow",
+        %{"operation" => "claim"},
+        agent_context: context,
+        tracker_settings: tracker_settings(),
+        projects_request: request_fun
+      )
+
+    assert claim["success"], claim["output"]
+    assert claim["evidence"]["project_item"]["status"] == "QA"
+    assert Agent.get(remote, & &1.status) == "QA"
 
     handoff =
       AgentTool.execute(
@@ -946,11 +960,11 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       identifier: issue_id,
       url: "https://github.com/octo/app/issues/#{number}",
       branch_name: "symphony/octo-app-#{number}",
-      state: "Review",
+      state: "Ready",
       native_ref: %{
         repository: "octo/app",
         base_branch: "main",
-        project_status: "Review",
+        project_status: "Ready",
         issue_node_id: "I_issue_#{number}"
       }
     }
@@ -967,9 +981,9 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     assert :ok = Store.save_task(task)
     assert :ok = Store.begin_phase(issue_id, 1, "review", 1)
-    {:ok, remote} = Agent.start_link(fn -> %{status: "Review", draft: false} end)
+    {:ok, remote} = Agent.start_link(fn -> %{status: "Ready", draft: false} end)
 
-    request_fun = fn query, _variables, _settings ->
+    request_fun = fn query, variables, _settings ->
       Agent.get_and_update(remote, fn data ->
         cond do
           query =~ "SymphonyProject(" ->
@@ -1018,7 +1032,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
           query =~ "SymphonySetProjectStatus" ->
             body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
-            {{:ok, %{status: 200, body: body}}, %{data | status: "Building"}}
+            status = %{"option-review" => "Review", "option-building" => "Building"}[variables["optionId"]]
+            {{:ok, %{status: 200, body: body}}, %{data | status: status}}
 
           true ->
             flunk("unexpected GitHub Projects query: #{query}")
@@ -1041,7 +1056,20 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     markdown = "## Review report\n\nReview found a defect.\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
 
-    context = %{issue: issue, lane: :review, generation: 1, attempt: 1, task: task}
+    context = %{issue: issue, lane: :review, generation: 1, attempt: 1, task: task, tracker_kind: "github_projects"}
+
+    claim =
+      AgentTool.execute(
+        "github_workflow",
+        %{"operation" => "claim"},
+        agent_context: context,
+        tracker_settings: tracker_settings(),
+        projects_request: request_fun
+      )
+
+    assert claim["success"], claim["output"]
+    assert claim["evidence"]["project_item"]["status"] == "Review"
+    assert Agent.get(remote, & &1.status) == "Review"
 
     assert {:ok,
             %{
