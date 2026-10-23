@@ -58,7 +58,9 @@ If Codex reports that operator input, approval, or MCP elicitation is required, 
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. For the durable
 Projects pipeline, phase checkpoints and external-operation records are stored in SQLite at
 `~/.symphony/pipeline.sqlite3`; GitHub agent writes are verified remotely before Symphony advances
-the checkpoint. After the independent QA review, Symphony runs every `required_checks` command from
+the checkpoint. If a nonterminal checkpoint no longer matches the tracker state, Symphony records a
+local blocker with the reason and leaves the tracker unchanged; moving the item to Ready resumes the
+preserved work. After the independent QA review, Symphony runs every `required_checks` command from
 the repository profile in the task workspace and gives the evidence to the QA agent; missing or
 failed host checks cannot pass QA.
 A merge into the configured base branch is required before Symphony sets Done. Moving a Human Review

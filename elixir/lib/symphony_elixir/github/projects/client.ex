@@ -904,10 +904,11 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     lane = to_string(context.lane)
     report = normalize_report(Map.get(arguments, "report"))
     outcome = Map.get(arguments, "outcome") || report["outcome"]
-    report = report |> Map.put("outcome", outcome) |> normalize_agent_report(lane, context)
-    body = Map.get(arguments, "body")
+    submitted_report = Map.put(report, "outcome", outcome)
+    report = normalize_agent_report(submitted_report, lane, context)
 
-    with :ok <- validate_agent_pr_body(lane, report, issue),
+    with {:ok, body} <- AgentReport.normalize_body(Map.get(arguments, "body"), report, submitted_report),
+         :ok <- validate_agent_pr_body(lane, report, issue),
          :ok <- AgentReport.validate_body(body, report),
          {:ok, status} <- handoff_status(lane, report, settings),
          {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),

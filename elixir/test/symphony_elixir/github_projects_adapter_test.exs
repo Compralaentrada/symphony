@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.GitHubProjectsAdapterTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.GitHub.{AgentTool, Projects.Adapter, Projects.Client}
+  alias SymphonyElixir.GitHub.{AgentReport, AgentTool, Projects.Adapter, Projects.Client}
   alias SymphonyElixir.GitHubProjectsAdapterTest.FakeGitHubProjectsClient
   alias SymphonyElixir.Pipeline.Store
 
@@ -816,7 +816,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "findings" => [finding],
       "next_step" => "Fix the defect.",
       "sha" => sha,
-      "checks" => [%{"name" => "mix test", "status" => "passed", "evidence" => "exit status 0"}]
+      "checks" => [%{"name" => "mix test", "status" => "failed", "evidence" => "stale agent result"}]
     }
 
     markdown = "## QA report\n\nQA found a defect.\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
@@ -845,8 +845,11 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     assert Agent.get(remote, & &1.status) == "Building"
 
-    assert Agent.get(remote, & &1.report_body) ==
-             "<!-- symphony:report:start:#{issue_id}:1:qa:1 -->\n#{markdown}\n<!-- symphony:report:end -->"
+    stored_comment = Agent.get(remote, & &1.report_body)
+    assert stored_comment =~ "<!-- symphony:report:start:#{issue_id}:1:qa:1 -->"
+    assert stored_comment =~ "## QA report\n\nQA found a defect.\n\n"
+    assert {:ok, stored_report} = AgentReport.decode_comment(stored_comment)
+    assert stored_report["checks"] == context.host_checks
 
     workpad_result =
       AgentTool.execute(
@@ -862,28 +865,6 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert workpad["report_context"]["task"]["required_checks"] == ["mix test"]
     assert workpad["report_context"]["host_checks"] == context.host_checks
     assert workpad["report_context"]["qa_text"]["checks_failed"] == "One or more required host checks failed or were missing."
-
-    mismatched =
-      AgentTool.execute(
-        "github_workflow",
-        %{
-          "operation" => "handoff",
-          "outcome" => "defects_found",
-          "report" => report,
-          "body" =>
-            String.replace(
-              markdown,
-              Jason.encode!(report, pretty: true),
-              Jason.encode!(Map.put(report, "summary", "Different hidden summary."), pretty: true)
-            )
-        },
-        agent_context: context,
-        tracker_settings: tracker_settings(),
-        projects_request: fn _query, _variables, _settings -> flunk("invalid reports must fail before GitHub writes") end
-      )
-
-    refute mismatched["success"]
-    assert Jason.decode!(mismatched["output"])["error"]["reason"] == ":github_agent_report_json_mismatch"
 
     visible_json =
       AgentTool.execute(
@@ -918,15 +899,28 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     for {body, current_report, reason} <- [
           {nil, report, :invalid_github_agent_report_body},
           {"## QA report\n\nText only.", report, :missing_github_agent_report_json},
-          {markdown <> "\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->", report, :invalid_github_agent_report_json},
-          {"## QA report\n\n<!-- symphony:report:json\nnot JSON\n-->", report, :invalid_github_agent_report_json},
-          {"## QA report\n\n<!-- symphony:report:json\n#{unsafe_json}\n-->", unsafe_report, :unsafe_github_agent_report_json}
+          {markdown <> "\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->", report, :invalid_github_agent_report_json}
         ] do
       invalid = invalid_handoff.(body, current_report)
 
       refute invalid["success"]
       assert Jason.decode!(invalid["output"])["error"]["reason"] == ":#{reason}"
     end
+
+    unsafe_body = "## QA report\n\n<!-- symphony:report:json\n#{unsafe_json}\n-->"
+    assert {:error, :unsafe_github_agent_report_json} = AgentReport.validate_body(unsafe_body, unsafe_report)
+    assert {:ok, safe_body} = AgentReport.normalize_body(unsafe_body, unsafe_report)
+    assert safe_body =~ "--\\u003e"
+    assert :ok = AgentReport.validate_body(safe_body, unsafe_report)
+    assert {:error, :invalid_github_agent_report_body} = AgentReport.validate_body(nil, report)
+    assert {:error, :invalid_github_agent_report_body} = AgentReport.normalize_body(nil, report)
+
+    duplicate_blocks = "<!-- symphony:report:json\n{}\n-->\n<!-- symphony:report:json\n{}\n-->"
+    assert {:error, :missing_github_agent_report_json} = AgentReport.validate_body("plain text", report)
+    assert {:error, :invalid_github_agent_report_json} = AgentReport.validate_body(duplicate_blocks, report)
+
+    assert {:error, :invalid_github_agent_report_json} =
+             AgentReport.normalize_body(unsafe_body, Map.put(unsafe_report, "unsupported", self()))
   end
 
   test "Review defects return the Project item to Building" do

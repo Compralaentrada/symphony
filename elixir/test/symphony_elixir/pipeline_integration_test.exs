@@ -20,6 +20,48 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert MapSet.new(ids) == MapSet.new(Enum.map(issues, & &1.id))
   end
 
+  test "pipeline reconciliation blocks a Build checkpoint that conflicts with QA until the item is Ready" do
+    issue = issue("octo/app#22", 22)
+    issue = %{issue | state: "QA", native_ref: Map.put(issue.native_ref, :project_status, "QA")}
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+
+    task = %{
+      "issue_id" => issue.id,
+      "repository" => "octo/app",
+      "branch" => issue.branch_name,
+      "base_branch" => "main",
+      "required_checks" => ["true"],
+      "generation" => 1,
+      "phase" => "build",
+      "status" => "building",
+      "attempts" => %{},
+      "prior_findings" => [],
+      "current_sha" => nil,
+      "pr_number" => nil
+    }
+
+    assert :ok = Store.save_task(task)
+    assert :ignore = Pipeline.prepare(issue)
+    assert {:ok, %{"status" => "blocked", "blocked_reason" => reason}} = Store.get_task(issue.id)
+    assert reason =~ "checkpoint is Build"
+    assert :ok = Store.save_task(task)
+    assert :ok = Pipeline.reconcile()
+
+    assert {:ok, %{"status" => "blocked", "blocked_reason" => reason}} = Store.get_task(issue.id)
+    assert reason =~ "checkpoint is Build"
+    assert reason =~ "tracker state is QA"
+    assert project_state(table, issue.id) == "QA"
+
+    ready_issue = %{issue | state: "Ready", requeueable: true, native_ref: Map.put(issue.native_ref, :project_status, "Ready")}
+    :ets.insert(table, {{:issue, issue.id}, ready_issue})
+
+    assert {:ok, %{"status" => "building", "phase" => "build"} = resumed, "build"} =
+             Pipeline.prepare(ready_issue)
+
+    refute Map.has_key?(resumed, "blocked_reason")
+  end
+
   test "report locale uses Spanish only for Spanish issue descriptions" do
     for {description, locale} <- [
           {"Implementar soporte para nuevas salas", :es},

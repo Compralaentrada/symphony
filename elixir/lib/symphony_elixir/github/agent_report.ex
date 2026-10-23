@@ -18,6 +18,57 @@ defmodule SymphonyElixir.GitHub.AgentReport do
   def validate_body(_body, _report), do: {:error, :invalid_github_agent_report_body}
 
   @doc false
+  @spec normalize_body(term(), map()) :: {:ok, String.t()} | {:error, term()}
+  def normalize_body(body, report) when is_binary(body) and is_map(report),
+    do: normalize_body(body, report, report)
+
+  def normalize_body(_body, _report), do: {:error, :invalid_github_agent_report_body}
+
+  @doc false
+  @spec normalize_body(term(), map(), map()) :: {:ok, String.t()} | {:error, term()}
+  def normalize_body(body, report, submitted_report)
+      when is_binary(body) and is_map(report) and is_map(submitted_report) do
+    case {json_marker_count(body), Regex.scan(@json_block, body, capture: :all_but_first)} do
+      {1, [[_json]]} ->
+        normalize_report_body(body, report, submitted_report)
+
+      {0, []} ->
+        {:error, :missing_github_agent_report_json}
+
+      _ ->
+        {:error, :invalid_github_agent_report_json}
+    end
+  end
+
+  def normalize_body(_body, _report, _submitted_report), do: {:error, :invalid_github_agent_report_body}
+
+  defp normalize_report_body(body, report, submitted_report) do
+    if visible_report_json?(body, report) or visible_report_json?(body, submitted_report) do
+      {:error, :visible_github_agent_report_json}
+    else
+      normalize_report_json(body, report)
+    end
+  end
+
+  defp normalize_report_json(body, report) do
+    case validate_body(body, report) do
+      :ok ->
+        {:ok, body}
+
+      _ ->
+        case Jason.encode(report, pretty: true) do
+          {:ok, json} ->
+            json = String.replace(json, "-->", "--\\u003e")
+            normalized_block = @json_marker <> "\n" <> json <> "\n-->"
+            {:ok, Regex.replace(@json_block, body, fn _match -> normalized_block end, global: false)}
+
+          _ ->
+            {:error, :invalid_github_agent_report_json}
+        end
+    end
+  end
+
+  @doc false
   @spec comment_body(String.t(), String.t()) :: String.t()
   def comment_body(marker, body), do: marker <> "\n" <> body <> "\n" <> @report_end
 
