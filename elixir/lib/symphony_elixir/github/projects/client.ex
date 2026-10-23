@@ -116,14 +116,6 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   }
   """
 
-  @merge_mutation """
-  mutation SymphonyPipelineMergePullRequest($pullRequestId: ID!, $expectedHeadOid: GitObjectID!) {
-    mergePullRequest(input: { pullRequestId: $pullRequestId, expectedHeadOid: $expectedHeadOid }) {
-      pullRequest { id number url mergedAt baseRefName headRefOid }
-    }
-  }
-  """
-
   @close_issue_mutation """
   mutation SymphonyPipelineCloseIssue($issueId: ID!) {
     closeIssue(input: { issueId: $issueId }) { issue { id state stateReason url } }
@@ -1530,13 +1522,11 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          :ok <- ensure_merge_checks(task),
          {:ok, data} <- graphql(request_fun, @merge_query, variables, settings),
          %{} = pr <- find_pull_request(data, branch, base),
-         :ok <- merge_gate(pr, task, get_in(data, ["repository", "ref", "target", "oid"])),
-         :ok <- merge_if_open(pr, task, settings, request_fun),
-         {:ok, merged_pr} <- confirmed_merged_pull_request(issue, branch, base, settings, request_fun) do
+         :ok <- merge_gate(pr, task, get_in(data, ["repository", "ref", "target", "oid"])) do
       {:ok,
        %{
-         "outcome" => "merged",
-         "pull_request" => pr_evidence(merged_pr),
+         "outcome" => "passed",
+         "pull_request" => %{"head_sha" => pr["headRefOid"], "base_sha" => pr["baseRefOid"]},
          "sha" => task["current_sha"]
        }}
     else
@@ -1562,41 +1552,46 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp merge_gate(pr, task, current_base_sha) do
+    head_sha = task["current_sha"]
+
+    with :ok <- validate_merge_shas(head_sha, current_base_sha),
+         :ok <- validate_merge_identity(pr, head_sha, current_base_sha),
+         :ok <- validate_github_checks(pr) do
+      validate_merge_state(pr)
+    end
+  end
+
+  defp validate_merge_shas(head_sha, base_sha) do
     cond do
-      pr["headRefOid"] != task["current_sha"] -> {:error, :pull_request_head_sha_mismatch}
-      pr["baseRefOid"] != current_base_sha -> {:error, :pull_request_base_sha_mismatch}
-      get_in(pr, ["statusCheckRollup", "state"]) != "SUCCESS" -> {:error, :required_github_checks_not_passed}
+      not sha_available?(head_sha) -> {:error, :pull_request_head_sha_unavailable}
+      not sha_available?(base_sha) -> {:error, :pull_request_base_sha_unavailable}
+      true -> :ok
+    end
+  end
+
+  defp validate_merge_identity(pr, head_sha, base_sha) do
+    cond do
+      pr["headRefOid"] != head_sha -> {:error, :pull_request_head_sha_mismatch}
+      pr["baseRefOid"] != base_sha -> {:error, :pull_request_base_sha_mismatch}
+      true -> :ok
+    end
+  end
+
+  defp validate_github_checks(pr) do
+    if get_in(pr, ["statusCheckRollup", "state"]) == "SUCCESS",
+      do: :ok,
+      else: {:error, :required_github_checks_not_passed}
+  end
+
+  defp validate_merge_state(pr) do
+    cond do
       pr["state"] == "MERGED" and is_binary(pr["mergedAt"]) -> :ok
       pr["state"] == "OPEN" and pr["isDraft"] == false -> :ok
       true -> {:error, :pull_request_not_mergeable}
     end
   end
 
-  defp merge_if_open(%{"state" => "MERGED"}, _task, _settings, _request_fun), do: :ok
-
-  defp merge_if_open(pr, task, settings, request_fun) do
-    with {:ok, data} <-
-           graphql(
-             request_fun,
-             @merge_mutation,
-             %{"pullRequestId" => pr["id"], "expectedHeadOid" => task["current_sha"]},
-             settings
-           ),
-         %{"pullRequest" => %{"mergedAt" => merged_at}} when is_binary(merged_at) <- data["mergePullRequest"] do
-      :ok
-    else
-      {:error, _reason} = error -> error
-      _ -> {:error, :pull_request_merge_not_confirmed}
-    end
-  end
-
-  defp confirmed_merged_pull_request(issue, branch, base, settings, request_fun) do
-    case pull_request(issue, settings, request_fun) do
-      {:ok, %{merged: true, branch: ^branch, base: ^base} = pr} -> {:ok, pr}
-      {:ok, _} -> {:error, :pull_request_merge_not_confirmed}
-      {:error, _reason} = error -> error
-    end
-  end
+  defp sha_available?(sha), do: is_binary(sha) and sha != ""
 
   defp close_merged_issue(issue, settings, request_fun) do
     if issue.state == "closed" do
