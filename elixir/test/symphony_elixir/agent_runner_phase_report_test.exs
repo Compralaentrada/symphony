@@ -621,6 +621,15 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       trace_file = Path.join(test_root, "codex-input.trace")
       File.mkdir_p!(test_root)
 
+      source_repo = Path.join(test_root, "source")
+      File.mkdir_p!(source_repo)
+      git!(source_repo, ["init", "-b", "main"])
+      git!(source_repo, ["config", "user.name", "Test User"])
+      git!(source_repo, ["config", "user.email", "test@example.com"])
+      File.write!(Path.join(source_repo, "BASE"), "base")
+      git!(source_repo, ["add", "BASE"])
+      git!(source_repo, ["commit", "-m", "main"])
+
       report = %{
         "outcome" => "merged",
         "summary" => "The merged pull request is confirmed.",
@@ -687,8 +696,14 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         title: "Confirm merged delivery",
         description: "Verify the human-merged pull request.",
         state: "closed",
+        branch_name: "symphony/octo-app-107",
         url: "https://github.com/octo/app/issues/107",
-        labels: ["backend"]
+        labels: ["backend"],
+        native_ref: %{
+          repository: "octo/app",
+          base_branch: "main",
+          prepare_command: "git clone --quiet '#{source_repo}' ."
+        }
       }
 
       assert %{"outcome" => "merged", "sha" => sha} =
@@ -697,7 +712,8 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
                  branch: "symphony/octo-app-107",
                  base_branch: "main",
                  pr_number: 107,
-                 sha: report["sha"]
+                 sha: report["sha"],
+                 pipeline_task: %{"pr_number" => 107}
                )
 
       assert sha == report["sha"]

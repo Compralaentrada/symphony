@@ -47,7 +47,7 @@ defmodule SymphonyElixir.AgentRunner do
     has_pull_request? = is_map(task) and not is_nil(Map.get(task, "pr_number"))
 
     workspace_opts = [
-      require_existing_project_branch: has_pull_request? and not diagnostic?,
+      require_existing_project_branch: has_pull_request? and phase_with_pr?(opts) and not diagnostic?,
       create_project_branch: not diagnostic?,
       refresh_project_branch: refresh_project_branch?
     ]

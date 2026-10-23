@@ -1483,7 +1483,7 @@ defmodule SymphonyElixir.Orchestrator do
     terminal_states = terminal_state_set()
 
     cond do
-      terminal_issue_state?(issue.state, terminal_states) ->
+      terminal_issue_state?(issue.state, terminal_states) and not pending_finalization_issue?(issue) ->
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
         cleanup_issue_workspace(issue, metadata)
