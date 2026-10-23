@@ -7,6 +7,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   alias SymphonyElixir.GitHub.AgentReport
   alias SymphonyElixir.Pipeline.Findings
   alias SymphonyElixir.Pipeline.Store
+  alias SymphonyElixir.PRBody
   alias SymphonyElixir.Tracker.Issue
 
   @default_graphql_url "https://api.github.com/graphql"
@@ -906,7 +907,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     report = report |> Map.put("outcome", outcome) |> normalize_agent_report(lane, context)
     body = Map.get(arguments, "body")
 
-    with :ok <- AgentReport.validate_body(body, report),
+    with :ok <- validate_agent_pr_body(lane, report, issue),
+         :ok <- AgentReport.validate_body(body, report),
          {:ok, status} <- handoff_status(lane, report, settings),
          {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
          :ok <- handoff_source_status(lane, current, status, settings),
@@ -930,6 +932,11 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
        }}
     end
   end
+
+  defp validate_agent_pr_body(lane, %{"outcome" => "ready"} = report, issue) when lane in ["build", "individual"],
+    do: PRBody.validate_agent_body(report["pull_request_body"], issue.id)
+
+  defp validate_agent_pr_body(_lane, _report, _issue), do: :ok
 
   defp handoff_status("build", %{"outcome" => "ready"}, settings), do: {:ok, settings.statuses.qa}
   defp handoff_status("build", %{"outcome" => outcome}, settings) when outcome in ["blocked", "no_changes"], do: {:ok, settings.statuses.blocked}
@@ -1041,7 +1048,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     profile = profile_for_issue(issue, settings)
     branch = task["branch"] || issue.branch_name
     base = task["base_branch"] || profile.base_branch
-    body = delivery_body(issue, report)
+    body = delivery_body(report)
 
     with :ok <- validate_handoff_source_for_lane(lane, issue, tracker_settings, settings, request_fun),
          :ok <- validate_pipeline_delivery(issue, branch, sha, settings, request_fun),
@@ -1482,34 +1489,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp required_checks_passed?(_required, _checks), do: false
 
-  defp delivery_body(issue, report) do
-    """
-    <!-- symphony:delivery:start -->
-    Issue: #{issue.url}
-
-    ## Summary
-    #{report["summary"] || "Build completed."}
-
-    ## Acceptance criteria
-    #{markdown_items(report["criteria"])}
-
-    ## Changes
-    #{markdown_items(report["changes"])}
-
-    ## Checks
-    #{markdown_items(report["checks"])}
-
-    ## Build SHA
-    `#{report["sha"]}`
-    <!-- symphony:delivery:end -->
-    """
-    |> String.trim()
-  end
-
-  defp markdown_items(items) when is_list(items) and items != [],
-    do: Enum.map_join(items, "\n", &("- " <> if(is_binary(&1), do: &1, else: Jason.encode!(&1))))
-
-  defp markdown_items(_items), do: "- None reported."
+  defp delivery_body(report), do: PRBody.delivery_block(report["pull_request_body"])
 
   defp validate_merge_policy(nil), do: :ok
   defp validate_merge_policy(value) when value in ["human", "auto"], do: :ok
@@ -1562,10 +1542,39 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp merge_gate(pr, task, current_base_sha) do
+    head_sha = task["current_sha"]
+
+    with :ok <- validate_merge_shas(head_sha, current_base_sha),
+         :ok <- validate_merge_identity(pr, head_sha, current_base_sha),
+         :ok <- validate_github_checks(pr) do
+      validate_merge_state(pr)
+    end
+  end
+
+  defp validate_merge_shas(head_sha, base_sha) do
     cond do
-      pr["headRefOid"] != task["current_sha"] -> {:error, :pull_request_head_sha_mismatch}
-      pr["baseRefOid"] != current_base_sha -> {:error, :pull_request_base_sha_mismatch}
-      get_in(pr, ["statusCheckRollup", "state"]) != "SUCCESS" -> {:error, :required_github_checks_not_passed}
+      not sha_available?(head_sha) -> {:error, :pull_request_head_sha_unavailable}
+      not sha_available?(base_sha) -> {:error, :pull_request_base_sha_unavailable}
+      true -> :ok
+    end
+  end
+
+  defp validate_merge_identity(pr, head_sha, base_sha) do
+    cond do
+      pr["headRefOid"] != head_sha -> {:error, :pull_request_head_sha_mismatch}
+      pr["baseRefOid"] != base_sha -> {:error, :pull_request_base_sha_mismatch}
+      true -> :ok
+    end
+  end
+
+  defp validate_github_checks(pr) do
+    if get_in(pr, ["statusCheckRollup", "state"]) == "SUCCESS",
+      do: :ok,
+      else: {:error, :required_github_checks_not_passed}
+  end
+
+  defp validate_merge_state(pr) do
+    cond do
       pr["state"] == "MERGED" and is_binary(pr["mergedAt"]) -> :ok
       pr["state"] == "OPEN" and pr["isDraft"] == false -> :ok
       true -> {:error, :pull_request_not_mergeable}
@@ -1597,6 +1606,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       {:error, _reason} = error -> error
     end
   end
+
+  defp sha_available?(sha), do: is_binary(sha) and sha != ""
 
   defp close_merged_issue(issue, settings, request_fun) do
     if issue.state == "closed" do
@@ -1939,15 +1950,15 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp create_pull_request(issue, repository, attrs, settings, request_fun) do
     variables = %{"owner" => repository.owner, "name" => repository.name}
 
-    with {:ok, data} <- graphql(request_fun, @repository_query, variables, settings),
+    with body when is_binary(body) and byte_size(body) in 1..60_000 <- attrs[:body],
+         {:ok, data} <- graphql(request_fun, @repository_query, variables, settings),
          repository_id when is_binary(repository_id) <- get_in(data, ["repository", "id"]),
-         {:ok, issue_ref} <- issue_repository_and_number(issue),
          input = %{
            "repositoryId" => repository_id,
            "baseRefName" => attrs.base,
            "headRefName" => attrs.branch,
            "title" => issue.title,
-           "body" => attrs[:body] || "Fixes ##{issue_ref["number"]}\n\nCreated by Symphony after the Build phase.",
+           "body" => body,
            "draft" => true
          },
          {:ok, created} <- graphql(request_fun, @create_pull_request_mutation, %{"input" => input}, settings),
@@ -1955,6 +1966,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       {:ok, normalize_pull_request(pr)}
     else
       {:error, _reason} = error -> error
+      body when not is_binary(body) -> {:error, :github_pull_request_body_required}
+      body when is_binary(body) and byte_size(body) not in 1..60_000 -> {:error, :github_pull_request_body_required}
       _ -> {:error, {:github_projects_api_error, "GitHub did not create the pipeline pull request."}}
     end
   end

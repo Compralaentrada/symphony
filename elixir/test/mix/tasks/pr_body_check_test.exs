@@ -28,6 +28,8 @@ defmodule Mix.Tasks.PrBody.CheckTest do
   """
 
   @valid_body """
+  Fixes #42
+
   #### Context
 
   Context text.
@@ -190,6 +192,32 @@ defmodule Mix.Tasks.PrBody.CheckTest do
         end)
 
       assert error_output =~ "Section cannot be empty: #### Context"
+    end)
+  end
+
+  test "accepts a template body inside the Symphony-owned delivery block" do
+    in_temp_repo(fn ->
+      write_template!(@template)
+
+      File.write!("body.md", "<!-- symphony:delivery:start -->\n#{@valid_body}\n<!-- symphony:delivery:end -->")
+
+      assert capture_io(fn -> Check.run(["lint", "--file", "body.md"]) end) =~ "PR body format OK"
+    end)
+  end
+
+  test "requires a GitHub issue reference" do
+    in_temp_repo(fn ->
+      write_template!(@template)
+      File.write!("body.md", String.replace(@valid_body, "Fixes #42\n\n", ""))
+
+      error_output =
+        capture_io(:stderr, fn ->
+          assert_raise Mix.Error, ~r/PR body format invalid/, fn ->
+            Check.run(["lint", "--file", "body.md"])
+          end
+        end)
+
+      assert error_output =~ "Include Fixes, Closes, Resolves, or Related to #<number>."
     end)
   end
 

@@ -47,7 +47,7 @@ defmodule SymphonyElixir.AgentRunner do
     has_pull_request? = is_map(task) and not is_nil(Map.get(task, "pr_number"))
 
     workspace_opts = [
-      require_existing_project_branch: has_pull_request? and not diagnostic?,
+      require_existing_project_branch: has_pull_request? and phase_with_pr?(opts) and not diagnostic?,
       create_project_branch: not diagnostic?,
       refresh_project_branch: refresh_project_branch?
     ]
@@ -297,11 +297,7 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    selected_repo_skills =
-      if is_nil(worker_host) do
-        skills = Skills.select(issue)
-        if Keyword.has_key?(opts, :phase), do: List.delete(skills, "code-review"), else: skills
-      end
+    selected_repo_skills = Skills.select(issue, selected_skill_phase(opts))
 
     opts = Keyword.put(opts, :selected_repo_skills, selected_repo_skills)
 
@@ -315,7 +311,7 @@ defmodule SymphonyElixir.AgentRunner do
     opts = Keyword.put(opts, :report_locale, Pipeline.report_locale(issue))
     agent_context = github_agent_context(issue, opts)
 
-    with :ok <- ensure_skills_available(workspace, issue, worker_host),
+    with :ok <- ensure_skills_available(workspace, issue, opts, worker_host),
          {:ok, session} <-
            AppServer.start_session(
              workspace,
@@ -477,7 +473,7 @@ defmodule SymphonyElixir.AgentRunner do
         "\n\n" <>
           phase_instructions(phase, opts) <>
           "\nEvery GitHub `handoff` must include the structured `report` and the complete human-readable Markdown comment in `body`. Put the report JSON only in one hidden HTML comment: `<!-- symphony:report:json` on its own line, the JSON object, then `-->` on its own line. Escape any `-->` inside JSON string values as `--\\u003e` so the HTML comment stays hidden. Its decoded object must exactly match `report`, including the handoff outcome and any phase-specific report fields your instructions require you to copy from `read_workpad`'s `report_context`. Keep the rest of the comment readable Markdown." <>
-          "\nUse the Humanizer guidance for report values. Write report values in #{report_language} (Spanish only for Spanish issues; English otherwise). Keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details." <>
+          "\nWrite report values in #{report_language} (Spanish only for Spanish issues; English otherwise). Keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details." <>
           "\nThe phase report JSON contract overrides any skill's preferred presentation format."
       )
 
@@ -570,9 +566,10 @@ defmodule SymphonyElixir.AgentRunner do
     Then read the issue's workpad and current-generation phase reports with `github_workflow` operation `read_workpad` before editing. Use those task records for prior findings and decisions. Work on the branch already checked out for this task and push your work to origin.
     Implement the issue using the accepted task context recorded on the issue. Copy branch, base branch, and required checks from `read_workpad`'s `report_context.task` into your report; include the pushed SHA.
     Before editing, create or update the persistent issue workpad with `github_workflow` operation `workpad` and record the plan.
-    After pushing, call `github_workflow` with operation `handoff`, outcome `ready`, and your complete report and Markdown body; the host verifies the SHA, creates or updates the draft PR, and moves the Project item to QA.
+    Before handoff, read `.github/pull_request_template.md` in the task repository and write a complete PR description in `report.pull_request_body`: keep every section in template order, respect its length guidance, replace every placeholder, and include `Fixes #<issue-number>` on its own line. Set `body_file=$(mktemp)`, save that exact description without Symphony delivery markers to `$body_file`, and run `(cd elixir && mise exec -- mix pr_body.check --file "$body_file")`.
+    After pushing, call `github_workflow` with operation `handoff`, outcome `ready`, and your report plus the separate issue-comment Markdown body. The comment body must contain one hidden `symphony:report:json` HTML comment whose JSON matches the report, including `pull_request_body`; the host validates and writes `report.pull_request_body` as the draft PR description, then moves the Project item to QA.
     For `no_changes` or `blocked`, hand off that result with a concise reason. Never merge a PR.
-    Finish with exactly one JSON object containing outcome (ready, no_changes, or blocked), summary, criteria, changes, checks, risks, next_step, reason when blocked or no_changes, and sha after pushing.
+    Finish with exactly one JSON object containing outcome (ready, no_changes, or blocked), summary, criteria, changes, checks, risks, next_step, reason when blocked or no_changes, sha after pushing, and pull_request_body for ready.
     criteria, changes, checks, and risks must be JSON arrays, even when empty. Put each risk in its own string element.
     Use sha null only for no_changes or blocked.
     """
@@ -595,7 +592,7 @@ defmodule SymphonyElixir.AgentRunner do
     The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
     Do not modify files. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
     Update the persistent workpad with review findings and resolutions using `github_workflow` operation `workpad`.
-    With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`, then call `request_merge`; if the host confirms the merge, hand off outcome `merged` so the host verifies the merge before closing the issue and moving the item to Done. If the gate rejects the request, leave the PR in Human Review.
+    With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`, then call `request_merge`; if the host confirms the merge, hand off outcome `merged` so the host verifies it before closing the issue and moving the item to Done. If the gate rejects the request, leave the PR in Human Review.
     Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end
@@ -645,9 +642,12 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp normalize_phase_report(report), do: report
 
-  defp ensure_skills_available(_workspace, _issue, worker_host) when is_binary(worker_host), do: :ok
+  defp ensure_skills_available(_workspace, _issue, _opts, worker_host) when is_binary(worker_host), do: :ok
 
-  defp ensure_skills_available(workspace, issue, nil), do: Skills.ensure_available(workspace, issue)
+  defp ensure_skills_available(workspace, issue, opts, nil),
+    do: Skills.ensure_available(workspace, issue, selected_skill_phase(opts))
+
+  defp selected_skill_phase(opts), do: if(Keyword.get(opts, :diagnostic, false), do: :diagnostic, else: Keyword.get(opts, :phase))
 
   defp do_run_codex_turns(
          app_session,
@@ -723,18 +723,33 @@ defmodule SymphonyElixir.AgentRunner do
     if Config.settings!().tracker.kind in ["github", "github_projects"] and not Keyword.has_key?(opts, :phase) do
       release = if Config.settings!().tracker.kind == "github", do: " After the handoff, release your claim.", else: ""
 
+      github_instructions = """
+      For this GitHub task, create or update the persistent issue workpad with `github_workflow` operation `workpad`, then claim the issue before working. Preserve branch #{issue.branch_name}, push it to origin, and read `.github/pull_request_template.md` in the task repository.
+      Put the complete PR description in `report.pull_request_body`, keep every section in template order, follow its length guidance, replace all placeholders, include `Fixes #<issue-number>` for this issue, and omit Symphony delivery markers. Set `body_file=$(mktemp)`, save that exact text to `$body_file`, and run `(cd elixir && mise exec -- mix pr_body.check --file "$body_file")`.
+      Then hand off outcome `ready` with a separate human-readable Markdown issue-comment `body` containing one hidden `symphony:report:json` HTML comment. Put the marker on its own line, the exact report JSON next, and `-->` on its own line; escape any `-->` in JSON strings as `--\\u003e` and make the decoded JSON match `report`, including `pull_request_body`. The host validates and writes that description to the draft PR. For `blocked` or `no_changes`, hand off that result with a reason and do not create a PR. Use `github_workflow` for every GitHub write; the default merge policy is human review.
+      """
+
       prompt <>
-        "\n\nFor this GitHub task, create or update the persistent issue workpad with `github_workflow` operation `workpad`, then claim the issue before working. Preserve branch #{issue.branch_name}, push it to origin, and hand off the complete report with outcome `ready` and a human-readable Markdown `body` containing one hidden `symphony:report:json` HTML comment. Put the marker on its own line, the exact report JSON next, and `-->` on its own line; escape any `-->` in JSON strings as `--\\u003e` and make the decoded JSON match `report`. The host verifies the SHA and creates or updates the draft PR. For `blocked` or `no_changes`, hand off that result with a reason and do not create a PR. Use `github_workflow` for every GitHub write; the default merge policy is human review." <>
+        "\n\n" <>
+        github_instructions <>
         release
     else
       prompt
     end
   end
 
+  defp append_selected_skills(prompt, [], 1) do
+    prompt <>
+      "\n\nSymphony selected no task-specific repo skills for this unattended session. Do not load unlisted task-specific skills; follow separate repository workflow instructions for operational skills when relevant."
+  end
+
   defp append_selected_skills(prompt, selected_skills, 1) when is_list(selected_skills) do
     skills = Enum.map_join(selected_skills, "\n", &"- `#{&1}`")
 
-    prompt <> "\n\nUse these repo-local skills when their conditions apply:\n" <> skills
+    prompt <>
+      "\n\nUse only these task-specific repo skills selected by Symphony for this unattended session:\n" <>
+      skills <>
+      "\nFollow separate repository workflow instructions for operational skills such as pull, commit, and push when relevant."
   end
 
   defp append_selected_skills(prompt, _selected_skills, _turn_number), do: prompt

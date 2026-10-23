@@ -32,6 +32,12 @@ Local runs discover repo-local Codex skills from `.agents/skills` in the workspa
 Symphony checks selected skills before launching Codex and reports a missing `SKILL.md` path; pinned
 sources and fingerprints are listed in [`../.agents/skills/SOURCES.md`](../.agents/skills/SOURCES.md).
 
+In the Projects pipeline, Symphony owns the Build, QA, and Review role prompts and base skill
+assignments; installation `WORKFLOW.md` front matter cannot remap them. Task-specific skills are
+selected from issue context. Unattended sessions load only selected task skills; separate workflow
+instructions can still request operational skills. Interactive skills such as Impeccable and TDD
+are not forced into unattended sessions.
+
 During single-run app-server sessions, the selected tracker adapter may advertise provider-native
 tools. Linear serves `linear_graphql`, GitHub Issues and GitHub Projects v2 serve the read-only
 `github_api` plus the task-scoped `github_workflow`, Jira Cloud serves `jira_rest`, Asana serves
@@ -59,6 +65,12 @@ A merge into the configured base branch is required before Symphony sets Done. M
 item back to Ready requests corrections on the same branch and PR. To move unmerged work to Dropped,
 add a human-authored `Drop reason: <reason>` line to the issue body; after a `no_changes` result,
 this line confirms the decision to discard the work.
+
+With `merge_policy: auto`, Review invokes the deterministic merge gate. It requires the reviewed PR
+head SHA, the current base SHA, and successful required checks. The gate stops when GitHub cannot
+confirm any of that state. When the gate passes, Symphony merges the PR and verifies that GitHub
+reports it merged before closing the issue and moving the Project item to Done. Symphony never
+approves PRs automatically; a rejected gate leaves the PR in Human Review.
 
 Pipeline phase reports use Markdown in Spanish when the issue is Spanish, and English for English,
 unsupported, or ambiguous issue languages. Reports omit empty sections and distinguish blocked

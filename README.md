@@ -9,6 +9,8 @@ correspondiente y ejecuta las fases necesarias con Codex.
 - Coordina varios repositorios desde un único GitHub Project v2 mediante perfiles de repositorio.
 - Ejecuta Build, QA y Review en sesiones separadas y comprueba los comandos `required_checks` del
   repositorio durante QA.
+- Resuelve las skills del catálogo de Symphony por fase y añade las condicionales solo cuando
+  aplican a la tarea.
 - Publica informes Markdown en español para issues en español y en inglés para el resto.
 - Guarda checkpoints del pipeline en SQLite para reanudar el trabajo tras un reinicio.
 - Expone el estado operativo y las tareas del pipeline en Operations, Delivery y una API JSON.
