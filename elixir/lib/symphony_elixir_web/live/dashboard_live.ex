@@ -5,6 +5,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
+  alias SymphonyElixir.Pipeline
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
   @runtime_tick_ms 1_000
 
@@ -21,6 +22,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
     end
 
     {:ok, socket}
+  end
+
+  @impl true
+  def handle_params(_params, _uri, socket) do
+    delivery = if socket.assigns.live_action == :delivery, do: Pipeline.delivery_tasks()
+    {:noreply, assign(socket, :delivery, delivery)}
   end
 
   @impl true
@@ -48,10 +55,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
               Compralaentrada Observability
             </p>
             <h1 class="hero-title">
-              Operations Dashboard
+              <%= if @live_action == :delivery, do: "Delivery", else: "Operations Dashboard" %>
             </h1>
             <p class="hero-copy">
-              Current state, retry pressure, token usage, and orchestration health for the active Symphony runtime.
+              <%= if @live_action == :delivery do %>
+                Pipeline issues and their current tracker state.
+              <% else %>
+                Current state, retry pressure, token usage, and orchestration health for the active Symphony runtime.
+              <% end %>
             </p>
           </div>
 
@@ -68,6 +79,75 @@ defmodule SymphonyElixirWeb.DashboardLive do
         </div>
       </header>
 
+      <nav class="dashboard-nav" aria-label="Dashboard views">
+        <.link
+          navigate="/"
+          class="subtle-button"
+          aria-current={if @live_action == :index, do: "page"}
+        >
+          Operations
+        </.link>
+        <.link
+          navigate="/delivery"
+          class="subtle-button"
+          aria-current={if @live_action == :delivery, do: "page"}
+        >
+          Delivery
+        </.link>
+      </nav>
+
+      <%= if @live_action == :delivery do %>
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Pipeline tasks</h2>
+              <p class="section-copy">Current tracker information for issues in the pipeline.</p>
+            </div>
+          </div>
+
+          <%= case @delivery do %>
+            <% {:ok, []} -> %>
+              <p class="empty-state">No pipeline tasks yet.</p>
+            <% {:ok, tasks} -> %>
+              <div class="table-wrap">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Issue</th>
+                      <th>Title</th>
+                      <th>Tracker status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <%= for row <- tasks do %>
+                      <% tracker_issue = row["tracker_issue"] %>
+                      <% issue = tracker_issue["issue"] %>
+                      <% lookup_message = if tracker_issue["lookup"] == "error", do: "Tracker unavailable", else: "Issue not found" %>
+                      <% current_state = if issue, do: issue["state"], else: lookup_message %>
+                      <tr>
+                        <td>
+                          <.issue_identifier
+                            identifier={if(issue, do: issue["identifier"], else: row["task"]["issue_id"])}
+                            url={if(issue, do: issue["url"])}
+                          />
+                        </td>
+                        <td><%= if issue, do: issue["title"], else: lookup_message %></td>
+                        <td>
+                          <span class={state_badge_class(current_state)}><%= current_state %></span>
+                        </td>
+                      </tr>
+                    <% end %>
+                  </tbody>
+                </table>
+              </div>
+            <% {:error, _reason} -> %>
+              <div class="error-card" role="status">
+                <h2 class="error-title">Delivery unavailable</h2>
+                <p class="error-copy">Pipeline tasks could not be loaded.</p>
+              </div>
+          <% end %>
+        </section>
+      <% else %>
       <%= if @payload[:error] do %>
         <section class="error-card">
           <h2 class="error-title">
@@ -324,6 +404,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </div>
           <% end %>
         </section>
+      <% end %>
       <% end %>
     </section>
     """
