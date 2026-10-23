@@ -77,6 +77,47 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     end
   end
 
+  test "Build finish recovers the validated PR body from successful remote handoff evidence" do
+    issue = issue("octo/app#56", 56)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    sha = String.duplicate("a", 40)
+    body = build(sha, issue.id)["pull_request_body"]
+
+    task = %{
+      "issue_id" => issue.id,
+      "generation" => 1,
+      "phase" => "build",
+      "attempts" => %{"build" => 1},
+      "status" => "building",
+      "branch" => issue.branch_name,
+      "base_branch" => "main",
+      "current_sha" => sha
+    }
+
+    assert :ok = Store.save_task(task)
+    assert :ok = Store.begin_phase(issue.id, 1, "build", 1)
+    :ets.insert(table, {{:remote_sha, issue.id}, sha})
+
+    report =
+      build(sha, issue.id)
+      |> Map.delete("pull_request_body")
+      |> Map.put("_remote_evidence", [
+        %{
+          "outcome" => "ready",
+          "issue" => %{"id" => issue.id},
+          "comment" => %{"id" => "comment-56", "url" => "https://github.com/octo/app/issues/56#issuecomment-1"},
+          "project_item" => %{"id" => "item-56", "status" => "QA"},
+          "pull_request" => %{"number" => 156, "url" => "https://github.com/octo/app/pull/156", "head_sha" => sha, "draft" => true},
+          "pull_request_body" => body,
+          "sha" => sha
+        }
+      ])
+
+    assert :ok = Pipeline.finish_phase(issue, task, "build", 1, report)
+    assert {:ok, %{"phase" => "qa", "status" => "qa"}} = Store.get_task(issue.id)
+  end
+
   test "system-generated QA blockers require a diagnostic agent handoff" do
     issue = issue("octo/app#40", 40)
     table = start_board([issue], %{})

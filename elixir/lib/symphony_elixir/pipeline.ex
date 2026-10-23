@@ -799,8 +799,14 @@ defmodule SymphonyElixir.Pipeline do
 
   defp normalize_remote_result(result, phase) when phase in ["build", "review", "finalize"] do
     case remote_handoff(result) do
-      %{"outcome" => outcome} when is_binary(outcome) -> Map.put(result, "outcome", outcome)
-      _ -> result
+      %{"outcome" => "ready", "pull_request_body" => body} when phase == "build" and is_binary(body) ->
+        Map.merge(result, %{"outcome" => "ready", "pull_request_body" => body})
+
+      %{"outcome" => outcome} when is_binary(outcome) ->
+        Map.put(result, "outcome", outcome)
+
+      _ ->
+        result
     end
   end
 

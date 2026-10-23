@@ -935,6 +935,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          "project_item" => status_evidence,
          "comment" => comment,
          "pull_request" => pr,
+         "pull_request_body" => report["pull_request_body"],
          "sha" => report["sha"]
        }}
     end
