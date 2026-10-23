@@ -275,6 +275,62 @@ defmodule SymphonyElixir.Workspace do
   def run_required_check(_workspace, _command, _sha, _issue_or_identifier, _worker_host),
     do: {:error, :check_unavailable}
 
+  @spec verify_skill_snapshot(Path.t(), [map()], worker_host()) :: :ok | {:error, term()}
+  def verify_skill_snapshot(_workspace, [], _worker_host), do: :ok
+
+  def verify_skill_snapshot(workspace, snapshot, worker_host)
+      when is_binary(workspace) and is_list(snapshot) do
+    issue = %{issue_id: nil, issue_identifier: "skill-readiness"}
+
+    case run_hook(skill_snapshot_command(snapshot), workspace, issue, "skill_readiness", worker_host) do
+      :ok ->
+        :ok
+
+      {:error, {:workspace_hook_failed, "skill_readiness", status, output}} ->
+        {:error, {:skill_snapshot_unavailable, status, output}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp skill_snapshot_command(snapshot) do
+    checks = Enum.flat_map(snapshot, &skill_snapshot_checks/1)
+
+    [
+      "if command -v sha256sum >/dev/null 2>&1; then hash_skill_file() { sha256sum \"$1\" | awk '{print $1}'; }; elif command -v shasum >/dev/null 2>&1; then hash_skill_file() { shasum -a 256 \"$1\" | awk '{print $1}'; }; else exit 127; fi",
+      Enum.join(checks, "\n")
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp skill_snapshot_checks(%{"name" => name, "fingerprint" => fingerprint})
+       when is_binary(name) and is_binary(fingerprint) do
+    if Regex.match?(~r/\A[a-z0-9-]+\z/, name) and Regex.match?(~r/\A[[:xdigit:]]{64}\z/, fingerprint) do
+      skill_dir = Path.join([".agents", "skills", name])
+
+      [
+        "skill_dir=#{shell_escape(skill_dir)}",
+        "[ ! -L .agents ] && [ ! -L .agents/skills ] && [ ! -L \"$skill_dir\" ] || { printf '%s\\n' #{shell_escape("Skill path contains a symlink: " <> name)}; exit 20; }",
+        "[ -f \"$skill_dir/SKILL.md\" ] || { printf '%s\\n' #{shell_escape("Required skill file is missing: " <> skill_dir <> "/SKILL.md")}; exit 20; }",
+        "[ -f \"$skill_dir/CHECKSUMS.sha256\" ] || { printf '%s\\n' #{shell_escape("Skill checksum list is missing: " <> skill_dir <> "/CHECKSUMS.sha256")}; exit 20; }",
+        "actual_fingerprint=$(hash_skill_file \"$skill_dir/CHECKSUMS.sha256\") || exit 127",
+        "[ \"$actual_fingerprint\" = #{shell_escape(fingerprint)} ] || { printf '%s\\n' #{shell_escape("Skill fingerprint mismatch: " <> name <> " expected=" <> fingerprint)} \"actual=$actual_fingerprint\"; exit 21; }",
+        "listed_count=$(wc -l < \"$skill_dir/CHECKSUMS.sha256\" | tr -d '[:space:]')",
+        "actual_count=$(find \"$skill_dir\" -type f ! -path \"$skill_dir/CHECKSUMS.sha256\" | wc -l | tr -d '[:space:]')",
+        "[ \"$listed_count\" = \"$actual_count\" ] || { printf '%s\\n' #{shell_escape("Skill file list differs from the lock: " <> name)}; exit 22; }",
+        "while IFS=' ' read -r expected relative; do",
+        "  actual=$(hash_skill_file \"$skill_dir/$relative\") || exit 127",
+        "  [ \"$actual\" = \"$expected\" ] || { printf '%s\\n' \"Skill file checksum mismatch: $skill_dir/$relative expected=$expected actual=$actual\"; exit 23; }",
+        "done < \"$skill_dir/CHECKSUMS.sha256\""
+      ]
+    else
+      ["printf '%s\\n' 'Invalid skill snapshot'; exit 23"]
+    end
+  end
+
+  defp skill_snapshot_checks(_snapshot), do: ["printf '%s\\n' 'Invalid skill snapshot'; exit 23"]
+
   defp verify_required_check_workspace(workspace, sha, issue_or_identifier, worker_host) do
     command = """
     actual_sha=$(git rev-parse --verify HEAD 2>/dev/null) || exit 127

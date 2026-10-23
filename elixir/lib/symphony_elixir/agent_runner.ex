@@ -12,6 +12,32 @@ defmodule SymphonyElixir.AgentRunner do
   @workspace_refresh_blockers [:project_branch_diverged, :project_branch_missing, :project_branch_dirty]
 
   @doc false
+  @spec preflight_skills(Issue.t(), map() | nil, atom() | String.t() | nil, worker_host()) ::
+          :ok | {:ok, :skills_preflighted} | {:error, term()}
+  def preflight_skills(%Issue{} = issue, task, phase, worker_host \\ nil) do
+    snapshot = Skills.attempt_snapshot(issue, task, phase)
+
+    if snapshot == [] do
+      :ok
+    else
+      opts = [phase: normalize_phase(phase), pipeline_task: task || %{}]
+      task = task || %{}
+      has_pull_request? = not is_nil(task["pr_number"])
+
+      workspace_opts = [
+        require_existing_project_branch: has_pull_request? and phase_with_pr?(opts),
+        create_project_branch: true,
+        refresh_project_branch: refresh_project_branch?(opts)
+      ]
+
+      with {:ok, workspace} <- Workspace.create_for_issue(issue, worker_host, workspace_opts),
+           :ok <- verify_skill_snapshot(workspace, snapshot, worker_host) do
+        {:ok, :skills_preflighted}
+      end
+    end
+  end
+
+  @doc false
   @spec continue_with_issue_for_test(Issue.t(), ([String.t()] -> term())) ::
           {:continue, Issue.t()} | {:done, Issue.t()} | {:error, term()}
   def continue_with_issue_for_test(%Issue{} = issue, issue_state_fetcher)
@@ -42,7 +68,10 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
     diagnostic? = Keyword.get(opts, :diagnostic, false)
-    refresh_project_branch? = not diagnostic? and refresh_project_branch?(opts)
+
+    refresh_project_branch? =
+      not diagnostic? and not Keyword.get(opts, :skills_preflighted, false) and refresh_project_branch?(opts)
+
     task = Keyword.get(opts, :pipeline_task, %{})
     has_pull_request? = is_map(task) and not is_nil(Map.get(task, "pr_number"))
 
@@ -297,9 +326,13 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    selected_repo_skills = Skills.select(issue, selected_skill_phase(opts))
+    selected_skill_snapshot =
+      Skills.attempt_snapshot(issue, Keyword.get(opts, :pipeline_task), selected_skill_phase(opts))
 
-    opts = Keyword.put(opts, :selected_repo_skills, selected_repo_skills)
+    opts =
+      opts
+      |> Keyword.put(:selected_skill_snapshot, selected_skill_snapshot)
+      |> Keyword.put(:selected_repo_skills, Skills.names(selected_skill_snapshot))
 
     opts =
       Keyword.put_new(
@@ -642,12 +675,18 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp normalize_phase_report(report), do: report
 
-  defp ensure_skills_available(_workspace, _issue, _opts, worker_host) when is_binary(worker_host), do: :ok
+  defp ensure_skills_available(workspace, _issue, opts, worker_host) do
+    verify_skill_snapshot(workspace, Keyword.fetch!(opts, :selected_skill_snapshot), worker_host)
+  end
 
-  defp ensure_skills_available(workspace, issue, opts, nil),
-    do: Skills.ensure_available(workspace, issue, selected_skill_phase(opts))
+  defp verify_skill_snapshot(workspace, snapshot, nil), do: Skills.verify_snapshot(workspace, snapshot)
+  defp verify_skill_snapshot(workspace, snapshot, worker_host), do: Workspace.verify_skill_snapshot(workspace, snapshot, worker_host)
 
   defp selected_skill_phase(opts), do: if(Keyword.get(opts, :diagnostic, false), do: :diagnostic, else: Keyword.get(opts, :phase))
+
+  defp normalize_phase(phase) when is_atom(phase), do: phase
+  defp normalize_phase(phase) when phase in ["build", "qa", "review", "diagnostic", "finalize"], do: String.to_existing_atom(phase)
+  defp normalize_phase(_phase), do: nil
 
   defp do_run_codex_turns(
          app_session,
