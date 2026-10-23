@@ -2102,7 +2102,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 ### 17.2 Workspace Manager and Safety
 
-- Deterministic workspace path per issue identifier
+- Deterministic workspace path per issue identifier; GitHub Projects paths use the full Project,
+  item, repository, and issue execution identity
 - Missing workspace directory is created
 - Existing workspace directory is reused
 - Existing non-directory path at workspace location is handled safely (replace or fail per
@@ -2112,10 +2113,12 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored
-- Workspace path sanitization, stable original-identifier-hash collision resistance, and root
-  containment invariants are enforced before agent launch
+- Workspace path sanitization, stable original-key-hash collision resistance, and root containment
+  invariants are enforced before agent launch
 - Identifiers unchanged by sanitization keep their deterministic workspace key; conformance tests
   include distinct identifiers that sanitize to the same text and verify distinct keys
+- Same-number issues in different repositories have separate task identities, workspace paths,
+  branches, and repository-scoped pull request lookups
 - Agent launch uses the per-issue workspace path as cwd and rejects out-of-root paths
 
 ### 17.3 Issue Tracker Adapter
