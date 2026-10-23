@@ -286,6 +286,41 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert Enum.take(Agent.get(remote, &Enum.reverse(&1.events)), 3) == [:pull_request_read, :pull_request_read, :issue_closed]
   end
 
+  test "merge gate requires approved checks and current SHA and base evidence" do
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    root = Path.join(System.tmp_dir!(), "symphony-project-merge-gate-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    {result, queries} = run_merge_gate(%{})
+    assert {:ok, %{"outcome" => "merged"}} = result
+    assert Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
+
+    for {scenario, expected_error} <- [
+          {%{host_check_status: "failed"}, :host_checks_not_verified},
+          {%{github_check_status: "FAILURE"}, :required_github_checks_not_passed},
+          {%{pr_head_sha: String.duplicate("b", 40)}, :pull_request_head_sha_mismatch},
+          {%{pr_base_sha: "stale-base"}, :pull_request_base_sha_mismatch},
+          {%{current_base_sha: nil, pr_base_sha: nil}, :pull_request_base_sha_unavailable}
+        ] do
+      {result, queries} = run_merge_gate(scenario)
+      assert result == {:error, expected_error}
+      refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
+    end
+
+    {result, queries} = run_merge_gate(%{provider_error: true})
+    assert {:error, {:github_projects_api_error, _}} = result
+    refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
+  end
+
   test "Review cannot hand off unresolved prior findings to Human Review" do
     finding = %{"id" => "QA-1", "reproduction" => "Run the failing case.", "criterion" => "The acceptance criterion passes."}
     context = %{task: %{"prior_findings" => [finding]}}
@@ -1752,6 +1787,123 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
                end
              end)
   end
+
+  defp run_merge_gate(options) do
+    number = System.unique_integer([:positive])
+    issue_id = "octo/app##{number}"
+    branch = "symphony/octo-app-#{number}"
+    sha = String.duplicate("a", 40)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: issue_id,
+      branch_name: branch,
+      state: "Review",
+      native_ref: %{repository: "octo/app", base_branch: "main", project_status: "Review"}
+    }
+
+    task = %{
+      "issue_id" => issue_id,
+      "generation" => 1,
+      "phase" => "review",
+      "attempts" => %{"review" => 1},
+      "branch" => branch,
+      "base_branch" => "main",
+      "current_sha" => sha,
+      "required_checks" => ["make -C elixir all"],
+      "host_checks" => [
+        %{
+          "name" => "make -C elixir all",
+          "status" => Map.get(options, :host_check_status, "passed"),
+          "evidence" => "exit status 0"
+        }
+      ]
+    }
+
+    assert :ok = Store.save_task(task)
+    assert :ok = Store.begin_phase(issue_id, 1, "review", 1)
+    {:ok, queries} = Agent.start_link(fn -> [] end)
+
+    request_fun = fn query, _variables, _settings ->
+      Agent.update(queries, &[query | &1])
+
+      cond do
+        query =~ "SymphonyProject(" ->
+          {:ok, %{status: 200, body: project_response([issue_item("octo/app", number, "Review")])}}
+
+        query =~ "SymphonyPipelineMergeGate" and Map.get(options, :provider_error, false) ->
+          {:error, :timeout}
+
+        query =~ "SymphonyPipelineMergeGate" ->
+          current_base_sha = Map.get(options, :current_base_sha, "base-current")
+
+          pull_request = %{
+            "id" => "PR_#{number}",
+            "number" => number,
+            "url" => "https://github.com/octo/app/pull/#{number}",
+            "state" => "OPEN",
+            "isDraft" => false,
+            "mergedAt" => nil,
+            "baseRefName" => "main",
+            "baseRefOid" => Map.get(options, :pr_base_sha, current_base_sha),
+            "headRefName" => branch,
+            "headRefOid" => Map.get(options, :pr_head_sha, sha),
+            "statusCheckRollup" => %{"state" => Map.get(options, :github_check_status, "SUCCESS")}
+          }
+
+          current_ref = merge_gate_base_ref(current_base_sha)
+          body = %{"data" => %{"repository" => %{"ref" => current_ref, "pullRequests" => %{"nodes" => [pull_request]}}}}
+          {:ok, %{status: 200, body: body}}
+
+        query =~ "SymphonyPipelineMergePullRequest" ->
+          merged = %{
+            "id" => "PR_#{number}",
+            "number" => number,
+            "url" => "https://github.com/octo/app/pull/#{number}",
+            "mergedAt" => "2026-10-23T08:00:00Z"
+          }
+
+          {:ok, %{status: 200, body: %{"data" => %{"mergePullRequest" => %{"pullRequest" => merged}}}}}
+
+        query =~ "SymphonyPipelinePullRequest" ->
+          merged_pull_request = %{
+            "id" => "PR_#{number}",
+            "number" => number,
+            "url" => "https://github.com/octo/app/pull/#{number}",
+            "state" => "MERGED",
+            "isDraft" => false,
+            "mergedAt" => "2026-10-23T08:00:00Z",
+            "baseRefName" => "main",
+            "baseRefOid" => Map.get(options, :current_base_sha, "base-current"),
+            "headRefName" => branch,
+            "headRefOid" => Map.get(options, :pr_head_sha, sha),
+            "reviewDecision" => nil,
+            "body" => ""
+          }
+
+          body = %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [merged_pull_request]}}}}
+          {:ok, %{status: 200, body: body}}
+
+        true ->
+          flunk("unexpected GitHub Projects query: #{query}")
+      end
+    end
+
+    context = %{issue: issue, lane: :review, generation: 1, attempt: 1, task: task}
+
+    result =
+      Client.agent_operation(issue, context, "request_merge", %{},
+        tracker_settings: tracker_settings(%{"merge_policy" => "auto"}),
+        projects_request: request_fun
+      )
+
+    calls = Agent.get(queries, &Enum.reverse/1)
+    Agent.stop(queries)
+    {result, calls}
+  end
+
+  defp merge_gate_base_ref(nil), do: nil
+  defp merge_gate_base_ref(oid), do: %{"target" => %{"oid" => oid}}
 
   defp tracker_settings(provider_overrides \\ %{}) do
     %{

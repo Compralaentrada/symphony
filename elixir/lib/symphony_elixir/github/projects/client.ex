@@ -1562,15 +1562,46 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp merge_gate(pr, task, current_base_sha) do
+    head_sha = task["current_sha"]
+
+    with :ok <- validate_merge_shas(head_sha, current_base_sha),
+         :ok <- validate_merge_identity(pr, head_sha, current_base_sha),
+         :ok <- validate_github_checks(pr) do
+      validate_merge_state(pr)
+    end
+  end
+
+  defp validate_merge_shas(head_sha, base_sha) do
     cond do
-      pr["headRefOid"] != task["current_sha"] -> {:error, :pull_request_head_sha_mismatch}
-      pr["baseRefOid"] != current_base_sha -> {:error, :pull_request_base_sha_mismatch}
-      get_in(pr, ["statusCheckRollup", "state"]) != "SUCCESS" -> {:error, :required_github_checks_not_passed}
+      not sha_available?(head_sha) -> {:error, :pull_request_head_sha_unavailable}
+      not sha_available?(base_sha) -> {:error, :pull_request_base_sha_unavailable}
+      true -> :ok
+    end
+  end
+
+  defp validate_merge_identity(pr, head_sha, base_sha) do
+    cond do
+      pr["headRefOid"] != head_sha -> {:error, :pull_request_head_sha_mismatch}
+      pr["baseRefOid"] != base_sha -> {:error, :pull_request_base_sha_mismatch}
+      true -> :ok
+    end
+  end
+
+  defp validate_github_checks(pr) do
+    if get_in(pr, ["statusCheckRollup", "state"]) == "SUCCESS",
+      do: :ok,
+      else: {:error, :required_github_checks_not_passed}
+  end
+
+  defp validate_merge_state(pr) do
+    cond do
       pr["state"] == "MERGED" and is_binary(pr["mergedAt"]) -> :ok
       pr["state"] == "OPEN" and pr["isDraft"] == false -> :ok
       true -> {:error, :pull_request_not_mergeable}
     end
   end
+
+  defp sha_available?(sha), do: is_binary(sha) and sha != ""
 
   defp merge_if_open(%{"state" => "MERGED"}, _task, _settings, _request_fun), do: :ok
 
