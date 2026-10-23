@@ -62,7 +62,11 @@ this line confirms the decision to discard the work.
 
 Pipeline phase reports use Markdown in Spanish when the issue is Spanish, and English for English,
 unsupported, or ambiguous issue languages. Reports omit empty sections and distinguish blocked
-phases from checks that did not run.
+phases from checks that did not run. QA reports map each issue acceptance criterion to a status,
+test or procedure, and evidence reference. Agent checks include their test layer, exact command,
+result, and status; Symphony records its required checks separately as host evidence. QA also records
+coverage gaps by scenario, impact, missing coverage, and risk priority. Review checks the latest QA
+report against the issue criteria, accepted SHA, and required host checks before advancing.
 
 ## Prerequisites
 
