@@ -14,7 +14,8 @@ installation.
    adapters are also available for GitHub Issues, Linear, Jira Cloud, Asana, and GitLab.
 2. Creates an isolated workspace for each issue and launches Codex in
    [App Server mode](https://developers.openai.com/codex/app-server/).
-3. Runs Build, QA, and autonomous Review in separate sessions for GitHub Projects work.
+3. Runs Build, QA, and autonomous Review in separate sessions for ordinary GitHub Projects work;
+   issues labelled `qa` start in QA and continue to Review using an existing pull request.
 4. Verifies configured QA checks, prepares a pull request for human review, and waits for the
    merge or a request for corrections.
 

@@ -210,6 +210,7 @@ defmodule SymphonyElixir.Pipeline do
   defp prepare_task(nil, %Issue{} = issue) do
     if issue.state in [issue_status_value(issue, :ready), issue_status_value(issue, :building)] do
       profile = issue.native_ref || %{}
+      phase = if Issue.routable?(issue, ["qa"]), do: "qa", else: "build"
 
       task = %{
         "issue_id" => issue.id,
@@ -218,15 +219,17 @@ defmodule SymphonyElixir.Pipeline do
         "base_branch" => profile_value(profile, :base_branch),
         "required_checks" => profile_value(profile, :required_checks) || [],
         "generation" => 1,
-        "phase" => "build",
-        "status" => "building",
+        "phase" => phase,
+        "status" => if(phase == "qa", do: "qa", else: "building"),
         "attempts" => %{},
         "prior_findings" => [],
         "current_sha" => nil,
         "pr_number" => nil
       }
 
-      with :ok <- Store.save_task(task), do: {:ok, task, "build"}
+      with {:ok, task} <- seed_qa_pull_request(task, issue),
+           :ok <- Store.save_task(task),
+           do: {:ok, task, phase}
     else
       :ignore
     end
@@ -269,6 +272,28 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp prepare_task(_task, _issue), do: :ignore
+
+  defp seed_qa_pull_request(%{"phase" => "qa"} = task, issue) do
+    expected_branch = task["branch"]
+    expected_base = task["base_branch"]
+
+    case Tracker.pull_request(issue) do
+      {:ok, %{number: number, branch: ^expected_branch, base: ^expected_base, sha: sha}}
+      when is_integer(number) and is_binary(sha) and sha != "" ->
+        {:ok, Map.merge(task, %{"current_sha" => sha, "pr_number" => number})}
+
+      {:ok, _pull_request} ->
+        {:ok, task}
+
+      :ignore ->
+        {:ok, task}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp seed_qa_pull_request(task, _issue), do: {:ok, task}
 
   defp resume_blocked_task(%{"phase" => phase, "current_sha" => current_sha} = task, issue)
        when phase in ["qa", "review"] and is_binary(current_sha) do
