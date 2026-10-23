@@ -33,6 +33,18 @@ defmodule SymphonyElixir.Pipeline do
     if confidence >= @report_locale_confidence, do: :es, else: :en
   end
 
+  @spec delivery_tasks() :: {:ok, [map()]} | {:error, term()}
+  def delivery_tasks do
+    with {:ok, tasks} <- Store.tasks() do
+      issue_ids = Enum.map(tasks, & &1["issue_id"])
+
+      tracker_issues =
+        if issue_ids == [], do: {:ok, []}, else: Tracker.fetch_issues_by_ids(issue_ids)
+
+      {:ok, project_delivery_tasks(tasks, tracker_issues)}
+    end
+  end
+
   @spec reconcile() :: :ok | {:error, term()}
   def reconcile do
     with {:ok, tasks} <- Store.tasks() do
@@ -139,6 +151,38 @@ defmodule SymphonyElixir.Pipeline do
       _ ->
         :ignore
     end
+  end
+
+  defp project_delivery_tasks(tasks, {:ok, issues}) do
+    issues_by_id = Map.new(issues, &{&1.id, &1})
+
+    Enum.map(tasks, fn task ->
+      tracker_issue =
+        case Map.get(issues_by_id, task["issue_id"]) do
+          %Issue{} = issue ->
+            %{
+              "lookup" => "found",
+              "issue" => %{
+                "id" => issue.id,
+                "identifier" => issue.identifier,
+                "title" => issue.title,
+                "url" => issue.url,
+                "state" => issue.state
+              }
+            }
+
+          nil ->
+            %{"lookup" => "missing", "issue" => nil}
+        end
+
+      %{"task" => task, "tracker_issue" => tracker_issue}
+    end)
+  end
+
+  defp project_delivery_tasks(tasks, {:error, _reason}) do
+    Enum.map(tasks, fn task ->
+      %{"task" => task, "tracker_issue" => %{"lookup" => "error", "issue" => nil}}
+    end)
   end
 
   defp finish_prepare(issue, prepared) do

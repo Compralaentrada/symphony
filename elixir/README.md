@@ -200,7 +200,10 @@ Notes:
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
-  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+  `/`, `/api/v1/state`, `/api/v1/delivery`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+- `GET /api/v1/delivery` returns persisted pipeline tasks alongside a current tracker lookup by
+  stable issue ID. `tracker_issue.lookup` is `found`, `missing`, or `error`; the tracker issue's
+  title, URL, and state are returned separately from the pipeline task.
 
 ### Linear adapter profile
 

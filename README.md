@@ -11,7 +11,8 @@ correspondiente y ejecuta las fases necesarias con Codex.
   repositorio durante QA.
 - Publica informes Markdown en español para issues en español y en inglés para el resto.
 - Guarda checkpoints del pipeline en SQLite para reanudar el trabajo tras un reinicio.
-- Expone el estado operativo en un dashboard y una API JSON.
+- Expone el estado operativo en un dashboard y una API JSON. La API incluye las tareas persistidas
+  del pipeline con el estado actual del tracker.
 - Espera una fusión humana y solo marca una tarea como Done tras confirmar la fusión.
 
 En el pipeline de Projects, el estado visible del Project determina el despacho. El flujo normal es

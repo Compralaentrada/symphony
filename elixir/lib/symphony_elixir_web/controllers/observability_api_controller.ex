@@ -6,11 +6,23 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   use Phoenix.Controller, formats: [:json]
 
   alias Plug.Conn
+  alias SymphonyElixir.Pipeline
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
   @spec state(Conn.t(), map()) :: Conn.t()
   def state(conn, _params) do
     json(conn, Presenter.state_payload(orchestrator(), snapshot_timeout_ms()))
+  end
+
+  @spec delivery(Conn.t(), map()) :: Conn.t()
+  def delivery(conn, _params) do
+    case Pipeline.delivery_tasks() do
+      {:ok, tasks} ->
+        json(conn, %{tasks: tasks})
+
+      {:error, _reason} ->
+        error_response(conn, 503, "delivery_unavailable", "Delivery data unavailable")
+    end
   end
 
   @spec issue(Conn.t(), map()) :: Conn.t()
