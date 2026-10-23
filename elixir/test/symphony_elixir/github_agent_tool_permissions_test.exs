@@ -68,6 +68,31 @@ defmodule SymphonyElixir.GitHubAgentToolPermissionsTest do
     refute response["success"]
   end
 
+  test "Review reaches the merge gate only when auto is explicit" do
+    for context <- [agent_context(:review), Map.delete(agent_context(:review), :merge_policy)] do
+      response =
+        AgentTool.execute(
+          "github_workflow",
+          %{"operation" => "request_merge", "report" => %{}},
+          agent_context: context,
+          workflow_client: fn _context, _operation, _arguments -> flunk("human policy reached the merge gate") end
+        )
+
+      refute response["success"]
+    end
+
+    response =
+      AgentTool.execute(
+        "github_workflow",
+        %{"operation" => "request_merge", "report" => %{}},
+        agent_context: agent_context(:review, "auto"),
+        workflow_client: fn _context, "request_merge", _arguments -> {:ok, %{"requested" => true}} end
+      )
+
+    assert response["success"]
+    assert response["evidence"] == %{"requested" => true}
+  end
+
   test "workflow rejects malformed calls and uses the configured GitHub tracker client" do
     assert %{"success" => false} = AgentTool.execute("github_workflow", "not an object", [])
 
