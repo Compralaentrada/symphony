@@ -297,11 +297,7 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    selected_repo_skills =
-      if is_nil(worker_host) do
-        skills = Skills.select(issue)
-        if Keyword.has_key?(opts, :phase), do: List.delete(skills, "code-review"), else: skills
-      end
+    selected_repo_skills = Skills.select(issue, selected_skill_phase(opts))
 
     opts = Keyword.put(opts, :selected_repo_skills, selected_repo_skills)
 
@@ -315,7 +311,7 @@ defmodule SymphonyElixir.AgentRunner do
     opts = Keyword.put(opts, :report_locale, Pipeline.report_locale(issue))
     agent_context = github_agent_context(issue, opts)
 
-    with :ok <- ensure_skills_available(workspace, issue, worker_host),
+    with :ok <- ensure_skills_available(workspace, issue, opts, worker_host),
          {:ok, session} <-
            AppServer.start_session(
              workspace,
@@ -477,7 +473,7 @@ defmodule SymphonyElixir.AgentRunner do
         "\n\n" <>
           phase_instructions(phase, opts) <>
           "\nEvery GitHub `handoff` must include the structured `report` and the complete human-readable Markdown comment in `body`. Put the report JSON only in one hidden HTML comment: `<!-- symphony:report:json` on its own line, the JSON object, then `-->` on its own line. Escape any `-->` inside JSON string values as `--\\u003e` so the HTML comment stays hidden. Its decoded object must exactly match `report`, including the handoff outcome and any phase-specific report fields your instructions require you to copy from `read_workpad`'s `report_context`. Keep the rest of the comment readable Markdown." <>
-          "\nUse the Humanizer guidance for report values. Write report values in #{report_language} (Spanish only for Spanish issues; English otherwise). Keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details." <>
+          "\nWrite report values in #{report_language} (Spanish only for Spanish issues; English otherwise). Keep the wording direct and natural, and preserve every fact, result, and evidence item without inventing details." <>
           "\nThe phase report JSON contract overrides any skill's preferred presentation format."
       )
 
@@ -646,9 +642,12 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp normalize_phase_report(report), do: report
 
-  defp ensure_skills_available(_workspace, _issue, worker_host) when is_binary(worker_host), do: :ok
+  defp ensure_skills_available(_workspace, _issue, _opts, worker_host) when is_binary(worker_host), do: :ok
 
-  defp ensure_skills_available(workspace, issue, nil), do: Skills.ensure_available(workspace, issue)
+  defp ensure_skills_available(workspace, issue, opts, nil),
+    do: Skills.ensure_available(workspace, issue, selected_skill_phase(opts))
+
+  defp selected_skill_phase(opts), do: if(Keyword.get(opts, :diagnostic, false), do: :diagnostic, else: Keyword.get(opts, :phase))
 
   defp do_run_codex_turns(
          app_session,
@@ -739,10 +738,18 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  defp append_selected_skills(prompt, [], 1) do
+    prompt <>
+      "\n\nSymphony selected no task-specific repo skills for this unattended session. Do not load unlisted task-specific skills; follow separate repository workflow instructions for operational skills when relevant."
+  end
+
   defp append_selected_skills(prompt, selected_skills, 1) when is_list(selected_skills) do
     skills = Enum.map_join(selected_skills, "\n", &"- `#{&1}`")
 
-    prompt <> "\n\nUse these repo-local skills when their conditions apply:\n" <> skills
+    prompt <>
+      "\n\nUse only these task-specific repo skills selected by Symphony for this unattended session:\n" <>
+      skills <>
+      "\nFollow separate repository workflow instructions for operational skills such as pull, commit, and push when relevant."
   end
 
   defp append_selected_skills(prompt, _selected_skills, _turn_number), do: prompt
