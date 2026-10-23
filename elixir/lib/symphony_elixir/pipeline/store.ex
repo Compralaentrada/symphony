@@ -29,6 +29,27 @@ defmodule SymphonyElixir.Pipeline.Store do
     end)
   end
 
+  @spec latest_phase_result(String.t(), pos_integer()) ::
+          {:ok, %{phase: String.t(), result: map(), updated_at: String.t()} | nil} | {:error, term()}
+  def latest_phase_result(issue_id, generation) do
+    with_db(fn conn ->
+      case query(
+             conn,
+             "SELECT phase, result, updated_at FROM pipeline_phases WHERE issue_id = ? AND generation = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+             [issue_id, generation]
+           ) do
+        {:ok, [[phase, result, updated_at]]} ->
+          {:ok, %{phase: phase, result: Jason.decode!(result), updated_at: updated_at}}
+
+        {:ok, []} ->
+          {:ok, nil}
+
+        {:error, _reason} = error ->
+          error
+      end
+    end)
+  end
+
   @spec save_task(map()) :: :ok | {:error, term()}
   def save_task(task), do: with_db(&save_task(&1, task))
 
