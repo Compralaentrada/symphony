@@ -30,12 +30,34 @@ defmodule SymphonyElixir.AgentRunner do
         refresh_project_branch: refresh_project_branch?(opts)
       ]
 
-      with {:ok, workspace} <- Workspace.create_for_issue(issue, worker_host, workspace_opts),
-           :ok <- verify_skill_snapshot(workspace, snapshot, worker_host) do
-        {:ok, :skills_preflighted}
+      case Workspace.create_for_issue(issue, worker_host, workspace_opts) do
+        {:ok, workspace} ->
+          preflight_verified_skills(workspace, snapshot, worker_host)
+
+        {:error, reason} ->
+          preflight_workspace_error(issue, snapshot, worker_host, reason)
       end
     end
   end
+
+  defp preflight_verified_skills(workspace, snapshot, worker_host) do
+    with :ok <- verify_skill_snapshot(workspace, snapshot, worker_host), do: {:ok, :skills_preflighted}
+  end
+
+  defp preflight_workspace_error(issue, snapshot, worker_host, reason) when reason in @workspace_refresh_blockers do
+    case Workspace.create_for_issue(issue, worker_host, create_project_branch: false) do
+      {:ok, workspace} ->
+        with :ok <- verify_skill_snapshot(workspace, snapshot, worker_host) do
+          {:error, {:workspace_preflight, reason}}
+        end
+
+      {:error, fallback_reason} ->
+        {:error, {:workspace_preflight, fallback_reason}}
+    end
+  end
+
+  defp preflight_workspace_error(_issue, _snapshot, _worker_host, reason),
+    do: {:error, {:workspace_preflight, reason}}
 
   @doc false
   @spec continue_with_issue_for_test(Issue.t(), ([String.t()] -> term())) ::

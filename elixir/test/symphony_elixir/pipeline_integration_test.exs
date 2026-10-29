@@ -25,6 +25,56 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert MapSet.new(ids) == MapSet.new(Enum.map(issues, & &1.id))
   end
 
+  test "a slow skill preflight does not stop the orchestrator responding" do
+    issue = issue("octo/app#17", 17)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    orchestrator = start_orchestrator(__MODULE__.SlowSkillPreflightAgent)
+
+    assert await(fn -> lookup(table, :preflight_pid) != nil end)
+    preflight = lookup(table, :preflight_pid)
+    snapshot = Task.async(fn -> GenServer.call(orchestrator, :snapshot, 2_000) end)
+    result = Task.yield(snapshot, 100)
+    send(preflight, :continue)
+    assert {:ok, _} = result
+    stop_orchestrator(orchestrator)
+  end
+
+  test "a human status change during skill preflight prevents the stale result from claiming" do
+    issue = issue("octo/app#16", 16)
+    table = start_board([issue], %{})
+    pipeline_database!(table, retry_backoff_ms: 300_000)
+    orchestrator = start_orchestrator(__MODULE__.SlowSkillPreflightAgent)
+
+    assert await(fn -> lookup(table, :preflight_pid) != nil end)
+    preflight = lookup(table, :preflight_pid)
+    set_project_state(table, issue.id, "Building")
+    assert await(fn -> get_in(:sys.get_state(orchestrator), [Access.key(:running), issue.id, :issue, Access.key(:state)]) == "Building" end)
+    send(preflight, :continue)
+    assert await(fn -> not Map.has_key?(:sys.get_state(orchestrator).running, issue.id) end)
+    assert {:ok, task} = Store.get_task(issue.id)
+    refute get_in(task, ["skill_readiness", "status"]) == "failed"
+    stop_orchestrator(orchestrator)
+  end
+
+  test "a workspace preflight completes safely after the issue leaves active states" do
+    issue = issue("octo/app#15", 15)
+    table = start_board([issue], %{})
+    pipeline_database!(table, retry_backoff_ms: 300_000)
+    orchestrator = start_orchestrator(__MODULE__.SlowSkillPreflightAgent)
+
+    assert await(fn -> lookup(table, :preflight_pid) != nil end)
+    preflight = lookup(table, :preflight_pid)
+    set_project_state(table, issue.id, "Backlog")
+    Process.sleep(100)
+    assert Process.alive?(preflight)
+    send(preflight, :continue)
+    assert await(fn -> not Map.has_key?(:sys.get_state(orchestrator).running, issue.id) end)
+    assert {:ok, task} = Store.get_task(issue.id)
+    refute get_in(task, ["skill_readiness", "status"]) == "failed"
+    stop_orchestrator(orchestrator)
+  end
+
   test "persists the phase skill snapshot across runtime restarts" do
     issue = issue("octo/app#19", 19)
     table = start_board([issue], %{})
@@ -275,6 +325,18 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
     assert project_state(table, issue.id) == "QA"
     assert lookup(table, {:reports, issue.id}) == nil
+  end
+
+  test "workspace preflight failures reach diagnostic instead of skill readiness" do
+    issue = issue("octo/app#44", 44)
+    table = start_board([issue], %{})
+    pipeline_database!(table, retry_backoff_ms: 300_000)
+    orchestrator = start_orchestrator(__MODULE__.WorkspacePreflightAgent)
+
+    assert await(fn -> lookup(table, {:diagnostic_runner_calls, issue.id}) != nil end)
+    assert {:ok, task} = Store.get_task(issue.id)
+    refute get_in(task, ["skill_readiness", "status"]) == "failed"
+    stop_orchestrator(orchestrator)
   end
 
   test "orchestrator retries a preflight blocker through the diagnostic lane" do
@@ -1319,6 +1381,24 @@ defmodule SymphonyElixir.PipelineIntegrationTest.RealSkillPreflightAgent do
     do: SymphonyElixir.AgentRunner.preflight_skills(issue, task, phase, worker_host)
 
   def run(_issue, _recipient, _opts), do: {:error, :preflight_should_have_stopped_claim}
+end
+
+defmodule SymphonyElixir.PipelineIntegrationTest.SlowSkillPreflightAgent do
+  def preflight_skills(_issue, _task, _phase, _host) do
+    table = Application.fetch_env!(:symphony_elixir, :pipeline_test_board)
+    :ets.insert(table, {:preflight_pid, self()})
+
+    receive do
+      :continue -> {:error, :test_preflight_failure}
+    after
+      1_000 -> {:error, :test_preflight_failure}
+    end
+  end
+end
+
+defmodule SymphonyElixir.PipelineIntegrationTest.WorkspacePreflightAgent do
+  def preflight_skills(_issue, _task, _phase, _host), do: {:error, {:workspace_preflight, :project_branch_dirty}}
+  defdelegate run(issue, recipient, opts), to: SymphonyElixir.PipelineIntegrationTest.DiagnosticAgent
 end
 
 defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
