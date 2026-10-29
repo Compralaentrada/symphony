@@ -916,6 +916,10 @@ Failure handling:
   evidence where available. When a blocked QA or Review task is requeued after the PR head changed
   or the PR is missing, it restarts at Build so the accepted SHA and subsequent QA and Review
   evidence are refreshed together.
+- If a nonterminal phase checkpoint conflicts with the current nonterminal tracker state, a GitHub
+  Projects implementation SHOULD preserve the checkpoint and workspace, record a local blocker with
+  the mismatch reason, and leave the visible tracker state unchanged. Moving the item to `Ready`
+  explicitly requeues the work from the preserved checkpoint.
 
 ### 9.4 Workspace Hooks
 

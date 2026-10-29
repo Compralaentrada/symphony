@@ -888,28 +888,33 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp agent_claim(issue, context, tracker_settings, settings, request_fun) do
-    target = if context.lane in [:qa, "qa"], do: settings.statuses.qa, else: settings.statuses.building
-
-    with {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
-         :ok <- claimable_project_status(issue, current, target, settings),
-         :ok <- maybe_set_project_status(current, target, settings, request_fun),
+    with {:ok, target_status} <- claim_status(context.lane, settings),
+         {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
+         :ok <- claimable_project_status(issue, current, target_status, settings),
+         :ok <- maybe_set_project_status(current, target_status, settings, request_fun),
          {:ok, claimed} <- current_project_issue(issue, tracker_settings, request_fun),
-         true <- project_status(claimed) == target do
-      {:ok, project_evidence(issue, claimed, target)}
+         true <- project_status(claimed) == target_status do
+      {:ok, project_evidence(issue, claimed, target_status)}
     else
       false -> {:error, :github_project_claim_not_verified}
       {:error, _reason} = error -> error
     end
   end
 
+  defp claim_status(lane, settings) when lane in [:build, "build", :individual, "individual"], do: {:ok, settings.statuses.building}
+  defp claim_status(lane, settings) when lane in [:qa, "qa"], do: {:ok, settings.statuses.qa}
+  defp claim_status(lane, settings) when lane in [:review, "review"], do: {:ok, settings.statuses.review}
+  defp claim_status(_lane, _settings), do: {:error, :github_claim_not_supported_for_phase}
+
   defp agent_handoff(issue, context, arguments, tracker_settings, settings, request_fun) do
     lane = to_string(context.lane)
     report = normalize_report(Map.get(arguments, "report"))
     outcome = Map.get(arguments, "outcome") || report["outcome"]
-    report = report |> Map.put("outcome", outcome) |> normalize_agent_report(lane, context)
-    body = Map.get(arguments, "body")
+    submitted_report = Map.put(report, "outcome", outcome)
+    report = normalize_agent_report(submitted_report, lane, context)
 
-    with :ok <- validate_agent_pr_body(lane, report, issue),
+    with {:ok, body} <- AgentReport.normalize_body(Map.get(arguments, "body"), report, submitted_report),
+         :ok <- validate_agent_pr_body(lane, report, issue),
          :ok <- AgentReport.validate_body(body, report),
          {:ok, status} <- handoff_status(lane, report, settings),
          {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
@@ -930,6 +935,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          "project_item" => status_evidence,
          "comment" => comment,
          "pull_request" => pr,
+         "pull_request_body" => report["pull_request_body"],
          "sha" => report["sha"]
        }}
     end
@@ -1433,19 +1439,11 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp claimable_project_status(dispatched, current, target, settings) do
     ready = normalize_state(settings.statuses.ready)
-    building = normalize_state(settings.statuses.building)
-    qa = normalize_state(settings.statuses.qa)
+    target = normalize_state(target)
     dispatched_status = normalize_state(ref_value(dispatched.native_ref || %{}, :project_status))
     current_status = normalize_state(project_status(current))
 
-    allowed_pairs =
-      if normalize_state(target) == qa do
-        [{ready, ready}, {ready, building}, {ready, qa}, {building, building}, {building, qa}, {qa, qa}]
-      else
-        [{ready, ready}, {ready, building}, {building, building}]
-      end
-
-    if {dispatched_status, current_status} in allowed_pairs,
+    if {dispatched_status, current_status} in [{ready, ready}, {ready, target}, {target, target}],
       do: :ok,
       else: {:error, :github_human_decision_changed}
   end

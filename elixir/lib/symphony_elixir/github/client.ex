@@ -394,10 +394,11 @@ defmodule SymphonyElixir.GitHub.Client do
   defp agent_handoff(issue, context, arguments, settings, request_fun) do
     report = normalize_report(arguments["report"])
     outcome = arguments["outcome"] || report["outcome"]
-    report = Map.put(report, "outcome", outcome)
-    agent_body = Map.get(arguments, "body")
+    submitted_report = Map.put(report, "outcome", outcome)
+    report = submitted_report
 
-    with :ok <- validate_agent_handoff(issue, context, outcome, report),
+    with {:ok, agent_body} <- AgentReport.normalize_body(Map.get(arguments, "body"), submitted_report, submitted_report),
+         :ok <- validate_agent_handoff(issue, context, outcome, report),
          :ok <- AgentReport.validate_body(agent_body, report),
          {:ok, current_issue} <- current_issue(issue, settings, request_fun),
          :ok <- ensure_issue_open(current_issue),

@@ -28,6 +28,8 @@ cambiado o sin PR, reinicia en `Build` y repite ambas fases. Si falla una compro
 agente del lane `diagnostic` lee el workpad e inspecciona el workspace y la PR antes de documentar el
 motivo y la recuperación en la issue y el Project. Symphony detecta el bloqueo y coordina esa sesión,
 pero no escribe en GitHub.
+Si un checkpoint de fase no coincide con el estado actual del tracker, conserva el trabajo y
+registra el bloqueo local sin cambiar el estado visible; mover la tarea a `Ready` permite reanudarla.
 
 El tablero usa el campo `Status` y las opciones canónicas de Symphony: `Backlog`, `Ready`, `Building`,
 `QA`, `Review`, `Human Review`, `Blocked`, `Done` y `Dropped`.

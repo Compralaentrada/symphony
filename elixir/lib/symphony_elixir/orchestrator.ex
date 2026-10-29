@@ -1241,7 +1241,7 @@ defmodule SymphonyElixir.Orchestrator do
     send(recipient, {:pipeline_phase_result, issue.id, task["generation"], phase, phase_attempt, result})
   end
 
-  defp diagnose_system_blocker(runner, issue, recipient, opts, {:phase_result, {:system_blocker, _report}} = blocker) do
+  defp diagnose_system_blocker(runner, issue, recipient, opts, {:system_blocker, _report} = blocker) do
     if Pipeline.enabled?(), do: runner.run(issue, recipient, Keyword.put(opts, :diagnostic, true)), else: blocker
   end
 
