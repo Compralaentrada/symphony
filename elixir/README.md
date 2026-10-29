@@ -12,7 +12,9 @@ installation.
 
 1. Reads eligible issues from the configured tracker. The current pilot uses GitHub Projects v2;
    adapters are also available for GitHub Issues, Linear, Jira Cloud, Asana, and GitLab.
-2. Creates an isolated workspace for each issue and launches Codex in
+2. Creates an isolated workspace for each issue. GitHub Projects executions include the Project,
+   item, repository, and issue number in their identity, so same-number issues in different
+   repositories keep separate workspaces and pull request lookups. Then Symphony launches Codex in
    [App Server mode](https://developers.openai.com/codex/app-server/).
 3. Runs Build, QA, and autonomous Review in separate sessions for GitHub Projects work.
 4. Verifies configured QA checks, prepares a pull request for human review, and waits for the
@@ -48,6 +50,11 @@ permissions are restricted by repository, issue, lane, lease, and operation.
 If a claimed issue moves to a configured terminal state, Symphony stops the active agent and cleans
 up its workspace. In GitHub Projects mode, closing the linked GitHub Issue is terminal; Project
 items in Done or Blocked keep their workspace so moving them back to Ready can resume prior work.
+When a successful ID refresh omits a running issue, Symphony keeps the same agent, claim, and
+workspace after the first omission. A visible active refresh clears the counter; a second
+consecutive omission stops the agent and releases its slot while preserving the workspace. Tracker
+read errors do not count as omissions. The log records the issue, consecutive omission count, and
+number of normalized issues returned.
 Before QA or Review starts, Symphony compares the remote PR head and clean workspace with the
 Build-accepted SHA. A missing or changed PR head, a mismatched workspace, or uncommitted workspace
 changes creates a blocker report before the agent starts. When a Blocked item from QA or Review is
@@ -357,7 +364,8 @@ tracker:
 
 The observability UI now runs on a minimal Phoenix stack:
 
-- LiveView for the dashboard at `/`
+- LiveView dashboard at `/` with Operations and read-only Delivery views
+- Delivery lists pipeline tasks with the current title, status, and issue link from the configured tracker
 - JSON API for operational debugging under `/api/v1/*`
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
