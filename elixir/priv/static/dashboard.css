@@ -138,6 +138,23 @@ pre,
   gap: 1rem;
 }
 
+.dashboard-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.dashboard-nav a[aria-current="page"] {
+  background: var(--accent-soft);
+  border-color: rgba(16, 163, 127, 0.18);
+  color: var(--accent-ink);
+}
+
+.dashboard-nav a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .hero-card,
 .section-card,
 .metric-card,
