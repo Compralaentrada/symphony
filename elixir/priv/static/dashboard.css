@@ -738,6 +738,10 @@ body:has(.operations-dashboard) {
     padding: 1rem 0.85rem 2rem;
   }
 
+  .operations-dashboard .metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .operations-dashboard .metric-card {
     border-right: 0;
     border-bottom: 1px solid var(--line);
@@ -751,6 +755,10 @@ body:has(.operations-dashboard) {
 @media (max-width: 560px) {
   .app-shell:has(.operations-dashboard) {
     padding: 0.75rem;
+  }
+
+  .operations-dashboard .metric-grid {
+    grid-template-columns: 1fr;
   }
 
   .operations-dashboard .session-timeline-header {
