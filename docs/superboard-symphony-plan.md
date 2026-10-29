@@ -39,7 +39,7 @@ La primera demostración útil será una tarea real que complete el recorrido ha
 | Estado del trabajo | El Project gobierna la intención y estado visible | SQLite registra ejecución, fases, checkpoints y operaciones; nunca sustituye una decisión visible del Project. |
 | Escrituras de GitHub | Los agentes de fase gestionan issues, Projects y PRs | Symphony lee y coordina; las herramientas del host autorizan, verifican y registran las mutaciones iniciadas por los agentes. |
 | Ejecución | Un servicio Symphony con perfiles de repositorio | Un scheduler global despacha tareas independientes a slots disponibles; no usa waves ni prioridad por fase. |
-| Pipeline | `bug`/`feature`: Build → QA → Review; `qa`: QA → Review | La app define los estados y las skills del ciclo; cada fase autónoma usa una sesión separada. |
+| Pipeline | `bug`/`feature`: Build → QA → Review; etiqueta `qa`: QA → Review | La app define los estados y las skills del ciclo; cada fase autónoma usa una sesión separada. |
 | Skills | Catálogo y enrutamiento propios de la app | Se usan skills fijadas solo cuando aplican; la instalación no configura el mapeo por fase. |
 | Persistencia | SQLite en un host | Diario interno de ejecución, checkpoints, evidencias y operaciones idempotentes; el Project sigue siendo la autoridad del estado visible. |
 | Configuración | Project, perfiles de repo, un modelo global, slots y política de merge | Cada perfil contiene repo, rama base y preparación del entorno; estados y skills son fijos de la app. |
@@ -120,7 +120,7 @@ Cada fase usa una sesión nueva. La espera en `Human Review` libera el slot y pe
 
 La identidad estable contendrá `project_id`, `project_item_id`, `issue_node_id` y `repository_id`. La referencia humana será `owner/repo#number`. Cambiar el título, renombrar el repo o repetir `#42` en otro repositorio no debe crear una ejecución incorrecta. La branch y el workspace incluirán un identificador único del intento.
 
-El item debe vincular una issue, un repo registrado y un tipo de tarea. Las dependencias se leen de relaciones explícitas entre issues. `bug` y `feature` recorren Build → QA → Review; `qa` entra directamente en QA y luego pasa por Review, sin fabricar una fase de implementación. La antigüedad de Ready decide el despacho; la prioridad del Project no altera el orden. [SB1]
+El item debe vincular una issue y un repo registrado. Las dependencias se leen de relaciones explícitas entre issues. `bug` y `feature` recorren Build → QA → Review; la etiqueta `qa` entra directamente en QA y luego pasa por Review, sin fabricar una fase de implementación. La antigüedad de Ready decide el despacho; la prioridad del Project no altera el orden. [SB1]
 
 Las ideas sin issue pueden permanecer en Backlog. Para pasar a ejecución deben convertirse en una issue con repo inequívoco. Un item PR se vincula como resultado; no se interpreta automáticamente como una nueva tarea de implementación.
 
@@ -496,7 +496,7 @@ Aceptación: los agentes ejecutan y verifican claim/liberación, informes y tran
 
 ### Hito 1 — Completar el contrato de tarea
 
-Usar estados y skills definidos por Symphony, verificar el Project en onboarding e integrar el tipo `qa` que entra directamente en QA. Añadir dependencias explícitas entre issues. Las dependencias abiertas dejan la tarea sin despacho ni slot; las relaciones inválidas o irresolubles muestran un motivo y requieren intervención. `bug` y `feature` recorren Build → QA → Review.
+Usar estados y skills definidos por Symphony, verificar el Project en onboarding e integrar la etiqueta `qa` que entra directamente en QA. Añadir dependencias explícitas entre issues. Las dependencias abiertas dejan la tarea sin despacho ni slot; las relaciones inválidas o irresolubles muestran un motivo y requieren intervención. `bug` y `feature` recorren Build → QA → Review.
 
 Aceptación: la ruta `qa` nunca ejecuta Build; las dependencias se resuelven por identidad repo/issue, no por número local; una tarea con dependencia pendiente permanece en `Ready` sin ocupar slot; ningún estado o skill depende de un mapping configurado por instalación.
 

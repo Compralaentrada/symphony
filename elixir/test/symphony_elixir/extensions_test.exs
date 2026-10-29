@@ -7,6 +7,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   alias SymphonyElixir.Linear.Adapter
   alias SymphonyElixir.Pipeline.Store
   alias SymphonyElixir.Tracker.Memory
+  alias SymphonyElixir.Workspace
 
   @endpoint SymphonyElixirWeb.Endpoint
 
@@ -24,7 +25,8 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   defmodule DeliveryTrackerClient do
     def fetch_issues_by_ids(issue_ids) do
-      send(self(), {:delivery_tracker_ids, issue_ids})
+      test_pid = Application.get_env(:symphony_elixir, :delivery_tracker_test_pid, self())
+      send(test_pid, {:delivery_tracker_ids, issue_ids})
       Application.fetch_env!(:symphony_elixir, :delivery_tracker_result)
     end
   end
@@ -358,9 +360,16 @@ defmodule SymphonyElixir.ExtensionsTest do
            }
 
     conn = get(build_conn(), "/api/v1/MT-RETRY")
+    retry_identity = "PVT_project/PVTI_item/octo/app#7"
 
-    assert %{"status" => "retrying", "retry" => %{"attempt" => 2, "error" => "boom"}} =
-             json_response(conn, 200)
+    assert %{
+             "status" => "retrying",
+             "workspace" => %{"path" => retry_workspace},
+             "retry" => %{"attempt" => 2, "error" => "boom"}
+           } = json_response(conn, 200)
+
+    assert retry_workspace ==
+             Path.join(Config.settings!().workspace.root, Workspace.workspace_key(retry_identity))
 
     conn = get(build_conn(), "/api/v1/MT-BLOCKED")
 
@@ -594,7 +603,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Live"
     assert html =~ "Offline"
     assert html =~ "Copy ID"
-    assert html =~ "Codex update"
+    assert html =~ "Latest activity"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
@@ -646,6 +655,65 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute render(view) =~ "javascript:alert"
   end
 
+  test "dashboard liveview orders active sessions by latest runtime activity" do
+    now = DateTime.utc_now()
+    [base_entry] = static_snapshot().running
+
+    older_entry = %{
+      base_entry
+      | identifier: "MT-OLDER",
+        issue_url: "https://example.org/issues/MT-OLDER",
+        state: "Building",
+        last_codex_message: "older update",
+        last_codex_timestamp: DateTime.add(now, -30, :second),
+        started_at: DateTime.add(now, -120, :second)
+    }
+
+    newer_entry = %{
+      base_entry
+      | identifier: "MT-NEWER",
+        issue_url: "https://example.org/issues/MT-NEWER",
+        state: "QA",
+        last_codex_message: "newest update",
+        last_codex_timestamp: DateTime.add(now, -5, :second),
+        started_at: DateTime.add(now, -60, :second)
+    }
+
+    snapshot = put_in(static_snapshot().running, [older_entry, newer_entry])
+    orchestrator_name = Module.concat(__MODULE__, :TimelineOrchestrator)
+
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot})
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ ~s(class="session-timeline")
+    assert html =~ "MT-NEWER"
+    assert html =~ "MT-OLDER"
+    assert html =~ "Latest activity"
+    assert html =~ "Duration"
+    assert html =~ "newest update"
+    assert html =~ "older update"
+    assert html =~ ~s(href="/api/v1/MT-NEWER")
+    assert html =~ ~s(href="/api/v1/MT-OLDER")
+    assert :binary.match(html, "MT-NEWER") < :binary.match(html, "MT-OLDER")
+    assert html =~ "1m"
+    assert html =~ "2m"
+  end
+
+  test "dashboard liveview keeps the empty active session state" do
+    snapshot = put_in(static_snapshot().running, [])
+    orchestrator_name = Module.concat(__MODULE__, :EmptyTimelineOrchestrator)
+
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot})
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "No active sessions."
+    refute html =~ ~s(class="session-timeline")
+  end
+
   test "dashboard liveview renders an unavailable state without crashing" do
     start_test_endpoint(
       orchestrator: Module.concat(__MODULE__, :MissingDashboardOrchestrator),
@@ -655,6 +723,58 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, _view, html} = live(build_conn(), "/")
     assert html =~ "Snapshot unavailable"
     assert html =~ "snapshot_unavailable"
+  end
+
+  test "delivery dashboard navigates from operations and renders current tracker issues" do
+    task = %{"issue_id" => "octo/app#7", "phase" => "qa", "status" => "local-only-status"}
+
+    issue = %SymphonyElixir.Tracker.Issue{
+      id: "octo/app#7",
+      identifier: "octo/app#7",
+      title: "Current title",
+      url: "https://example.org/octo/app/issues/7",
+      state: "Human Review"
+    }
+
+    setup_delivery_pipeline([task], {:ok, [issue]})
+    start_test_endpoint(snapshot_timeout_ms: 50)
+
+    {:ok, operations_view, _html} = live(build_conn(), "/")
+    assert has_element?(operations_view, "nav[aria-label='Dashboard views'] a[href='/delivery']", "Delivery")
+
+    assert {:error, {:live_redirect, %{to: "/delivery"}}} =
+             operations_view |> element("a[href='/delivery']") |> render_click()
+
+    {:ok, delivery_view, html} = live(build_conn(), "/delivery")
+    assert has_element?(delivery_view, "nav[aria-label='Dashboard views'] a[href='/']", "Operations")
+    assert has_element?(delivery_view, "tbody tr td", "octo/app#7")
+    assert html =~ "Current title"
+    assert html =~ "Human Review"
+    assert html =~ ~s(href="https://example.org/octo/app/issues/7")
+    refute html =~ "local-only-status"
+  end
+
+  test "delivery dashboard distinguishes empty, missing, and unavailable tracker states" do
+    task = %{"issue_id" => "octo/app#7", "phase" => "qa", "status" => "local-only-status"}
+    setup_delivery_pipeline([], {:ok, []})
+    start_test_endpoint(snapshot_timeout_ms: 50)
+
+    {:ok, _view, empty_html} = live(build_conn(), "/delivery")
+    assert empty_html =~ "No pipeline tasks yet."
+    refute empty_html =~ "Tracker unavailable"
+
+    assert :ok = Store.save_task(task)
+    Application.put_env(:symphony_elixir, :delivery_tracker_result, {:ok, []})
+
+    {:ok, _view, missing_html} = live(build_conn(), "/delivery")
+    assert missing_html =~ "Issue not found"
+    refute missing_html =~ "local-only-status"
+
+    Application.put_env(:symphony_elixir, :delivery_tracker_result, {:error, :tracker_unavailable})
+
+    {:ok, _view, unavailable_html} = live(build_conn(), "/delivery")
+    assert unavailable_html =~ "Tracker unavailable"
+    refute unavailable_html =~ "local-only-status"
   end
 
   test "http server serves embedded assets, accepts form posts, and rejects invalid hosts" do
@@ -733,6 +853,30 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_supervised!({SymphonyElixirWeb.Endpoint, []})
   end
 
+  defp setup_delivery_pipeline(tasks, tracker_result) do
+    previous_env =
+      Map.new([:pipeline_database_path, :linear_client_module, :delivery_tracker_result, :delivery_tracker_test_pid], fn key ->
+        {key, Application.fetch_env(:symphony_elixir, key)}
+      end)
+
+    root = Path.join(System.tmp_dir!(), "symphony-delivery-live-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+    Application.put_env(:symphony_elixir, :linear_client_module, DeliveryTrackerClient)
+    Application.put_env(:symphony_elixir, :delivery_tracker_result, tracker_result)
+    Application.put_env(:symphony_elixir, :delivery_tracker_test_pid, self())
+    Enum.each(tasks, fn task -> :ok = Store.save_task(task) end)
+
+    on_exit(fn ->
+      File.rm_rf(root)
+
+      Enum.each(previous_env, fn
+        {key, {:ok, value}} -> Application.put_env(:symphony_elixir, key, value)
+        {key, :error} -> Application.delete_env(:symphony_elixir, key)
+      end)
+    end)
+  end
+
   defp static_snapshot do
     %{
       running: [
@@ -757,6 +901,7 @@ defmodule SymphonyElixir.ExtensionsTest do
         %{
           issue_id: "issue-retry",
           identifier: "MT-RETRY",
+          execution_identity: "PVT_project/PVTI_item/octo/app#7",
           issue_url: "https://example.org/issues/MT-RETRY",
           attempt: 2,
           due_in_ms: 2_000,

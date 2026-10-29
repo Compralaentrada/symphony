@@ -138,6 +138,23 @@ pre,
   gap: 1rem;
 }
 
+.dashboard-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.dashboard-nav a[aria-current="page"] {
+  background: var(--accent-soft);
+  border-color: rgba(16, 163, 127, 0.18);
+  color: var(--accent-ink);
+}
+
+.dashboard-nav a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .hero-card,
 .section-card,
 .metric-card,
@@ -351,6 +368,88 @@ pre,
   white-space: nowrap;
 }
 
+.session-timeline {
+  position: relative;
+  display: grid;
+  margin: 0.75rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.session-timeline::before {
+  position: absolute;
+  top: 0.85rem;
+  bottom: 0.85rem;
+  left: 0.28rem;
+  width: 1px;
+  background: var(--line-strong);
+  content: "";
+}
+
+.session-timeline-item {
+  position: relative;
+  min-width: 0;
+  padding: 0.8rem 0.25rem 1rem 1rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.session-timeline-item:last-child {
+  border-bottom: 0;
+}
+
+.session-timeline-marker {
+  position: absolute;
+  top: 1.1rem;
+  left: 0;
+  width: 0.58rem;
+  height: 0.58rem;
+  border: 2px solid white;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.session-timeline-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+
+.session-timeline-activity {
+  margin: 0.65rem 0;
+  overflow-wrap: anywhere;
+}
+
+.session-timeline-meta {
+  display: grid;
+  grid-template-columns: minmax(8rem, 0.6fr) minmax(0, 1.4fr);
+  gap: 0.75rem 1rem;
+  padding-top: 0.65rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.86rem;
+}
+
+.session-timeline-meta > div {
+  display: grid;
+  align-content: start;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.session-timeline-label {
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.session-timeline time {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
 .state-badge {
   display: inline-flex;
   align-items: center;
@@ -459,6 +558,10 @@ pre,
 
 @media (max-width: 560px) {
   .metric-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .session-timeline-meta {
     grid-template-columns: 1fr;
   }
 

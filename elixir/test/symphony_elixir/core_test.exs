@@ -364,7 +364,7 @@ defmodule SymphonyElixir.CoreTest do
     assert Process.alive?(runtime_pid)
   end
 
-  test "restarting the orchestrator does not overlap redispatched work" do
+  test "restarting the AgentRuntimeSupervisor cancels hooks before redispatching work" do
     issue_suffix = System.unique_integer([:positive])
 
     test_root =
@@ -375,6 +375,7 @@ defmodule SymphonyElixir.CoreTest do
 
     hook_marker = Path.join(test_root, "before-run-started")
     hook_fifo = Path.join(test_root, "before-run-blocker")
+    hook_pid_file = Path.join(test_root, "before-run-pids")
     runtime_supervisor_name = Module.concat(__MODULE__, "AgentRuntimeSupervisor#{issue_suffix}")
     task_supervisor_name = Module.concat(__MODULE__, "TaskSupervisor#{issue_suffix}")
     orchestrator_name = Module.concat(__MODULE__, "RestartOrchestrator#{issue_suffix}")
@@ -393,6 +394,15 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     on_exit(fn ->
+      if File.exists?(hook_pid_file) do
+        hook_pid_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.each(fn pid ->
+          if Regex.match?(~r/^\d+$/, pid), do: System.cmd("/bin/kill", ["-TERM", pid], stderr_to_stdout: true)
+        end)
+      end
+
       if pid = Process.whereis(runtime_supervisor_name) do
         GenServer.stop(pid)
       end
@@ -414,7 +424,8 @@ defmodule SymphonyElixir.CoreTest do
       tracker_kind: "memory",
       workspace_root: test_root,
       poll_interval_ms: 10,
-      hook_before_run: "mkfifo \"#{hook_fifo}\"; : > \"#{hook_marker}\"; read _ < \"#{hook_fifo}\"",
+      hook_after_create: required_skill_fixture_hook(),
+      hook_before_run: "printf '%s\\n' \"$$\" >> '#{hook_pid_file}'; mkfifo \"#{hook_fifo}\"; : > \"#{hook_marker}\"; read _ < \"#{hook_fifo}\"",
       hook_timeout_ms: 60_000
     )
 
@@ -447,9 +458,43 @@ defmodule SymphonyElixir.CoreTest do
     assert Process.alive?(first_worker_pid)
     assert eventually_value(fn -> if File.exists?(hook_marker), do: true end)
 
-    monitor_ref = Process.monitor(orchestrator_pid)
-    Process.exit(orchestrator_pid, :kill)
-    assert_receive {:DOWN, ^monitor_ref, :process, ^orchestrator_pid, :killed}, 1_000
+    first_hook_pid =
+      eventually_value(fn ->
+        case File.read(hook_pid_file) do
+          {:ok, contents} ->
+            case String.split(contents, "\n", trim: true) do
+              [first | _] -> first
+              _ -> nil
+            end
+
+          _ ->
+            nil
+        end
+      end)
+
+    monitor_ref = Process.monitor(runtime_supervisor_pid)
+    Process.exit(runtime_supervisor_pid, :kill)
+    assert_receive {:DOWN, ^monitor_ref, :process, ^runtime_supervisor_pid, :killed}, 1_000
+
+    assert eventually_value(fn ->
+             if not Process.alive?(orchestrator_pid) and not Process.alive?(task_supervisor_pid), do: true
+           end)
+
+    assert eventually_value(fn ->
+             case System.cmd("/bin/kill", ["-0", first_hook_pid], stderr_to_stdout: true) do
+               {_, 0} -> nil
+               _ -> true
+             end
+           end)
+
+    assert {:ok, restarted_runtime_supervisor_pid} =
+             SymphonyElixir.AgentRuntimeSupervisor.start_link(
+               name: runtime_supervisor_name,
+               task_supervisor_name: task_supervisor_name,
+               orchestrator_name: orchestrator_name
+             )
+
+    Process.unlink(restarted_runtime_supervisor_pid)
 
     restarted_pid =
       eventually_value(fn ->
@@ -485,6 +530,30 @@ defmodule SymphonyElixir.CoreTest do
 
     assert is_pid(second_worker_pid)
     assert Process.alive?(second_worker_pid)
+
+    hook_pids =
+      eventually_value(fn ->
+        case File.read(hook_pid_file) do
+          {:ok, contents} ->
+            case String.split(contents, "\n", trim: true) do
+              [first, second | _] -> {first, second}
+              _ -> nil
+            end
+
+          _ ->
+            nil
+        end
+      end)
+
+    assert {^first_hook_pid, second_hook_pid} = hook_pids
+    assert {_, 0} = System.cmd("/bin/kill", ["-0", second_hook_pid], stderr_to_stdout: true)
+
+    assert eventually_value(fn ->
+             case System.cmd("/bin/kill", ["-0", first_hook_pid], stderr_to_stdout: true) do
+               {_, 0} -> nil
+               _ -> true
+             end
+           end)
   end
 
   test "linear issue state reconciliation fetch with no running issues is a no-op" do
@@ -698,7 +767,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "missing running issues stop active agents without cleaning the workspace" do
+  test "two missing running issue refreshes stop the active agent without cleaning the workspace" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -761,6 +830,15 @@ defmodule SymphonyElixir.CoreTest do
         |> Map.put(:claimed, MapSet.new([issue_id]))
         |> Map.put(:retry_attempts, %{})
       end)
+
+      send(pid, :tick)
+      Process.sleep(100)
+      state = :sys.get_state(pid)
+
+      assert state.running[issue_id].pid == agent_pid
+      assert state.running[issue_id].consecutive_missing_refreshes == 1
+      assert MapSet.member?(state.claimed, issue_id)
+      assert Process.alive?(agent_pid)
 
       send(pid, :tick)
       Process.sleep(100)
@@ -1038,41 +1116,30 @@ defmodule SymphonyElixir.CoreTest do
   test "normal worker exit schedules active-state continuation retry" do
     issue_id = "issue-resume"
     ref = make_ref()
-    orchestrator_name = Module.concat(__MODULE__, :ContinuationOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
-
-    on_exit(fn ->
-      if Process.alive?(pid) do
-        Process.exit(pid, :normal)
-      end
-    end)
-
-    initial_state = :sys.get_state(pid)
+    issue = %Issue{id: issue_id, identifier: "MT-558", state: "In Progress", url: "https://example.org/issues/MT-558"}
 
     running_entry = %{
       pid: self(),
       ref: ref,
-      identifier: "MT-558",
-      issue: %Issue{id: issue_id, identifier: "MT-558", state: "In Progress"},
+      identifier: issue.identifier,
+      issue: issue,
       started_at: DateTime.utc_now()
     }
 
-    :sys.replace_state(pid, fn _ ->
-      initial_state
-      |> Map.put(:running, %{issue_id => running_entry})
-      |> Map.put(:claimed, MapSet.new([issue_id]))
-      |> Map.put(:retry_attempts, %{})
-    end)
+    state = %Orchestrator.State{
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      completed: MapSet.new(),
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
 
-    send(pid, {:DOWN, ref, :process, self(), :normal})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    assert {:noreply, state} = Orchestrator.handle_info({:DOWN, ref, :process, self(), :normal}, state)
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
-    assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_in_range(due_at_ms, 900, 1_100)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -1152,6 +1219,116 @@ defmodule SymphonyElixir.CoreTest do
              state.retry_attempts[issue_id]
 
     assert_due_in_range(due_at_ms, 9_000, 10_500)
+  end
+
+  test "orchestrator keeps retrying when slots stay full past many attempts" do
+    issue = %Issue{
+      id: "issue-permanent-retry",
+      identifier: "MT-RETRY",
+      title: "Retry until a slot opens",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-RETRY",
+      labels: [],
+      dispatchable: true
+    }
+
+    busy_issue = %Issue{
+      id: "issue-occupying-slot",
+      identifier: "MT-BUSY",
+      title: "Occupy the only slot",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-BUSY",
+      dispatchable: true
+    }
+
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      max_retry_backoff_ms: 50
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :PermanentRetryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    busy_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid, :normal)
+      if Process.alive?(busy_pid), do: send(busy_pid, :stop)
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+    end)
+
+    retry_token = make_ref()
+    busy_ref = make_ref()
+    now_ms = System.monotonic_time(:millisecond)
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | running: %{
+            busy_issue.id => %{
+              pid: busy_pid,
+              ref: busy_ref,
+              identifier: busy_issue.identifier,
+              issue: busy_issue,
+              session_id: "busy-session",
+              codex_app_server_pid: nil,
+              codex_input_tokens: 0,
+              codex_output_tokens: 0,
+              codex_total_tokens: 0,
+              last_codex_timestamp: nil,
+              last_codex_message: nil,
+              last_codex_event: nil,
+              started_at: DateTime.utc_now()
+            }
+          },
+          claimed: MapSet.new([issue.id, busy_issue.id]),
+          max_concurrent_agents: 1,
+          retry_attempts: %{
+            issue.id => %{
+              attempt: 100,
+              timer_ref: nil,
+              retry_token: retry_token,
+              due_at_ms: now_ms,
+              identifier: issue.identifier,
+              issue_url: issue.url,
+              error: "no available orchestrator slots"
+            }
+          }
+      }
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue, busy_issue])
+
+    send(pid, {:retry_issue, issue.id, retry_token})
+
+    retry =
+      eventually_value(fn ->
+        state = :sys.get_state(pid)
+
+        case Map.get(state.retry_attempts, issue.id) do
+          %{attempt: attempt} = entry when attempt >= 103 -> entry
+          _ -> nil
+        end
+      end)
+
+    assert %{attempt: attempt, error: "no available orchestrator slots"} = retry
+    assert attempt >= 103
+
+    assert %{retrying: [%{issue_id: "issue-permanent-retry", attempt: snapshot_attempt}]} =
+             Orchestrator.snapshot(orchestrator_name, 1_000)
+
+    assert snapshot_attempt >= 103
+    assert Map.has_key?(:sys.get_state(pid).running, busy_issue.id)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do

@@ -47,6 +47,10 @@ codex:
 
 The installation-level `merge_policy` front matter key accepts `human` (the default) or `auto`. A configured top-level value takes precedence over `tracker.provider.merge_policy`; when omitted, an explicit provider value remains supported. With `auto`, Review requests the deterministic merge gate; when the reviewed head SHA, base SHA, and required checks pass, Symphony merges and verifies the PR before closing the issue and moving its Project item to Done. Symphony never approves PRs automatically.
 
+The gate requires the current attempt's approved Review report and verifies that the reviewed head contains the current base commit. It accepts a missing GitHub check rollup when the host checks passed; if GitHub reports a rollup, it must be successful. GitHub still enforces branch protection and mergeability.
+
+If an automatic Review handoff reaches Human Review but its response is lost, Symphony keeps the task there for a human decision rather than assuming who moved it.
+
 You are working on a GitHub issue dispatched from the configured GitHub Projects v2 board.
 
 {% if attempt %}
@@ -61,7 +65,7 @@ Issue context:
 Identifier (repository#number): {{ issue.identifier }}
 Title: {{ issue.title }}
 Project status: {{ issue.state }}
-Labels (context only; they do not control routing): {{ issue.labels }}
+Labels: {{ issue.labels }} (the `qa` label selects the direct QA → Review route; other labels are context only)
 URL: {{ issue.url }}
 
 Description:
@@ -76,10 +80,10 @@ No description provided.
 The configured Project status is the source of dispatch:
 
 - Symphony reads and reconciles Project state. Each phase agent owns the GitHub writes for its lane through authorized host tools and preserves newer human decisions.
-- Ready: Symphony dispatches Build or resumes a human-requested correction on the same branch and PR.
+- Ready: Symphony dispatches Build, or starts directly in QA when the issue has the `qa` label; human-requested corrections resume on the same branch and PR.
 - Building: Build owns the issue claim, branch push, draft PR, report, and transition to QA. Its issue report records the configured branch and pushed SHA for later phases.
-- QA: the QA agent independently reviews the current SHA and reports every issue acceptance criterion with its exact text, status, procedure, and evidence references. Agent checks include their layer, exact command, result, status, and a reason when skipped, unstable, or unavailable. Symphony runs every `required_checks` command in the task workspace and records those results separately as host evidence; a required check that is missing or does not pass cannot pass QA. QA records coverage gaps with scenario, impact, missing coverage, and risk priority. An environment, access, or tool failure must produce an actionable blocker rather than a Builder code-change request.
-- Review: the Review agent reads all current-generation QA reports from the issue, verifies the latest report's SHA, complete criterion coverage, and required-check evidence, and uses earlier reports to carry forward findings before preparing the PR for human review or requesting changes. Symphony's host-run checks are evidenced in the report, so Review does not require a separate GitHub status context.
+- QA: the QA agent independently reviews the current SHA and reports every issue acceptance criterion with its exact text, status, procedure, and evidence references. Agent checks include their layer, exact command, result, status, and a reason when skipped, unstable, or unavailable. On the direct `qa` route, the existing PR supplies the SHA and PR number; QA claims the item into QA without a Build report. Symphony runs each `required_checks` command in the task workspace and records it separately as host evidence; a missing or non-passing required check cannot pass QA. QA records coverage gaps with scenario, impact, missing coverage, and risk priority. Environment, access, or tool failures require an actionable blocker rather than a Builder code-change request.
+- Review: the Review agent reads all current-generation QA reports from the issue, verifies the latest report's SHA, complete criterion coverage, and required-check evidence, and carries forward earlier findings before preparing the PR for human review or requesting changes. Symphony's host-run checks are evidenced in the report, so Review does not require a separate GitHub status context.
 - Human Review: the PR is ready for a person; Symphony waits for a merge or a move back to Ready.
 - Blocked: the phase agent records its reason through `github_workflow`; when a deterministic host preflight prevents the phase from starting, Symphony coordinates the restricted `diagnostic` lane to inspect the workpad, workspace, and PR and record the blocker. After it is resolved, a human moves the issue to Ready. If QA or Review was blocked and the PR head changed or is missing, Symphony restarts at Build and repeats QA and Review.
 - Done: the PR merge into the configured base branch has been confirmed.
@@ -87,7 +91,7 @@ The configured Project status is the source of dispatch:
 - Backlog: not dispatched.
 - Dropped: terminal work without a merge. Include a human-authored `Drop reason: <reason>` line in the issue body; after `no_changes`, this confirms the decision to discard the work.
 
-The issue identifier starts with the target repository in the form owner/repository#number. Work only in that repository. Do not assume a specific organization, repository, or default branch. The runtime has selected a repository profile and checked out the task branch from that profile's base branch. When Build resumes without an accepted SHA, a reused workspace fetches that task branch and fast-forwards when possible; if local and remote work diverged, both copies of the branch are missing, or local changes prevent the update, Symphony starts the restricted `diagnostic` lane and preserves the workspace. Before QA and Review, Symphony verifies that the PR head and clean workspace match the Build SHA. A deterministic preflight failure starts the `diagnostic` lane in the current attempt; that agent reads saved issue reports and inspects the workspace and PR, then records the blocker and recovery instructions through authorized GitHub tools. The coordinator never writes the diagnostic report or Project status, and phase evidence stays in the issue workpad rather than prompts. Transient tracker read failures retry without creating a blocker.
+The issue identifier starts with the target repository in the form owner/repository#number. Work only in that repository. Do not assume a specific organization, repository, or default branch. The runtime has selected a repository profile and checked out the task branch from that profile's base branch. When Build resumes without an accepted SHA, a reused workspace fetches that task branch and fast-forwards when possible; if local and remote work diverged, both copies of the branch are missing, or local changes prevent the update, Symphony starts the restricted `diagnostic` lane and preserves the workspace. Before QA and Review, Symphony verifies that the PR head and clean workspace match the Build SHA, or the PR SHA saved at initial direct QA dispatch. A deterministic preflight failure starts the `diagnostic` lane in the current attempt; that agent reads saved issue reports and inspects the workspace and PR, then records the blocker and recovery instructions through authorized GitHub tools. The coordinator never writes the diagnostic report or Project status, and phase evidence stays in the issue workpad rather than prompts. Transient tracker read failures retry without creating a blocker.
 
 Use `github_workflow` for GitHub writes made by the agent. `github_api` is read-only and scoped to the task repository. Do not use `gh` or shell commands to write issues, Project items, or pull requests. Git push is allowed for the Build handoff. Never copy tracker tokens into the workpad or command output.
 
@@ -147,7 +151,7 @@ Impeccable and TDD are not forced into unattended sessions.
 2. Use the repository's existing patterns and keep changes within the issue scope.
 3. Run the issue's required validation before each push. Record exact commands and results in the workpad.
 4. If validation or a required dependency is blocked, record what failed and why; do not claim it passed.
-5. For issue comments, labels, and closure, use the lane-authorized `github_workflow` tool. `github_api` is read-only; do not use `gh` or shell commands for GitHub writes. Do not use labels for Symphony routing.
+5. For issue comments, labels, and closure, use the lane-authorized `github_workflow` tool. `github_api` is read-only; do not use `gh` or shell commands for GitHub writes. The `qa` label selects the direct QA route; Project status controls dispatch eligibility.
 
 ## Step 2: Prepare a human handoff
 

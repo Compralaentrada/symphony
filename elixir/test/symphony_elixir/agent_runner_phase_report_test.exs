@@ -465,6 +465,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert length(prompts) == 2
       assert hd(prompts) =~ "Each finding must include the exact keys id, reproduction, and criterion as non-empty strings."
       assert hd(prompts) =~ "Pipeline phase: independent QA."
+      assert hd(prompts) =~ "claim"
       assert hd(prompts) =~ "read_workpad"
       assert hd(prompts) =~ "report_context.host_checks"
       assert hd(prompts) =~ "complete human-readable Markdown comment in `body`"
@@ -608,9 +609,12 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       [initial_turn, correction_turn] = turn_starts
       review_prompt = get_in(initial_turn, ["params", "input", Access.at(0), "text"])
       assert review_prompt =~ "Pipeline phase: autonomous code review."
+      assert review_prompt =~ "claim"
       assert review_prompt =~ "Do not invoke the repository's `code-review` skill or its Markdown report format"
       assert review_prompt =~ "read_workpad"
       assert review_prompt =~ "report_context.task"
+      assert review_prompt =~ "The configured merge policy is human."
+      assert review_prompt =~ "outcome (passed, merged, changes_requested, or blocked)"
       refute review_prompt =~ "finding-from-task"
       refute review_prompt =~ "symphony/branch-from-task"
       refute review_prompt =~ report["sha"]
@@ -631,6 +635,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
                "The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result."
 
       schema = get_in(initial_turn, ["params", "outputSchema"])
+      assert "merged" in get_in(schema, ["properties", "outcome", "enum"])
       assert schema["type"] == "object"
       assert "outcome" in schema["required"]
       assert "findings" in schema["required"]

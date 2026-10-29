@@ -5,8 +5,10 @@ defmodule SymphonyElixir.Workspace do
 
   require Logger
   alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.Tracker.Issue
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
+  @workspace_identity_conflict_status 45
   @project_branch_diverged_status 42
   @project_branch_missing_status 43
   @project_branch_dirty_status 44
@@ -30,6 +32,7 @@ defmodule SymphonyElixir.Workspace do
 
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
+           :ok <- migrate_legacy_workspace(issue_or_identifier, safe_id, workspace, worker_host),
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
         case prepare_workspace(workspace, issue_context, created?, worker_host, refresh_project_branch?) do
           :ok ->
@@ -275,6 +278,62 @@ defmodule SymphonyElixir.Workspace do
   def run_required_check(_workspace, _command, _sha, _issue_or_identifier, _worker_host),
     do: {:error, :check_unavailable}
 
+  @spec verify_skill_snapshot(Path.t(), [map()], worker_host()) :: :ok | {:error, term()}
+  def verify_skill_snapshot(_workspace, [], _worker_host), do: :ok
+
+  def verify_skill_snapshot(workspace, snapshot, worker_host)
+      when is_binary(workspace) and is_list(snapshot) do
+    issue = %{issue_id: nil, issue_identifier: "skill-readiness"}
+
+    case run_hook(skill_snapshot_command(snapshot), workspace, issue, "skill_readiness", worker_host) do
+      :ok ->
+        :ok
+
+      {:error, {:workspace_hook_failed, "skill_readiness", status, output}} ->
+        {:error, {:skill_snapshot_unavailable, status, output}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp skill_snapshot_command(snapshot) do
+    checks = Enum.flat_map(snapshot, &skill_snapshot_checks/1)
+
+    [
+      "if command -v sha256sum >/dev/null 2>&1; then hash_skill_file() { sha256sum \"$1\" | awk '{print $1}'; }; elif command -v shasum >/dev/null 2>&1; then hash_skill_file() { shasum -a 256 \"$1\" | awk '{print $1}'; }; else exit 127; fi",
+      Enum.join(checks, "\n")
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp skill_snapshot_checks(%{"name" => name, "fingerprint" => fingerprint})
+       when is_binary(name) and is_binary(fingerprint) do
+    if Regex.match?(~r/\A[a-z0-9-]+\z/, name) and Regex.match?(~r/\A[[:xdigit:]]{64}\z/, fingerprint) do
+      skill_dir = Path.join([".agents", "skills", name])
+
+      [
+        "skill_dir=#{shell_escape(skill_dir)}",
+        "[ ! -L .agents ] && [ ! -L .agents/skills ] && [ ! -L \"$skill_dir\" ] || { printf '%s\\n' #{shell_escape("Skill path contains a symlink: " <> name)}; exit 20; }",
+        "[ -f \"$skill_dir/SKILL.md\" ] || { printf '%s\\n' #{shell_escape("Required skill file is missing: " <> skill_dir <> "/SKILL.md")}; exit 20; }",
+        "[ -f \"$skill_dir/CHECKSUMS.sha256\" ] || { printf '%s\\n' #{shell_escape("Skill checksum list is missing: " <> skill_dir <> "/CHECKSUMS.sha256")}; exit 20; }",
+        "actual_fingerprint=$(hash_skill_file \"$skill_dir/CHECKSUMS.sha256\") || exit 127",
+        "[ \"$actual_fingerprint\" = #{shell_escape(fingerprint)} ] || { printf '%s\\n' #{shell_escape("Skill fingerprint mismatch: " <> name <> " expected=" <> fingerprint)} \"actual=$actual_fingerprint\"; exit 21; }",
+        "listed_count=$(wc -l < \"$skill_dir/CHECKSUMS.sha256\" | tr -d '[:space:]')",
+        "actual_count=$(find \"$skill_dir\" -type f ! -path \"$skill_dir/CHECKSUMS.sha256\" | wc -l | tr -d '[:space:]')",
+        "[ \"$listed_count\" = \"$actual_count\" ] || { printf '%s\\n' #{shell_escape("Skill file list differs from the lock: " <> name)}; exit 22; }",
+        "while IFS=' ' read -r expected relative; do",
+        "  actual=$(hash_skill_file \"$skill_dir/$relative\") || exit 127",
+        "  [ \"$actual\" = \"$expected\" ] || { printf '%s\\n' \"Skill file checksum mismatch: $skill_dir/$relative expected=$expected actual=$actual\"; exit 23; }",
+        "done < \"$skill_dir/CHECKSUMS.sha256\""
+      ]
+    else
+      ["printf '%s\\n' 'Invalid skill snapshot'; exit 23"]
+    end
+  end
+
+  defp skill_snapshot_checks(_snapshot), do: ["printf '%s\\n' 'Invalid skill snapshot'; exit 23"]
+
   defp verify_required_check_workspace(workspace, sha, issue_or_identifier, worker_host) do
     command = """
     actual_sha=$(git rev-parse --verify HEAD 2>/dev/null) || exit 127
@@ -336,13 +395,68 @@ defmodule SymphonyElixir.Workspace do
     {:ok, Path.join(Config.settings!().workspace.root, safe_id)}
   end
 
-  @doc """
-  Returns the collision-safe directory name for an issue identifier.
+  defp migrate_legacy_workspace(%Issue{identifier: identifier}, safe_id, workspace, worker_host)
+       when is_binary(identifier) do
+    legacy_key = workspace_key(identifier)
 
-  The hash is derived from the original identifier so callers that only know the identifier can
-  derive the same key as callers holding a full tracker issue.
+    if legacy_key == safe_id do
+      :ok
+    else
+      with {:ok, legacy_workspace} <- workspace_path_for_issue(legacy_key, worker_host),
+           :ok <- validate_workspace_path(legacy_workspace, worker_host) do
+        migrate_workspace_path(legacy_workspace, workspace, worker_host)
+      end
+    end
+  end
+
+  defp migrate_legacy_workspace(_issue, _safe_id, _workspace, _worker_host), do: :ok
+
+  defp migrate_workspace_path(legacy_workspace, workspace, nil) do
+    cond do
+      File.exists?(legacy_workspace) and File.exists?(workspace) ->
+        {:error, :workspace_identity_migration_conflict}
+
+      File.exists?(legacy_workspace) ->
+        case File.rename(legacy_workspace, workspace) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:workspace_identity_migration_failed, reason}}
+        end
+
+      true ->
+        :ok
+    end
+  end
+
+  defp migrate_workspace_path(legacy_workspace, workspace, worker_host) when is_binary(worker_host) do
+    script =
+      [
+        "set -eu",
+        remote_shell_assign("legacy_workspace", legacy_workspace),
+        remote_shell_assign("workspace", workspace),
+        "if [ -e \"$legacy_workspace\" ]; then",
+        "  if [ -e \"$workspace\" ]; then exit #{@workspace_identity_conflict_status}; fi",
+        "  mv \"$legacy_workspace\" \"$workspace\"",
+        "fi"
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> :ok
+      {:ok, {_output, @workspace_identity_conflict_status}} -> {:error, :workspace_identity_migration_conflict}
+      {:ok, {output, status}} -> {:error, {:workspace_identity_migration_failed, worker_host, status, output}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc """
+  Returns the collision-safe directory name for an execution identity.
+
+  The hash is derived from the original identity so sanitizing path characters cannot create
+  collisions.
   """
   @spec workspace_key(map() | String.t() | nil) :: String.t()
+  def workspace_key(%Issue{} = issue), do: workspace_key(Issue.execution_identity(issue))
+
   def workspace_key(%{identifier: identifier}), do: workspace_key(identifier)
 
   def workspace_key(identifier) when is_binary(identifier) do
@@ -500,7 +614,7 @@ defmodule SymphonyElixir.Workspace do
           ]
           |> Enum.join("\n")
 
-        run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms)
+        run_remote_hook_command(worker_host, script, "before_remove", Config.settings!().hooks.timeout_ms)
         |> case do
           {:ok, {output, status}} ->
             handle_hook_command_result(
@@ -528,25 +642,17 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
-    task =
-      Task.async(fn ->
-        System.cmd("sh", ["-lc", command],
-          cd: workspace,
-          env: hook_environment(issue_context),
-          stderr_to_stdout: true
-        )
-      end)
-
-    case Task.yield(task, timeout_ms) do
+    case run_local_hook_command(command, workspace, issue_context, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
-      nil ->
-        Task.shutdown(task, :brutal_kill)
-
+      :timeout ->
         Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local timeout_ms=#{timeout_ms}")
 
         {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -565,7 +671,7 @@ defmodule SymphonyElixir.Workspace do
       |> Enum.reject(&(&1 == ""))
       |> Enum.join("\n")
 
-    case run_remote_command(worker_host, script, timeout_ms) do
+    case run_remote_hook_command(worker_host, script, hook_name, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
@@ -574,6 +680,139 @@ defmodule SymphonyElixir.Workspace do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp run_local_hook_command(command, workspace, issue_context, timeout_ms) do
+    executable = System.find_executable("sh")
+
+    if is_binary(executable) do
+      run_hook_port(
+        fn ->
+          {:ok,
+           Port.open(
+             {:spawn_executable, String.to_charlist(executable)},
+             [
+               :binary,
+               :exit_status,
+               :stderr_to_stdout,
+               args: [~c"-lc", String.to_charlist(command)],
+               cd: String.to_charlist(workspace),
+               env:
+                 Enum.map(hook_environment(issue_context), fn {name, value} ->
+                   {String.to_charlist(name), String.to_charlist(value)}
+                 end)
+             ]
+           )}
+        end,
+        timeout_ms
+      )
+    else
+      {:ok, {"sh executable not found", 127}}
+    end
+  end
+
+  defp run_remote_hook_command(worker_host, script, hook_name, timeout_ms) do
+    case run_hook_port(fn -> SSH.start_port(worker_host, script) end, timeout_ms) do
+      {:ok, cmd_result} ->
+        {:ok, cmd_result}
+
+      :timeout ->
+        {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp run_hook_port(start_port, timeout_ms) do
+    owner = self()
+    reference = make_ref()
+
+    {runner, monitor} =
+      spawn_monitor(fn -> run_hook_port_worker(owner, reference, start_port, timeout_ms) end)
+
+    receive do
+      {^reference, result} ->
+        Process.demonitor(monitor, [:flush])
+        result
+
+      {:DOWN, ^monitor, :process, ^runner, reason} ->
+        {:error, {:workspace_hook_runner_failed, reason}}
+    end
+  end
+
+  defp run_hook_port_worker(owner, reference, start_port, timeout_ms) do
+    owner_monitor = Process.monitor(owner)
+
+    result =
+      case start_port.() do
+        {:ok, port} ->
+          case collect_hook_port(
+                 port,
+                 System.monotonic_time(:millisecond) + timeout_ms,
+                 [],
+                 owner,
+                 owner_monitor
+               ) do
+            {:ok, command_result} ->
+              {:ok, command_result}
+
+            :timeout ->
+              terminate_hook_port(port)
+              :timeout
+
+            :owner_down ->
+              terminate_hook_port(port)
+              :owner_down
+          end
+
+        {:error, _reason} = error ->
+          error
+      end
+
+    Process.demonitor(owner_monitor, [:flush])
+    if result != :owner_down, do: send(owner, {reference, result})
+  end
+
+  defp collect_hook_port(port, deadline, output, owner, owner_monitor) do
+    remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {^port, {:data, data}} ->
+        collect_hook_port(port, deadline, [data | output], owner, owner_monitor)
+
+      {^port, {:exit_status, status}} ->
+        {:ok, {output |> Enum.reverse() |> IO.iodata_to_binary(), status}}
+
+      {:DOWN, ^owner_monitor, :process, ^owner, _reason} ->
+        :owner_down
+    after
+      remaining_ms ->
+        :timeout
+    end
+  end
+
+  defp terminate_hook_port(port) do
+    case :erlang.port_info(port, :os_pid) do
+      {:os_pid, os_pid} ->
+        System.cmd("/bin/kill", ["-TERM", Integer.to_string(os_pid)], stderr_to_stdout: true)
+
+        receive do
+          {^port, {:exit_status, _status}} -> :ok
+        after
+          100 ->
+            System.cmd("/bin/kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
+        end
+
+      _ ->
+        :ok
+    end
+
+    try do
+      Port.close(port)
+    rescue
+      ArgumentError -> :ok
     end
   end
 

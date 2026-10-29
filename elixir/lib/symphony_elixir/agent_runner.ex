@@ -12,6 +12,54 @@ defmodule SymphonyElixir.AgentRunner do
   @workspace_refresh_blockers [:project_branch_diverged, :project_branch_missing, :project_branch_dirty]
 
   @doc false
+  @spec preflight_skills(Issue.t(), map() | nil, atom() | String.t() | nil, worker_host()) ::
+          :ok | {:ok, :skills_preflighted} | {:error, term()}
+  def preflight_skills(%Issue{} = issue, task, phase, worker_host \\ nil) do
+    snapshot = Skills.attempt_snapshot(issue, task, phase)
+
+    if snapshot == [] do
+      :ok
+    else
+      opts = [phase: normalize_phase(phase), pipeline_task: task || %{}]
+      task = task || %{}
+      has_pull_request? = not is_nil(task["pr_number"])
+
+      workspace_opts = [
+        require_existing_project_branch: has_pull_request? and phase_with_pr?(opts),
+        create_project_branch: true,
+        refresh_project_branch: refresh_project_branch?(opts)
+      ]
+
+      case Workspace.create_for_issue(issue, worker_host, workspace_opts) do
+        {:ok, workspace} ->
+          preflight_verified_skills(workspace, snapshot, worker_host)
+
+        {:error, reason} ->
+          preflight_workspace_error(issue, snapshot, worker_host, reason)
+      end
+    end
+  end
+
+  defp preflight_verified_skills(workspace, snapshot, worker_host) do
+    with :ok <- verify_skill_snapshot(workspace, snapshot, worker_host), do: {:ok, :skills_preflighted}
+  end
+
+  defp preflight_workspace_error(issue, snapshot, worker_host, reason) when reason in @workspace_refresh_blockers do
+    case Workspace.create_for_issue(issue, worker_host, create_project_branch: false) do
+      {:ok, workspace} ->
+        with :ok <- verify_skill_snapshot(workspace, snapshot, worker_host) do
+          {:error, {:workspace_preflight, reason}}
+        end
+
+      {:error, fallback_reason} ->
+        {:error, {:workspace_preflight, fallback_reason}}
+    end
+  end
+
+  defp preflight_workspace_error(_issue, _snapshot, _worker_host, reason),
+    do: {:error, {:workspace_preflight, reason}}
+
+  @doc false
   @spec continue_with_issue_for_test(Issue.t(), ([String.t()] -> term())) ::
           {:continue, Issue.t()} | {:done, Issue.t()} | {:error, term()}
   def continue_with_issue_for_test(%Issue{} = issue, issue_state_fetcher)
@@ -42,7 +90,10 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
     diagnostic? = Keyword.get(opts, :diagnostic, false)
-    refresh_project_branch? = not diagnostic? and refresh_project_branch?(opts)
+
+    refresh_project_branch? =
+      not diagnostic? and not Keyword.get(opts, :skills_preflighted, false) and refresh_project_branch?(opts)
+
     task = Keyword.get(opts, :pipeline_task, %{})
     has_pull_request? = is_map(task) and not is_nil(Map.get(task, "pr_number"))
 
@@ -91,7 +142,7 @@ defmodule SymphonyElixir.AgentRunner do
       {false, phase, task} when phase in [:qa, :review] and is_map(task) ->
         case Map.get(task, "current_sha") do
           sha when is_binary(sha) and sha != "" ->
-            verify_pipeline_workspace_sha_at_sha(workspace, issue, sha, worker_host)
+            verify_pipeline_workspace_sha_at_sha(workspace, issue, sha, worker_host, phase == :qa and task["direct_qa"] == true)
 
           _ ->
             {:phase_result, {:system_blocker, blocked_workspace_report(:project_branch_sha_missing, issue)}}
@@ -102,8 +153,8 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp verify_pipeline_workspace_sha_at_sha(workspace, issue, sha, worker_host) do
-    case verify_pipeline_pr_sha(issue, sha) do
+  defp verify_pipeline_workspace_sha_at_sha(workspace, issue, sha, worker_host, require_draft?) do
+    case verify_pipeline_pr_sha(issue, sha, require_draft?) do
       :ok -> verify_accepted_workspace_sha(workspace, issue, sha, worker_host)
       result -> result
     end
@@ -115,12 +166,18 @@ defmodule SymphonyElixir.AgentRunner do
   def verify_pipeline_workspace_sha_for_test(workspace, issue, opts, worker_host),
     do: verify_pipeline_workspace_sha(workspace, issue, opts, worker_host)
 
-  defp verify_pipeline_pr_sha(issue, accepted_sha) do
-    if Pipeline.enabled?(), do: read_pipeline_pr_sha(issue, accepted_sha), else: :ok
+  defp verify_pipeline_pr_sha(issue, accepted_sha, require_draft?) do
+    if Pipeline.enabled?(), do: read_pipeline_pr_sha(issue, accepted_sha, require_draft?), else: :ok
   end
 
-  defp read_pipeline_pr_sha(issue, accepted_sha) do
+  defp read_pipeline_pr_sha(issue, accepted_sha, require_draft?) do
     case Tracker.pull_request(issue) do
+      {:ok, %{sha: ^accepted_sha, draft: true}} when require_draft? ->
+        :ok
+
+      {:ok, %{sha: ^accepted_sha}} when require_draft? ->
+        {:phase_result, {:system_blocker, blocked_workspace_report(:project_pr_not_draft, issue)}}
+
       {:ok, %{sha: ^accepted_sha}} ->
         :ok
 
@@ -237,6 +294,12 @@ defmodule SymphonyElixir.AgentRunner do
   defp blocked_workspace_report_content(:project_branch_sha_missing, _locale),
     do: {"QA/Review has no Build-accepted SHA to validate the workspace.", "Move the issue to Ready to rerun Build against the current PR branch before QA and Review."}
 
+  defp blocked_workspace_report_content(:project_pr_not_draft, :es),
+    do: {"La PR debe estar en borrador antes de ejecutar QA.", "Pasa la PR a borrador y mueve la issue a Ready para repetir QA."}
+
+  defp blocked_workspace_report_content(:project_pr_not_draft, _locale),
+    do: {"The PR must be a draft before running QA.", "Mark the PR as draft, then move the issue to Ready to retry QA."}
+
   defp blocked_workspace_report_content(:project_pr_head_changed, :es),
     do: {"La cabeza de la PR cambió después de que Build aceptara el SHA.", "Mueve la issue de Blocked a Ready para repetir Build, QA y Review sobre la cabeza actual de la PR."}
 
@@ -297,9 +360,13 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    selected_repo_skills = Skills.select(issue, selected_skill_phase(opts))
+    selected_skill_snapshot =
+      Skills.attempt_snapshot(issue, Keyword.get(opts, :pipeline_task), selected_skill_phase(opts))
 
-    opts = Keyword.put(opts, :selected_repo_skills, selected_repo_skills)
+    opts =
+      opts
+      |> Keyword.put(:selected_skill_snapshot, selected_skill_snapshot)
+      |> Keyword.put(:selected_repo_skills, Skills.names(selected_skill_snapshot))
 
     opts =
       Keyword.put_new(
@@ -685,9 +752,9 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp pipeline_phase_instructions(:qa, _opts) do
     """
-    Pipeline phase: independent QA. Read the issue's workpad and current-generation Build reports with `github_workflow` operation `read_workpad`; use the saved task records to identify the accepted commit, branch, required checks, and prior findings.
-    Symphony runs the configured host checks on the accepted SHA. `read_workpad` returns authoritative `report_context.host_checks`, required checks, and locale-specific canonical QA text. Copy host evidence exactly into the report and hidden JSON; identify it as host evidence, not agent work. Do not modify files or invent check results.
-    Do not modify files or invent results. For every acceptance criterion, record its exact text, status, concrete procedure, and evidence references. Each reference must identify an agent check by id or a host check as `host:<exact command>`. A summary never covers an untested criterion.
+    Pipeline phase: independent QA. Before any other GitHub write, call `github_workflow` with operation `claim`; stop if the claim is rejected. This moves a requeued Ready item to QA and confirms an item already in QA. On a direct `qa` route there is no Build report; use `report_context.task` for the accepted commit, branch, required checks, and PR. Then read the issue's workpad and current-generation phase reports with `github_workflow` operation `read_workpad`; use the saved task records to identify the accepted commit, branch, required checks, and prior findings.
+    Symphony runs the configured host checks on the accepted SHA. `read_workpad` returns authoritative `report_context.host_checks`, required checks, and locale-specific canonical QA text. Copy host evidence exactly into the report and hidden JSON; identify it as host evidence, not agent work. Do not modify files or invent results.
+    For every acceptance criterion, record its exact text, status, concrete procedure, and evidence references. Each reference must identify an agent check by id or a host check as `host:<exact command>`. A summary never covers an untested criterion.
     Record agent checks with their layer (`unit`, `component`, `e2e`, or `manual`), exact command when applicable, status, reproducible result, evidence reference, and whether they are required. Use only `passed`, `failed`, `unstable`, `skipped`, or `unavailable`; skipped, unstable, and unavailable checks need a reason. A required check that is not passed cannot approve QA.
     Keep Symphony-run results in `host_checks`; they are host evidence, not agent work. Include the accepted SHA. Analyze uncovered scenarios with impact and missing coverage, order high-risk gaps first, and consider errors, limits, permissions, and determinism when relevant.
     If environment, access, or tooling prevents verification, use outcome `blocked`, state what is missing, and give an actionable recovery step for the environment/tool. Do not request a code change from Builder for an operational blocker. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings.
@@ -697,15 +764,17 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp pipeline_phase_instructions(:review, _opts) do
+    merge_policy = Map.get(Config.settings!().tracker.provider, "merge_policy", "human")
+
     """
-    Pipeline phase: autonomous code review. Read the issue's workpad and all current-generation QA reports with `github_workflow` operation `read_workpad` before reviewing. Use those task records and `report_context.task` to identify the accepted commit, branch, QA findings, and findings to resolve. Include the task's branch, base branch, PR number, and current SHA in your report, plus every prior finding not explicitly resolved.
+    Pipeline phase: autonomous code review. Before any other GitHub write, call `github_workflow` with operation `claim`; stop if the claim is rejected. This moves a requeued Ready item to Review and confirms an item already in Review. Then read the issue's workpad and all current-generation QA reports with `github_workflow` operation `read_workpad` before reviewing. Use those task records and `report_context.task` to identify the accepted commit, branch, QA findings, and findings to resolve. Include the task's branch, base branch, PR number, and current SHA in your report, plus every prior finding not explicitly resolved.
     Use the QA report's host-check evidence for its recorded SHA; do not require a separate GitHub status context for Symphony's host-run check.
     Do not invoke the repository's `code-review` skill or its Markdown report format; perform this review directly under the pipeline's JSON contract.
     The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
     Do not modify files. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
     Update the persistent workpad with review findings and resolutions using `github_workflow` operation `workpad`.
-    With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`, then call `request_merge`; if the host confirms the merge, hand off outcome `merged` so the host verifies it before closing the issue and moving the item to Done. If the gate rejects the request, leave the PR in Human Review.
-    Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
+    The configured merge policy is #{merge_policy}. With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`, then call `request_merge`; if the host confirms the merge, hand off outcome `merged` so the host verifies it before closing the issue and moving the item to Done. If the gate rejects the request, leave the PR in Human Review.
+    Finish with exactly one JSON object containing outcome (passed, merged, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end
 
@@ -754,12 +823,18 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp normalize_phase_report(report), do: report
 
-  defp ensure_skills_available(_workspace, _issue, _opts, worker_host) when is_binary(worker_host), do: :ok
+  defp ensure_skills_available(workspace, _issue, opts, worker_host) do
+    verify_skill_snapshot(workspace, Keyword.fetch!(opts, :selected_skill_snapshot), worker_host)
+  end
 
-  defp ensure_skills_available(workspace, issue, opts, nil),
-    do: Skills.ensure_available(workspace, issue, selected_skill_phase(opts))
+  defp verify_skill_snapshot(workspace, snapshot, nil), do: Skills.verify_snapshot(workspace, snapshot)
+  defp verify_skill_snapshot(workspace, snapshot, worker_host), do: Workspace.verify_skill_snapshot(workspace, snapshot, worker_host)
 
   defp selected_skill_phase(opts), do: if(Keyword.get(opts, :diagnostic, false), do: :diagnostic, else: Keyword.get(opts, :phase))
+
+  defp normalize_phase(phase) when is_atom(phase), do: phase
+  defp normalize_phase(phase) when phase in ["build", "qa", "review", "diagnostic", "finalize"], do: String.to_existing_atom(phase)
+  defp normalize_phase(_phase), do: nil
 
   defp do_run_codex_turns(
          app_session,
@@ -893,7 +968,7 @@ defmodule SymphonyElixir.AgentRunner do
     properties = %{
       "outcome" => %{
         "type" => "string",
-        "enum" => ["passed", "changes_requested", "blocked", "failed", "defects_found"]
+        "enum" => ["passed", "changes_requested", "blocked", "failed", "defects_found"] ++ if(phase == :review, do: ["merged"], else: [])
       },
       "summary" => %{"type" => "string"},
       "findings" => %{
