@@ -282,6 +282,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "worker_host" => nil,
                  "workspace_path" => nil,
                  "session_id" => "thread-http",
+                 "model" => nil,
+                 "reasoning_effort" => nil,
                  "turn_count" => 7,
                  "last_event" => "notification",
                  "last_message" => "rendered",
@@ -416,7 +418,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       end)
     end)
 
-    task = %{"issue_id" => "octo/app#7", "phase" => "qa", "status" => "qa"}
+    task = %{"issue_id" => "octo/app#7", "generation" => 1, "phase" => "qa", "status" => "qa"}
     assert :ok = Store.save_task(task)
     start_test_endpoint(snapshot_timeout_ms: 50)
 
@@ -443,6 +445,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert found["tasks"] == [
              %{
                "task" => task,
+               "latest_phase_result" => nil,
                "tracker_issue" => %{
                  "lookup" => "found",
                  "issue" => %{
@@ -576,7 +579,13 @@ defmodule SymphonyElixir.ExtensionsTest do
     pipeline_entry =
       snapshot.running
       |> hd()
-      |> Map.merge(%{issue_id: "issue-pipeline", identifier: "MT-PIPELINE", pipeline_phase: "review"})
+      |> Map.merge(%{
+        issue_id: "issue-pipeline",
+        identifier: "MT-PIPELINE",
+        pipeline_phase: "review",
+        model: "gpt-6-luna",
+        reasoning_effort: "max"
+      })
 
     snapshot = put_in(snapshot.running, snapshot.running ++ [pipeline_entry])
 
@@ -612,6 +621,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Offline"
     assert html =~ "Copy ID"
     assert html =~ "Latest activity"
+    assert html =~ "Model"
+    assert html =~ "gpt-6-luna"
+    assert html =~ "Reasoning"
+    assert html =~ "max"
+    assert html =~ "No disponible"
     assert html =~ "Pipeline phase"
     assert html =~ "review"
     assert length(Regex.scan(~r/Pipeline phase/, html)) == 1
@@ -623,6 +637,8 @@ defmodule SymphonyElixir.ExtensionsTest do
       |> Enum.filter(&(&1["issue_identifier"] == "MT-PIPELINE"))
 
     assert pipeline_payload["pipeline_phase"] == "review"
+    assert pipeline_payload["model"] == "gpt-6-luna"
+    assert pipeline_payload["reasoning_effort"] == "max"
 
     [regular_payload] =
       get(build_conn(), "/api/v1/state")
@@ -754,7 +770,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   test "delivery dashboard navigates from operations and renders current tracker issues" do
-    task = %{"issue_id" => "octo/app#7", "phase" => "qa", "status" => "local-only-status"}
+    task = %{"issue_id" => "octo/app#7", "generation" => 1, "phase" => "review", "status" => "human_review"}
 
     issue = %SymphonyElixir.Tracker.Issue{
       id: "octo/app#7",
@@ -765,6 +781,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     }
 
     setup_delivery_pipeline([task], {:ok, [issue]})
+
+    assert :ok =
+             Store.commit_phase(task, "review", 1, %{"outcome" => "passed", "summary" => "Review passed", "sha" => "abc123"}, [])
+
     start_test_endpoint(snapshot_timeout_ms: 50)
 
     {:ok, operations_view, operations_html} = live(build_conn(), "/")
@@ -780,12 +800,13 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert has_element?(delivery_view, "tbody tr td", "octo/app#7")
     assert html =~ "Current title"
     assert html =~ "Human Review"
+    assert has_element?(delivery_view, "tbody tr td", "review · passed")
+    refute html =~ "Done"
     assert html =~ ~s(href="https://example.org/octo/app/issues/7")
-    refute html =~ "local-only-status"
   end
 
   test "delivery dashboard distinguishes empty, missing, and unavailable tracker states" do
-    task = %{"issue_id" => "octo/app#7", "phase" => "qa", "status" => "local-only-status"}
+    task = %{"issue_id" => "octo/app#7", "generation" => 1, "phase" => "qa", "status" => "qa"}
     setup_delivery_pipeline([], {:ok, []})
     start_test_endpoint(snapshot_timeout_ms: 50)
 
@@ -798,13 +819,13 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     {:ok, _view, missing_html} = live(build_conn(), "/delivery")
     assert missing_html =~ "Issue not found"
-    refute missing_html =~ "local-only-status"
+    assert missing_html =~ "No phase recorded"
 
     Application.put_env(:symphony_elixir, :delivery_tracker_result, {:error, :tracker_unavailable})
 
     {:ok, _view, unavailable_html} = live(build_conn(), "/delivery")
     assert unavailable_html =~ "Tracker unavailable"
-    refute unavailable_html =~ "local-only-status"
+    assert unavailable_html =~ "No phase recorded"
   end
 
   test "http server serves embedded assets, accepts form posts, and rejects invalid hosts" do

@@ -116,6 +116,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <th>Issue</th>
                       <th>Title</th>
                       <th>Tracker status</th>
+                      <th>Latest phase result</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -124,6 +125,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <% issue = tracker_issue["issue"] %>
                       <% lookup_message = if tracker_issue["lookup"] == "error", do: "Tracker unavailable", else: "Issue not found" %>
                       <% current_state = if issue, do: issue["state"], else: lookup_message %>
+                      <% phase_result = row["latest_phase_result"] %>
                       <tr>
                         <td>
                           <.issue_identifier
@@ -134,6 +136,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <td><%= if issue, do: issue["title"], else: lookup_message %></td>
                         <td>
                           <span class={state_badge_class(current_state)}><%= current_state %></span>
+                        </td>
+                        <td>
+                          <%= if phase_result do %>
+                            <%= phase_result.phase %> · <%= phase_result.result["outcome"] %>
+                          <% else %>
+                            No phase recorded
+                          <% end %>
                         </td>
                       </tr>
                     <% end %>
@@ -244,6 +253,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <% else %>
                         <span class="muted">No activity reported yet</span>
                       <% end %>
+                    </div>
+                    <div>
+                      <span class="session-timeline-label">Model</span>
+                      <span><%= entry.model || "No disponible" %></span>
+                    </div>
+                    <div>
+                      <span class="session-timeline-label">Reasoning</span>
+                      <span><%= entry.reasoning_effort || "No disponible" %></span>
                     </div>
                     <%= if entry[:pipeline_phase] do %>
                       <div>

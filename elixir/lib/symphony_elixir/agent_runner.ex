@@ -106,7 +106,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     case Workspace.create_for_issue(issue, worker_host, workspace_opts) do
       {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+        send_worker_runtime_info(codex_update_recipient, issue, %{worker_host: worker_host, workspace_path: workspace})
 
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host),
@@ -400,21 +400,14 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
-       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
-    send(
-      recipient,
-      {:worker_runtime_info, issue_id,
-       %{
-         worker_host: worker_host,
-         workspace_path: workspace
-       }}
-    )
+  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, runtime_info)
+       when is_binary(issue_id) and is_pid(recipient) and is_map(runtime_info) do
+    send(recipient, {:worker_runtime_info, issue_id, runtime_info})
 
     :ok
   end
 
-  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
+  defp send_worker_runtime_info(_recipient, _issue, _runtime_info), do: :ok
 
   defp notify_continuation_required(recipient, %Issue{id: issue_id})
        when is_pid(recipient) and is_binary(issue_id) do
@@ -452,6 +445,8 @@ defmodule SymphonyElixir.AgentRunner do
              worker_host: worker_host,
              agent_context: agent_context
            ) do
+      send_worker_runtime_info(codex_update_recipient, issue, Map.take(session, [:model, :reasoning_effort]))
+
       try do
         if Keyword.has_key?(opts, :phase) do
           run_pipeline_phase(session, issue, codex_update_recipient, opts)
@@ -807,6 +802,7 @@ defmodule SymphonyElixir.AgentRunner do
     Pipeline phase: Build.
     Before any other GitHub write or code edit, call `github_workflow` with operation `claim`; stop if the claim is rejected. This claims an item dispatched from Ready by moving it to Building.
     Then read the issue's workpad and current-generation phase reports with `github_workflow` operation `read_workpad` before editing. Use those task records for prior findings and decisions. Work on the branch already checked out for this task and push your work to origin.
+    Fetch the configured base branch and merge it into the task branch before validation. Resolve any conflicts, or hand off `blocked` with the conflict and recovery instructions if they cannot be resolved. Run the required checks on the updated branch.
     Implement the issue using the accepted task context recorded on the issue. Copy branch, base branch, and required checks from `read_workpad`'s `report_context.task` into your report; include the pushed SHA.
     Before editing, create or update the persistent issue workpad with `github_workflow` operation `workpad` and record the plan.
     Before handoff, read `.github/pull_request_template.md` in the task repository and write a complete PR description in `report.pull_request_body`: keep every section in template order, respect its length guidance, replace every placeholder, and include `Fixes #<issue-number>` on its own line. Set `body_file=$(mktemp)`, save that exact description without Symphony delivery markers to `$body_file`, and run `(cd elixir && mise exec -- mix pr_body.check --file "$body_file")`.
@@ -837,7 +833,7 @@ defmodule SymphonyElixir.AgentRunner do
     The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
     Do not modify files. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
     Update the persistent workpad with review findings and resolutions using `github_workflow` operation `workpad`.
-    The configured merge policy is #{merge_policy}. With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`, then call `request_merge`; if the host confirms the merge, hand off outcome `merged` so the host verifies it before closing the issue and moving the item to Done. If the gate rejects the request, leave the PR in Human Review.
+    The configured merge policy is #{merge_policy}. With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`, then call `request_merge`; if the host confirms the merge, hand off outcome `merged` so the host verifies it before closing the issue and moving the item to Done. If the gate reports `pull_request_base_not_in_head` or `pull_request_base_sha_mismatch`, finish with the existing `passed` report; the host requeues the task for Build. For other gate failures, leave the PR in Human Review.
     Finish with exactly one JSON object containing outcome (passed, merged, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end
