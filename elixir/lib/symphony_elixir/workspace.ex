@@ -5,8 +5,10 @@ defmodule SymphonyElixir.Workspace do
 
   require Logger
   alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.Tracker.Issue
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
+  @workspace_identity_conflict_status 45
   @project_branch_diverged_status 42
   @project_branch_missing_status 43
   @project_branch_dirty_status 44
@@ -30,6 +32,7 @@ defmodule SymphonyElixir.Workspace do
 
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
+           :ok <- migrate_legacy_workspace(issue_or_identifier, safe_id, workspace, worker_host),
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
         case prepare_workspace(workspace, issue_context, created?, worker_host, refresh_project_branch?) do
           :ok ->
@@ -392,13 +395,68 @@ defmodule SymphonyElixir.Workspace do
     {:ok, Path.join(Config.settings!().workspace.root, safe_id)}
   end
 
-  @doc """
-  Returns the collision-safe directory name for an issue identifier.
+  defp migrate_legacy_workspace(%Issue{identifier: identifier}, safe_id, workspace, worker_host)
+       when is_binary(identifier) do
+    legacy_key = workspace_key(identifier)
 
-  The hash is derived from the original identifier so callers that only know the identifier can
-  derive the same key as callers holding a full tracker issue.
+    if legacy_key == safe_id do
+      :ok
+    else
+      with {:ok, legacy_workspace} <- workspace_path_for_issue(legacy_key, worker_host),
+           :ok <- validate_workspace_path(legacy_workspace, worker_host) do
+        migrate_workspace_path(legacy_workspace, workspace, worker_host)
+      end
+    end
+  end
+
+  defp migrate_legacy_workspace(_issue, _safe_id, _workspace, _worker_host), do: :ok
+
+  defp migrate_workspace_path(legacy_workspace, workspace, nil) do
+    cond do
+      File.exists?(legacy_workspace) and File.exists?(workspace) ->
+        {:error, :workspace_identity_migration_conflict}
+
+      File.exists?(legacy_workspace) ->
+        case File.rename(legacy_workspace, workspace) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:workspace_identity_migration_failed, reason}}
+        end
+
+      true ->
+        :ok
+    end
+  end
+
+  defp migrate_workspace_path(legacy_workspace, workspace, worker_host) when is_binary(worker_host) do
+    script =
+      [
+        "set -eu",
+        remote_shell_assign("legacy_workspace", legacy_workspace),
+        remote_shell_assign("workspace", workspace),
+        "if [ -e \"$legacy_workspace\" ]; then",
+        "  if [ -e \"$workspace\" ]; then exit #{@workspace_identity_conflict_status}; fi",
+        "  mv \"$legacy_workspace\" \"$workspace\"",
+        "fi"
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> :ok
+      {:ok, {_output, @workspace_identity_conflict_status}} -> {:error, :workspace_identity_migration_conflict}
+      {:ok, {output, status}} -> {:error, {:workspace_identity_migration_failed, worker_host, status, output}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc """
+  Returns the collision-safe directory name for an execution identity.
+
+  The hash is derived from the original identity so sanitizing path characters cannot create
+  collisions.
   """
   @spec workspace_key(map() | String.t() | nil) :: String.t()
+  def workspace_key(%Issue{} = issue), do: workspace_key(Issue.execution_identity(issue))
+
   def workspace_key(%{identifier: identifier}), do: workspace_key(identifier)
 
   def workspace_key(identifier) when is_binary(identifier) do

@@ -367,6 +367,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     schedule_issue_retry(state, issue_id, next_attempt, %{
       identifier: running_entry.identifier,
+      execution_identity: Issue.execution_identity(running_entry.issue),
       issue_url: running_entry.issue.url,
       error: "agent exited: #{inspect(reason)}",
       worker_host: Map.get(running_entry, :worker_host),
@@ -623,8 +624,7 @@ defmodule SymphonyElixir.Orchestrator do
       if MapSet.member?(visible_issue_ids, issue_id) do
         state_acc
       else
-        log_missing_running_issue(state_acc, issue_id)
-        terminate_running_issue(state_acc, issue_id, false)
+        confirm_missing_running_issue(state_acc, issue_id, length(issues))
       end
     end)
   end
@@ -653,22 +653,56 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_missing_blocked_issue_ids(state, _requested_issue_ids, _issues), do: state
 
-  defp log_missing_running_issue(%State{} = state, issue_id) when is_binary(issue_id) do
+  defp confirm_missing_running_issue(%State{} = state, issue_id, normalized_issue_count)
+       when is_binary(issue_id) and is_integer(normalized_issue_count) do
     case Map.get(state.running, issue_id) do
-      %{identifier: identifier} ->
-        Logger.info("Issue no longer visible during running-state refresh: issue_id=#{issue_id} issue_identifier=#{identifier}; stopping active agent")
+      %{identifier: identifier} = running_entry ->
+        consecutive_absences = Map.get(running_entry, :consecutive_missing_refreshes, 0) + 1
+        session_id = running_entry_session_id(running_entry)
+
+        action =
+          if consecutive_absences >= 2,
+            do: "absence confirmed; stopping active agent",
+            else: "retaining active agent until confirmed"
+
+        Logger.info(
+          "Issue omitted from successful running-state refresh: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} consecutive_absences=#{consecutive_absences} normalized_issue_count=#{normalized_issue_count}; #{action}"
+        )
+
+        state = %{
+          state
+          | running:
+              Map.put(
+                state.running,
+                issue_id,
+                Map.put(running_entry, :consecutive_missing_refreshes, consecutive_absences)
+              )
+        }
+
+        if consecutive_absences >= 2,
+          do: terminate_running_issue(state, issue_id, false),
+          else: state
 
       _ ->
-        Logger.info("Issue no longer visible during running-state refresh: issue_id=#{issue_id}; stopping active agent")
+        terminate_running_issue(state, issue_id, false)
     end
   end
 
-  defp log_missing_running_issue(_state, _issue_id), do: :ok
+  defp confirm_missing_running_issue(state, _issue_id, _normalized_issue_count), do: state
 
   defp refresh_running_issue_state(%State{} = state, %Issue{} = issue) do
     case Map.get(state.running, issue.id) do
       %{issue: _} = running_entry ->
-        %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
+        consecutive_absences = Map.get(running_entry, :consecutive_missing_refreshes, 0)
+
+        if consecutive_absences > 0 do
+          session_id = running_entry_session_id(running_entry)
+
+          Logger.info("Issue recovered after successful running-state refresh: #{issue_context(issue)} session_id=#{session_id} consecutive_absences=#{consecutive_absences}; keeping active agent")
+        end
+
+        running_entry = running_entry |> Map.put(:issue, issue) |> Map.delete(:consecutive_missing_refreshes)
+        %{state | running: Map.put(state.running, issue.id, running_entry)}
 
       _ ->
         state
@@ -763,6 +797,7 @@ defmodule SymphonyElixir.Orchestrator do
         |> terminate_running_issue(issue_id, false)
         |> schedule_issue_retry(issue_id, next_attempt, %{
           identifier: identifier,
+          execution_identity: Issue.execution_identity(running_entry.issue),
           issue_url: running_entry.issue.url,
           error: "stalled for #{elapsed_ms}ms without codex activity"
         })
@@ -1357,6 +1392,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     schedule_issue_retry(state, issue.id, retry_attempt || 1, %{
       identifier: issue.identifier,
+      execution_identity: Issue.execution_identity(issue),
       issue_url: issue.url,
       error: inspect(reason),
       worker_host: worker_host
@@ -1495,6 +1531,7 @@ defmodule SymphonyElixir.Orchestrator do
     error = pick_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    execution_identity = Map.get(metadata, :execution_identity) || Map.get(previous_retry, :execution_identity)
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -1518,7 +1555,8 @@ defmodule SymphonyElixir.Orchestrator do
             issue_url: issue_url,
             error: error,
             worker_host: worker_host,
-            workspace_path: workspace_path
+            workspace_path: workspace_path,
+            execution_identity: execution_identity
           })
     }
   end
@@ -1531,7 +1569,8 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: Map.get(retry_entry, :issue_url),
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          execution_identity: Map.get(retry_entry, :execution_identity)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1650,6 +1689,7 @@ defmodule SymphonyElixir.Orchestrator do
              attempt + 1,
              Map.merge(metadata, %{
                identifier: issue.identifier,
+               execution_identity: Issue.execution_identity(issue),
                error: "retry dispatch refresh failed: #{inspect(reason)}"
              })
            )}
@@ -1664,6 +1704,7 @@ defmodule SymphonyElixir.Orchestrator do
          attempt + 1,
          Map.merge(metadata, %{
            identifier: issue.identifier,
+           execution_identity: Issue.execution_identity(issue),
            error: "no available orchestrator slots"
          })
        )}
@@ -1867,6 +1908,7 @@ defmodule SymphonyElixir.Orchestrator do
         %{
           issue_id: issue_id,
           identifier: metadata.identifier,
+          execution_identity: execution_identity(Map.get(metadata, :issue)),
           issue_url: metadata.issue.url,
           state: metadata.issue.state,
           worker_host: Map.get(metadata, :worker_host),
@@ -1893,6 +1935,7 @@ defmodule SymphonyElixir.Orchestrator do
           attempt: attempt,
           due_in_ms: max(0, due_at_ms - now_ms),
           identifier: Map.get(retry, :identifier),
+          execution_identity: Map.get(retry, :execution_identity),
           issue_url: Map.get(retry, :issue_url),
           error: Map.get(retry, :error),
           worker_host: Map.get(retry, :worker_host),
@@ -1906,6 +1949,7 @@ defmodule SymphonyElixir.Orchestrator do
         %{
           issue_id: issue_id,
           identifier: Map.get(metadata, :identifier),
+          execution_identity: execution_identity(Map.get(metadata, :issue)),
           issue_url: blocked_issue_url(metadata),
           state: blocked_issue_state(metadata),
           worker_host: Map.get(metadata, :worker_host),
@@ -1948,6 +1992,9 @@ defmodule SymphonyElixir.Orchestrator do
        operations: ["poll", "reconcile"]
      }, state}
   end
+
+  defp execution_identity(%Issue{} = issue), do: Issue.execution_identity(issue)
+  defp execution_identity(_issue), do: nil
 
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state
   defp blocked_issue_state(_metadata), do: nil

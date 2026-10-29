@@ -142,6 +142,7 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp prepare_from_checkpoint(issue, existing) do
+    existing = if is_map(existing), do: Map.put_new(existing, "execution_identity", Issue.execution_identity(issue)), else: existing
     _ = if(Tracker.agent_owned_writes?(), do: Store.supersede_pending_operations(issue.id), else: execute_pending(issue))
 
     case Store.pending_operations(issue.id) do
@@ -230,6 +231,7 @@ defmodule SymphonyElixir.Pipeline do
 
       task = %{
         "issue_id" => issue.id,
+        "execution_identity" => Issue.execution_identity(issue),
         "repository" => profile_value(profile, :repository),
         "branch" => issue.branch_name,
         "base_branch" => profile_value(profile, :base_branch),
@@ -818,7 +820,7 @@ defmodule SymphonyElixir.Pipeline do
   defp report_ops(task, phase, attempt, result), do: [report_op(task, phase, attempt, result)]
 
   defp report_op(task, phase, attempt, result) do
-    marker = "<!-- symphony:#{task["issue_id"]}:#{task["generation"]}:#{phase}:#{attempt} -->"
+    marker = "<!-- symphony:#{task["execution_identity"] || task["issue_id"]}:#{task["generation"]}:#{phase}:#{attempt} -->"
     body = marker <> "\n\n## Symphony #{String.capitalize(phase)} report\n\n" <> Jason.encode!(result, pretty: true)
     operation(task, "report", %{"marker" => marker, "body" => body, "phase" => phase})
   end
@@ -833,7 +835,7 @@ defmodule SymphonyElixir.Pipeline do
       )
 
   defp operation(task, kind, payload, salt \\ nil) do
-    key = Enum.join([task["issue_id"], task["generation"], task["phase"], kind, :erlang.phash2({payload, salt})], ":")
+    key = Enum.join([task["execution_identity"] || task["issue_id"], task["generation"], task["phase"], kind, :erlang.phash2({payload, salt})], ":")
     %{key: key, issue_id: task["issue_id"], kind: kind, payload: payload}
   end
 
