@@ -16,7 +16,8 @@ installation.
    item, repository, and issue number in their identity, so same-number issues in different
    repositories keep separate workspaces and pull request lookups. Then Symphony launches Codex in
    [App Server mode](https://developers.openai.com/codex/app-server/).
-3. Runs Build, QA, and autonomous Review in separate sessions for GitHub Projects work.
+3. Runs Build, QA, and autonomous Review in separate sessions for ordinary GitHub Projects work;
+   issues labelled `qa` start in QA and continue to Review using an existing pull request.
 4. Verifies configured QA checks, prepares a pull request for human review, and waits for the
    merge or a request for corrections.
 

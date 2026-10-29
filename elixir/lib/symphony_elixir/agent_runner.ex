@@ -142,7 +142,7 @@ defmodule SymphonyElixir.AgentRunner do
       {false, phase, task} when phase in [:qa, :review] and is_map(task) ->
         case Map.get(task, "current_sha") do
           sha when is_binary(sha) and sha != "" ->
-            verify_pipeline_workspace_sha_at_sha(workspace, issue, sha, worker_host)
+            verify_pipeline_workspace_sha_at_sha(workspace, issue, sha, worker_host, phase == :qa and task["direct_qa"] == true)
 
           _ ->
             {:phase_result, {:system_blocker, blocked_workspace_report(:project_branch_sha_missing, issue)}}
@@ -153,8 +153,8 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp verify_pipeline_workspace_sha_at_sha(workspace, issue, sha, worker_host) do
-    case verify_pipeline_pr_sha(issue, sha) do
+  defp verify_pipeline_workspace_sha_at_sha(workspace, issue, sha, worker_host, require_draft?) do
+    case verify_pipeline_pr_sha(issue, sha, require_draft?) do
       :ok -> verify_accepted_workspace_sha(workspace, issue, sha, worker_host)
       result -> result
     end
@@ -166,12 +166,18 @@ defmodule SymphonyElixir.AgentRunner do
   def verify_pipeline_workspace_sha_for_test(workspace, issue, opts, worker_host),
     do: verify_pipeline_workspace_sha(workspace, issue, opts, worker_host)
 
-  defp verify_pipeline_pr_sha(issue, accepted_sha) do
-    if Pipeline.enabled?(), do: read_pipeline_pr_sha(issue, accepted_sha), else: :ok
+  defp verify_pipeline_pr_sha(issue, accepted_sha, require_draft?) do
+    if Pipeline.enabled?(), do: read_pipeline_pr_sha(issue, accepted_sha, require_draft?), else: :ok
   end
 
-  defp read_pipeline_pr_sha(issue, accepted_sha) do
+  defp read_pipeline_pr_sha(issue, accepted_sha, require_draft?) do
     case Tracker.pull_request(issue) do
+      {:ok, %{sha: ^accepted_sha, draft: true}} when require_draft? ->
+        :ok
+
+      {:ok, %{sha: ^accepted_sha}} when require_draft? ->
+        {:phase_result, {:system_blocker, blocked_workspace_report(:project_pr_not_draft, issue)}}
+
       {:ok, %{sha: ^accepted_sha}} ->
         :ok
 
@@ -287,6 +293,12 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp blocked_workspace_report_content(:project_branch_sha_missing, _locale),
     do: {"QA/Review has no Build-accepted SHA to validate the workspace.", "Move the issue to Ready to rerun Build against the current PR branch before QA and Review."}
+
+  defp blocked_workspace_report_content(:project_pr_not_draft, :es),
+    do: {"La PR debe estar en borrador antes de ejecutar QA.", "Pasa la PR a borrador y mueve la issue a Ready para repetir QA."}
+
+  defp blocked_workspace_report_content(:project_pr_not_draft, _locale),
+    do: {"The PR must be a draft before running QA.", "Mark the PR as draft, then move the issue to Ready to retry QA."}
 
   defp blocked_workspace_report_content(:project_pr_head_changed, :es),
     do: {"La cabeza de la PR cambió después de que Build aceptara el SHA.", "Mueve la issue de Blocked a Ready para repetir Build, QA y Review sobre la cabeza actual de la PR."}
@@ -731,7 +743,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp pipeline_phase_instructions(:qa, _opts) do
     """
-    Pipeline phase: independent QA. Before any other GitHub write, call `github_workflow` with operation `claim`; stop if the claim is rejected. This moves a requeued Ready item to QA and confirms an item already in QA. Then read the issue's workpad and current-generation Build reports with `github_workflow` operation `read_workpad`; use the saved task records to identify the accepted commit, branch, required checks, and prior findings.
+    Pipeline phase: independent QA. Before any other GitHub write, call `github_workflow` with operation `claim`; stop if the claim is rejected. This moves a requeued Ready item to QA and confirms an item already in QA. On a direct `qa` route there is no Build report; use `report_context.task` for the accepted commit, branch, required checks, and PR. Then read the issue's workpad and current-generation Build reports with `github_workflow` operation `read_workpad`; use the saved task records to identify the accepted commit, branch, required checks, and prior findings.
     Symphony runs the configured host checks on the accepted SHA. `read_workpad` returns the authoritative `report_context.host_checks`, required checks, and locale-specific canonical QA text; copy the checks exactly into your report and hidden JSON. Do not modify files or invent check results. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings.
     Update the persistent workpad with QA evidence and findings using `github_workflow` operation `workpad`.
     Call `github_workflow` with operation `handoff`, your QA report, and the complete Markdown body. Choose the outcome using the required checks and authoritative host evidence in `report_context`; use its canonical QA text when Symphony's check or finding rules change the summary, reason, or next step. Symphony advances only when every required check passed. Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, criteria, changes, checks, findings, next_step, reason when blocked, and sha equal to the accepted commit.
