@@ -47,10 +47,10 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  @spec reconcile() :: :ok | {:error, term()}
-  def reconcile do
+  @spec reconcile([String.t()]) :: :ok | {:error, term()}
+  def reconcile(running_issue_ids \\ []) do
     with {:ok, tasks} <- Store.tasks() do
-      reconcile_tasks(tasks)
+      reconcile_tasks(tasks, running_issue_ids)
     end
   end
 
@@ -469,24 +469,30 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp reconcile_tasks([]), do: :ok
+  defp reconcile_tasks([], _running_issue_ids), do: :ok
 
-  defp reconcile_tasks(tasks) do
+  defp reconcile_tasks(tasks, running_issue_ids) do
     case Tracker.fetch_issues_by_ids(Enum.map(tasks, & &1["issue_id"])) do
       {:ok, issues} ->
         issues_by_id = Map.new(issues, &{&1.id, &1})
-        Enum.each(tasks, &reconcile_task(&1, issues_by_id))
+        Enum.each(tasks, &reconcile_task(&1, issues_by_id, running_issue_ids))
 
       {:error, _reason} ->
         :ok
     end
   end
 
-  defp reconcile_task(%{"issue_id" => issue_id} = task, issues_by_id) do
+  defp reconcile_task(%{"issue_id" => issue_id} = task, issues_by_id, running_issue_ids) do
     case Map.get(issues_by_id, issue_id) do
       %Issue{} = issue ->
         _ = execute_pending(issue)
-        reconcile_task_issue(issue, task)
+
+        if issue_id in running_issue_ids and task["phase"] == "review" and
+             issue.state in [status_value(task, :human_review), "closed"] do
+          :ok
+        else
+          reconcile_task_issue(issue, task)
+        end
 
       _ ->
         :ok
@@ -515,6 +521,12 @@ defmodule SymphonyElixir.Pipeline do
   defp reconcile_nonterminal_task(issue, %{"status" => "human_review"} = task),
     do: reconcile_human_review(issue, task)
 
+  defp reconcile_nonterminal_task(issue, %{"status" => "review", "phase" => "review"} = task) do
+    if issue.state == status_value(task, :human_review),
+      do: Store.save_task(Map.put(task, "status", "human_review")),
+      else: reconcile_checkpoint(issue, task)
+  end
+
   defp reconcile_nonterminal_task(issue, %{"status" => "blocked", "drop_pending" => true} = task) do
     case human_drop_reason(issue) do
       {:ok, reason} -> drop_task(issue, task, reason)
@@ -522,7 +534,9 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp reconcile_nonterminal_task(issue, task) do
+  defp reconcile_nonterminal_task(issue, task), do: reconcile_checkpoint(issue, task)
+
+  defp reconcile_checkpoint(issue, task) do
     case checkpoint_state_mismatch(task, issue) do
       {:mismatch, reason} -> block_checkpoint_mismatch(task, issue, reason)
       :ok -> :ok

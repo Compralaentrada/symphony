@@ -24,6 +24,49 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert MapSet.new(ids) == MapSet.new(Enum.map(issues, & &1.id))
   end
 
+  test "a Review worker survives polls between its handoffs and finalizes a confirmed merge" do
+    issue = issue("octo/app#90", 90)
+    table = start_board([issue], %{issue.id => %{build: [build("sha", issue.id)], qa: [qa("sha")], review: [review("sha")]}})
+    pipeline_database!(table)
+    name = Module.concat(__MODULE__, "PausedReview#{System.unique_integer([:positive])}")
+    {:ok, orchestrator} = Orchestrator.start_link(name: name, agent_runner: __MODULE__.PausedReviewAgent)
+
+    assert await(fn -> lookup(table, {:paused_review, issue.id}) != nil end)
+    worker = lookup(table, {:paused_review, issue.id})
+    assert project_state(table, issue.id) == "Human Review"
+    refresh!(name, table)
+    assert Process.alive?(worker)
+    assert {:ok, %{"status" => "review", "phase" => "review"}} = Store.get_task(issue.id)
+
+    set_pull_request_merged(table, issue.id, true)
+    set_github_issue_state(table, issue.id, "closed")
+    :ets.insert(table, {:fail_pr_reads, 2})
+    refresh!(name, table)
+    assert Process.alive?(worker)
+    assert {:ok, %{"status" => "review", "phase" => "review"}} = Store.get_task(issue.id)
+    send(worker, :finish_review)
+    assert await(fn -> project_state(table, issue.id) == "Done" end)
+    assert await(fn -> match?({:ok, %{"status" => "done"}}, Store.get_task(issue.id)) end)
+    stop_orchestrator(orchestrator)
+  end
+
+  test "a lost Review handoff leaves the task in Human Review after restart" do
+    issue = issue("octo/app#91", 91)
+    table = start_board([issue], %{issue.id => %{build: [build("sha", issue.id)], qa: [qa("sha")], review: [review("sha")]}})
+    pipeline_database!(table)
+    orchestrator = start_orchestrator(__MODULE__.PausedReviewAgent)
+
+    assert await(fn -> lookup(table, {:paused_review, issue.id}) != nil end)
+    assert project_state(table, issue.id) == "Human Review"
+    stop_orchestrator(orchestrator)
+
+    orchestrator = start_orchestrator()
+    assert await(fn -> match?({:ok, %{"status" => "human_review"}}, Store.get_task(issue.id)) end)
+    assert project_state(table, issue.id) == "Human Review"
+    refute pull_request(table, issue.id).merged
+    stop_orchestrator(orchestrator)
+  end
+
   test "running Project work survives one missing refresh and stops after two consecutive omissions" do
     issue = issue("octo/app#46", 46)
     issue = %{issue | state: "Building", native_ref: Map.put(issue.native_ref, :project_status, "Building")}
@@ -1258,6 +1301,31 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
   end
 end
 
+defmodule SymphonyElixir.PipelineIntegrationTest.PausedReviewAgent do
+  alias SymphonyElixir.PipelineIntegrationTest.{FakeAgent, FakeClient}
+
+  def run(issue, recipient, opts) do
+    if Keyword.fetch!(opts, :phase) == :review do
+      task = Keyword.fetch!(opts, :pipeline_task)
+      context = %{issue: issue, lane: :review, task: task, generation: Keyword.fetch!(opts, :generation), attempt: Keyword.fetch!(opts, :phase_attempt)}
+      report = %{"outcome" => "passed", "summary" => "Reviewed.", "sha" => task["current_sha"], "findings" => [], "resolutions" => [], "next_step" => "Merge."}
+      {:ok, passed} = FakeClient.workflow_operation(context, "handoff", %{"report" => report})
+      table = Application.fetch_env!(:symphony_elixir, :pipeline_test_board)
+      :ets.insert(table, {{:paused_review, issue.id}, self()})
+
+      receive do
+        :finish_review -> :ok
+      end
+
+      merged = %{report | "outcome" => "merged", "next_step" => "Done."}
+      {:ok, handoff} = FakeClient.workflow_operation(context, "handoff", %{"report" => merged})
+      Map.put(merged, "_remote_evidence", [passed, handoff])
+    else
+      FakeAgent.run(issue, recipient, opts)
+    end
+  end
+end
+
 defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
   alias SymphonyElixir.GitHub.AgentTool
   alias SymphonyElixir.Pipeline
@@ -1630,7 +1698,16 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
     {:ok, updated}
   end
 
-  def pull_request(issue), do: {:ok, lookup(table(), {:pull_request, issue.id})}
+  def pull_request(issue) do
+    table = table()
+
+    if (lookup(table, :fail_pr_reads) || 0) > 0 do
+      :ets.update_counter(table, :fail_pr_reads, {2, -1})
+      {:error, :temporary_failure}
+    else
+      {:ok, lookup(table, {:pull_request, issue.id})}
+    end
+  end
 
   def publish_phase_report(issue, marker, body, phase) do
     table = table()

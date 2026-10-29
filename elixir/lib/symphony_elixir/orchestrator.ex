@@ -376,7 +376,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
-    if Pipeline.enabled?(), do: Pipeline.reconcile()
+    if Pipeline.enabled?(), do: Pipeline.reconcile(Map.keys(state.running))
 
     state =
       state
@@ -544,18 +544,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
+    finalizing? = running_finalization?(issue, state, terminal_states)
+
     cond do
-      terminal_issue_state?(issue.state, terminal_states) and not pending_finalization_issue?(issue) ->
+      terminal_issue_state?(issue.state, terminal_states) and not finalizing? ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
         terminate_running_issue(state, issue.id, true)
 
-      !issue_routable?(issue) and not pending_finalization_issue?(issue) ->
+      !issue_routable?(issue) and not finalizing? ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
         terminate_running_issue(state, issue.id, false)
 
-      pending_finalization_issue?(issue) ->
+      finalizing? ->
         refresh_running_issue_state(state, issue)
 
       active_issue_state?(issue.state, active_states) ->
@@ -569,6 +571,25 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  defp running_finalization?(issue, state, terminal_states) do
+    pending_finalization_issue?(issue) or
+      (terminal_issue_state?(issue.state, terminal_states) and confirmed_running_review_merge?(issue, state))
+  end
+
+  defp confirmed_running_review_merge?(issue, state) do
+    case Map.get(state.running, issue.id) do
+      %{pipeline_phase: "review", pipeline_task: task} ->
+        case Tracker.pull_request(issue) do
+          {:ok, %{merged: true, base: base, sha: sha}} -> base == task["base_branch"] and sha == task["current_sha"]
+          {:error, _reason} -> true
+          _ -> false
+        end
+
+      _ ->
+        false
+    end
+  end
 
   defp reconcile_blocked_issue_states([], state, _active_states, _terminal_states), do: state
 

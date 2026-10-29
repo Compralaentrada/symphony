@@ -17,7 +17,8 @@ correspondiente y ejecuta las fases necesarias con Codex.
 - Guarda checkpoints del pipeline en SQLite para reanudar el trabajo tras un reinicio.
 - Expone el estado operativo y las tareas del pipeline en Operations, Delivery y una API JSON.
 - Espera una fusión humana por defecto; solo `auto` explícito solicita la fusión al gate determinista.
-  Symphony nunca aprueba PRs y solo marca una tarea como Done tras confirmar la fusión.
+  El gate exige Review aprobada en el SHA vigente y checks locales correctos. Symphony nunca aprueba
+  PRs y solo marca una tarea como Done tras confirmar la fusión.
 
 En el pipeline de Projects, el estado visible del Project determina el despacho. El flujo normal es
 `Ready → Building → QA → Review → Human Review → Done`; las tareas que requieren intervención
@@ -29,7 +30,8 @@ fases. Si falla una comprobación previa, el agente del lane `diagnostic` lee el
 el workspace y la PR antes de documentar el motivo y la recuperación en la issue y el Project.
 Symphony detecta el bloqueo y coordina esa sesión, pero no escribe en GitHub. Si un checkpoint de fase
 no coincide con el estado actual del tracker, conserva el trabajo y registra el bloqueo local sin
-cambiar el estado visible; mover la tarea a `Ready` permite reanudarla.
+cambiar el estado visible; mover la tarea a `Ready` permite reanudarla. Si Review quedó en Human
+Review tras una respuesta perdida, conserva ese estado y espera la decisión humana.
 
 El tablero usa el campo `Status` y las opciones canónicas de Symphony: `Backlog`, `Ready`, `Building`,
 `QA`, `Review`, `Human Review`, `Blocked`, `Done` y `Dropped`.

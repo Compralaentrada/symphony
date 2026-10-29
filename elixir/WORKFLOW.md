@@ -47,7 +47,9 @@ codex:
 
 The installation-level `merge_policy` front matter key accepts `human` (the default) or `auto`. A configured top-level value takes precedence over `tracker.provider.merge_policy`; when omitted, an explicit provider value remains supported. With `auto`, Review requests the deterministic merge gate; when the reviewed head SHA, base SHA, and required checks pass, Symphony merges and verifies the PR before closing the issue and moving its Project item to Done. Symphony never approves PRs automatically.
 
-The gate accepts a missing GitHub check rollup when the host checks passed; if GitHub reports a rollup, it must be successful. GitHub still enforces branch protection and mergeability.
+The gate requires the current attempt's approved Review report and verifies that the reviewed head contains the current base commit. It accepts a missing GitHub check rollup when the host checks passed; if GitHub reports a rollup, it must be successful. GitHub still enforces branch protection and mergeability.
+
+If an automatic Review handoff reaches Human Review but its response is lost, Symphony keeps the task there for a human decision rather than assuming who moved it.
 
 You are working on a GitHub issue dispatched from the configured GitHub Projects v2 board.
 
