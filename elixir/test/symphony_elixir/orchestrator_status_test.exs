@@ -841,6 +841,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       due_at_ms: System.monotonic_time(:millisecond) + 5_000,
       identifier: "MT-500",
       issue_url: "https://example.org/issues/MT-500",
+      execution_identity: "PVT_project/PVTI_item/octo/app#500",
       error: "agent exited: :boom"
     }
 
@@ -858,11 +859,50 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
                due_in_ms: due_in_ms,
                identifier: "MT-500",
                issue_url: "https://example.org/issues/MT-500",
+               execution_identity: "PVT_project/PVTI_item/octo/app#500",
                error: "agent exited: :boom"
              }
            ] = snapshot.retrying
 
     assert due_in_ms > 0
+  end
+
+  test "retry snapshot retains the Projects execution identity" do
+    issue = %Issue{
+      id: "project-item-500",
+      identifier: "octo/app#500",
+      native_ref: %{
+        project_id: "PVT_project",
+        project_item_id: "PVTI_item",
+        repository: "octo/app",
+        issue_number: 500
+      },
+      url: "https://github.com/octo/app/issues/500"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :ProjectsRetryIdentityOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    ref = make_ref()
+    running_entry = lifecycle_running_entry(issue, ref, nil, self())
+
+    :sys.replace_state(pid, fn state ->
+      %{state | running: %{issue.id => running_entry}, claimed: MapSet.new([issue.id])}
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :worker_failed})
+
+    snapshot =
+      wait_for_snapshot(pid, fn
+        %{retrying: [%{execution_identity: "PVT_project/PVTI_item/octo/app#500"}]} -> true
+        _ -> false
+      end)
+
+    assert [%{execution_identity: "PVT_project/PVTI_item/octo/app#500"}] = snapshot.retrying
   end
 
   test "orchestrator snapshot includes poll countdown and checking status" do

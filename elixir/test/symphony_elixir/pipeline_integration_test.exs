@@ -4,14 +4,18 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
   alias SymphonyElixir.Config
   alias SymphonyElixir.Pipeline
   alias SymphonyElixir.Pipeline.Store
+  alias SymphonyElixir.PipelineIntegrationTest.HoldingAgent
 
   test "pipeline reconciliation fetches all task issues in one tracker lookup" do
-    issues = [issue("octo/app#20", 20), issue("octo/app#21", 21)]
+    first_issue = issue("octo/app#20", 20)
+    first_issue = %{first_issue | native_ref: Map.merge(first_issue.native_ref, %{project_id: "PVT_test", project_item_id: "PVTI_20", issue_number: 20})}
+    issues = [first_issue, issue("octo/app#21", 21)]
     table = start_board(issues, %{})
     pipeline_database!(table)
 
     Enum.each(issues, fn issue ->
-      assert {:ok, _task, "build"} = Pipeline.prepare(issue)
+      assert {:ok, task, "build"} = Pipeline.prepare(issue)
+      assert task["execution_identity"] == Issue.execution_identity(issue)
     end)
 
     assert :ok = Pipeline.reconcile()
@@ -55,6 +59,79 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
     stop_orchestrator(orchestrator)
     File.rm_rf!(Path.dirname(path))
+  end
+
+  test "running Project work survives one missing refresh and stops after two consecutive omissions" do
+    issue = issue("octo/app#46", 46)
+    issue = %{issue | state: "Building", native_ref: Map.put(issue.native_ref, :project_status, "Building")}
+    table = start_board([issue], %{})
+    database_path = pipeline_database!(table, poll_interval_ms: 60_000)
+    orchestrator_name = Module.concat(__MODULE__, "MissingRefresh#{System.unique_integer([:positive])}")
+
+    {:ok, orchestrator_pid} =
+      Orchestrator.start_link(name: orchestrator_name, agent_runner: HoldingAgent)
+
+    on_exit(fn -> stop_orchestrator(orchestrator_pid) end)
+
+    assert await(fn -> lookup(table, {:held_agent_pid, issue.id}) != nil end)
+    agent_pid = lookup(table, {:held_agent_pid, issue.id})
+    assert await(fn -> Map.get(:sys.get_state(orchestrator_name).running[issue.id] || %{}, :workspace_path) != nil end)
+    workspace = :sys.get_state(orchestrator_name).running[issue.id].workspace_path
+
+    session_id = "thread-live-turn-live"
+    send(orchestrator_pid, {:codex_worker_update, issue.id, %{event: :session_started, session_id: session_id, timestamp: DateTime.utc_now()}})
+    assert await(fn -> :sys.get_state(orchestrator_name).running[issue.id].session_id == session_id end)
+
+    assert File.exists?(database_path)
+    assert {:ok, %{"status" => "building"}} = Store.get_task(issue.id)
+    assert :sys.get_state(orchestrator_name).running[issue.id].pid == agent_pid
+    assert Process.alive?(agent_pid)
+    assert MapSet.member?(:sys.get_state(orchestrator_name).claimed, issue.id)
+    assert File.dir?(workspace)
+
+    :ets.insert(table, {:fetch_issues_by_ids_responses, [{:ok, [issue]}, {:ok, []}]})
+    first_omission_log = capture_log(fn -> refresh!(orchestrator_name, table) end)
+
+    assert first_omission_log =~ issue.identifier
+    assert first_omission_log =~ "session_id=#{session_id}"
+    assert first_omission_log =~ "consecutive_absences=1"
+    assert first_omission_log =~ "normalized_issue_count=0"
+    assert_running_agent(orchestrator_name, issue, agent_pid, workspace, 1)
+    assert project_state(table, issue.id) == "Building"
+
+    :ets.insert(table, {:fetch_issues_by_ids_responses, [{:ok, [issue]}, {:ok, [issue]}]})
+    recovery_log = capture_log(fn -> refresh!(orchestrator_name, table) end)
+
+    assert recovery_log =~ "Issue recovered after successful running-state refresh"
+    assert recovery_log =~ "session_id=#{session_id}"
+    assert_running_agent(orchestrator_name, issue, agent_pid, workspace, 0)
+
+    :ets.insert(table, {:fetch_issues_by_ids_responses, [{:ok, [issue]}, {:error, :econnreset}]})
+    refresh!(orchestrator_name, table)
+    assert_running_agent(orchestrator_name, issue, agent_pid, workspace, 0)
+
+    :ets.insert(table, {:fetch_issues_by_ids_responses, [{:ok, [issue]}, {:ok, []}]})
+    refresh!(orchestrator_name, table)
+    assert_running_agent(orchestrator_name, issue, agent_pid, workspace, 1)
+
+    :ets.insert(table, {:hide_state_listing, true})
+    :ets.insert(table, {:fetch_issues_by_ids_responses, [{:ok, [issue]}, {:ok, []}]})
+    confirmed_omission_log = capture_log(fn -> refresh!(orchestrator_name, table) end)
+
+    assert confirmed_omission_log =~ "consecutive_absences=2"
+    assert confirmed_omission_log =~ "session_id=#{session_id}"
+    assert confirmed_omission_log =~ "normalized_issue_count=0"
+    assert await(fn -> not Process.alive?(agent_pid) end)
+
+    state = :sys.get_state(orchestrator_name)
+    refute Map.has_key?(state.running, issue.id)
+    refute MapSet.member?(state.claimed, issue.id)
+    assert map_size(state.running) == 0
+    assert lookup(table, {:agent_calls, issue.id, :build}) == 1
+    assert File.dir?(workspace)
+    assert project_state(table, issue.id) == "Building"
+
+    stop_orchestrator(orchestrator_pid)
   end
 
   test "pipeline reconciliation blocks a Build checkpoint that conflicts with QA until the item is Ready" do
@@ -921,7 +998,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     Application.put_env(:symphony_elixir, :github_projects_client_module, __MODULE__.FakeClient)
     Application.put_env(:symphony_elixir, :pipeline_database_path, path)
     Application.put_env(:symphony_elixir, :pipeline_test_workspace, workspace)
-    write_pipeline_workflow!(Keyword.get(opts, :retry_backoff_ms, 1))
+    write_pipeline_workflow!(Keyword.get(opts, :retry_backoff_ms, 1), Keyword.get(opts, :poll_interval_ms, 20))
 
     on_exit(fn ->
       File.rm_rf(root)
@@ -936,7 +1013,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     path
   end
 
-  defp write_pipeline_workflow!(retry_backoff_ms) do
+  defp write_pipeline_workflow!(retry_backoff_ms, poll_interval_ms) do
     File.write!(Workflow.workflow_file_path(), """
     ---
     tracker:
@@ -953,7 +1030,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
             required_checks: ["true"]
         token: test-token
     polling:
-      interval_ms: 20
+      interval_ms: #{poll_interval_ms}
     workspace:
       root: /tmp/symphony-pipeline-workspaces
     agent:
@@ -981,6 +1058,24 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
   defp stop_orchestrator(pid) do
     if Process.alive?(pid), do: GenServer.stop(pid, :normal, 1_000)
+  end
+
+  defp refresh!(orchestrator, table) do
+    previous_calls = lookup(table, :fetch_issues_by_ids_calls) || 0
+    assert %{queued: true} = Orchestrator.request_refresh(orchestrator)
+    assert await(fn -> (lookup(table, :fetch_issues_by_ids_calls) || 0) >= previous_calls + 2 end)
+    :sys.get_state(orchestrator)
+  end
+
+  defp assert_running_agent(orchestrator, issue, agent_pid, workspace, missing_refreshes) do
+    state = :sys.get_state(orchestrator)
+    assert state.running[issue.id].pid == agent_pid
+    assert Process.alive?(agent_pid)
+    assert MapSet.member?(state.claimed, issue.id)
+    assert map_size(state.running) == 1
+    assert Map.get(state.running[issue.id], :consecutive_missing_refreshes, 0) == missing_refreshes
+    assert state.running[issue.id].workspace_path == workspace
+    assert File.dir?(workspace)
   end
 
   defp issue(id, number) do
@@ -1423,14 +1518,26 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
   }
 
   def fetch_issues_by_states(states) do
-    {:ok, issues() |> Enum.filter(&(&1.state in states))}
+    if lookup(table(), :hide_state_listing) do
+      {:ok, []}
+    else
+      {:ok, issues() |> Enum.filter(&(&1.state in states))}
+    end
   end
 
   def fetch_issues_by_ids(ids) do
     table = table()
     call = :ets.update_counter(table, :fetch_issues_by_ids_calls, {2, 1}, {:fetch_issues_by_ids_calls, 0})
     :ets.insert(table, {{:fetch_issues_by_ids_call, call}, ids})
-    {:ok, Enum.filter(issues(), &(&1.id in ids))}
+
+    case :ets.lookup(table, :fetch_issues_by_ids_responses) do
+      [{:fetch_issues_by_ids_responses, [response | remaining]}] ->
+        :ets.insert(table, {:fetch_issues_by_ids_responses, remaining})
+        response
+
+      _ ->
+        {:ok, Enum.filter(issues(), &(&1.id in ids))}
+    end
   end
 
   def claim_issue(issue), do: set_pipeline_status(issue, :building)
@@ -1816,6 +1923,22 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
   end
 
   defp issue_index(%{id: id}), do: id |> String.split("#") |> List.last() |> String.to_integer()
+end
+
+defmodule SymphonyElixir.PipelineIntegrationTest.HoldingAgent do
+  alias SymphonyElixir.PipelineIntegrationTest
+
+  def run(issue, recipient, opts) do
+    table = Application.fetch_env!(:symphony_elixir, :pipeline_test_board)
+    workspace = PipelineIntegrationTest.ensure_test_workspace!(issue)
+    :ets.insert(table, {{:held_agent_pid, issue.id}, self()})
+    :ets.update_counter(table, {:agent_calls, issue.id, :build}, {2, 1}, {{:agent_calls, issue.id, :build}, 0})
+    send(recipient, {:worker_runtime_info, issue.id, %{workspace_path: workspace, worker_host: Keyword.get(opts, :worker_host)}})
+
+    receive do
+      :release -> :ok
+    end
+  end
 end
 
 defmodule SymphonyElixir.PipelineIntegrationTest.DiagnosticAgent do

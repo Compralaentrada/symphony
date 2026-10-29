@@ -10,6 +10,9 @@ El GitHub Projects v2 configurado para una instalación de Symphony, que reúne 
 **Issue del tablero**:
 Issue de GitHub vinculada al tablero común. Solo una issue cuyo estado `Status` sea `Ready`, cuyo repo esté registrado y cuyas dependencias estén resueltas puede iniciar una ejecución. En Projects v2, el estado del tablero controla el despacho.
 
+**Identidad de ejecución**:
+Identificador de una tarea de GitHub Projects compuesto por el ID del Project, el ID de su elemento, `owner/repo` y el número de issue. Symphony lo usa para distinguir tareas y nombrar workspaces e informes; `identifier` sigue siendo el valor legible que muestra la interfaz.
+
 **Perfil de repositorio**:
 Configuración de un repositorio permitido para una instalación, con su rama base y los pasos necesarios para preparar su workspace.
 
