@@ -491,7 +491,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
     normalized = state |> to_string() |> String.downcase()
 
     cond do
-      String.contains?(normalized, ["progress", "running", "active"]) -> "#{base} state-badge-active"
+      String.contains?(normalized, ["progress", "running", "active", "building"]) -> "#{base} state-badge-active"
       String.contains?(normalized, ["blocked", "error", "failed"]) -> "#{base} state-badge-danger"
       String.contains?(normalized, ["todo", "queued", "pending", "retry"]) -> "#{base} state-badge-warning"
       true -> base

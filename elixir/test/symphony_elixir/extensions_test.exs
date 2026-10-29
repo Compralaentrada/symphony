@@ -729,9 +729,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot})
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
-    {:ok, _view, html} = live(build_conn(), "/")
+    {:ok, view, html} = live(build_conn(), "/")
 
     assert html =~ ~s(class="session-timeline")
+    assert has_element?(view, ".session-timeline .state-badge-active", "Building")
     assert html =~ "MT-NEWER"
     assert html =~ "MT-OLDER"
     assert html =~ "Latest activity"
