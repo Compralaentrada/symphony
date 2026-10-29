@@ -134,6 +134,98 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     stop_orchestrator(orchestrator_pid)
   end
 
+  test "a qa-labeled task never enters Build after QA finds a defect" do
+    issue = %{issue("octo/app#64", 64) | labels: ["qa"]}
+    result = %{qa("qa-sha") | "outcome" => "changes_requested", "summary" => "A check failed."}
+    table = start_board([issue], %{issue.id => %{qa: [result]}})
+    pipeline_database!(table, retry_backoff_ms: 300_000)
+    workspace = ensure_test_workspace!(issue)
+    {sha, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: workspace, stderr_to_stdout: true)
+    sha = String.trim(sha)
+    :ets.insert(table, {{:remote_sha, issue.id}, sha})
+
+    :ets.insert(
+      table,
+      {{:pull_request, issue.id}, %{number: 164, branch: issue.branch_name, base: "main", sha: sha, draft: true, merged: false, body: "", url: "https://github.com/octo/app/pull/164"}}
+    )
+
+    orchestrator = start_orchestrator()
+
+    assert await(fn -> project_state(table, issue.id) == "Blocked" end)
+    assert await(fn -> match?({:ok, %{"status" => "blocked"}}, Store.get_task(issue.id)) end)
+    assert agent_calls(table, issue.id, :build) == 0
+    stop_orchestrator(orchestrator)
+  end
+
+  test "a blocked qa-labeled task waits for a valid PR and resumes QA without Build" do
+    issue = %{issue("octo/app#65", 65) | labels: ["qa"]}
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    assert {:ok, task, "qa"} = Pipeline.prepare(issue)
+    assert :ok = Store.save_task(Map.put(task, "status", "blocked"))
+    assert {:ok, %{"current_sha" => nil, "status" => "qa"} = retry, "qa"} = Pipeline.prepare(issue)
+    assert :ok = Store.save_task(Map.put(retry, "status", "blocked"))
+
+    :ets.insert(table, {{:pull_request, issue.id}, %{number: 165, branch: issue.branch_name, base: "main", sha: "new-qa-sha", draft: true, merged: false}})
+    assert {:ok, %{"current_sha" => "new-qa-sha", "status" => "qa"}, "qa"} = Pipeline.prepare(issue)
+  end
+
+  test "a qa-labeled task without a PR records a diagnostic in the Project" do
+    issue = %{issue("octo/app#67", 67) | labels: ["qa"]}
+    table = start_board([issue], %{})
+    pipeline_database!(table, retry_backoff_ms: 300_000)
+    assert {:ok, task, "qa"} = Pipeline.prepare(issue)
+    assert :ok = Store.save_task(Map.put(task, "status", "blocked"))
+    orchestrator = start_orchestrator(__MODULE__.DiagnosticAgent)
+    assert await(fn -> project_state(table, issue.id) == "Blocked" end)
+    assert agent_calls(table, issue.id, :build) == 0
+    stop_orchestrator(orchestrator)
+  end
+
+  test "a qa-labeled task returned from Human Review resumes QA in a new generation" do
+    issue = %{issue("octo/app#66", 66) | labels: ["qa"]}
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    :ets.insert(table, {{:pull_request, issue.id}, %{number: 166, branch: issue.branch_name, base: "main", sha: "qa-sha", draft: false, merged: false}})
+    assert {:ok, task, "qa"} = Pipeline.prepare(issue)
+    assert :ok = Store.save_task(Map.put(task, "status", "human_review"))
+    assert {:ok, %{"generation" => 2, "status" => "qa"}, "qa"} = Pipeline.prepare(issue)
+  end
+
+  test "direct QA resumes after a restart before the Project claim" do
+    issue = %{issue("octo/app#62", 62) | labels: ["qa"]}
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    :ets.insert(table, {{:pull_request, issue.id}, %{number: 162, branch: issue.branch_name, base: "main", sha: "qa-sha", draft: true, merged: false}})
+
+    assert {:ok, %{"status" => "qa"}, "qa"} = Pipeline.prepare(issue)
+    assert :ok = Pipeline.reconcile()
+    assert {:ok, %{"status" => "qa"} = task, "qa"} = Pipeline.prepare(issue)
+
+    assert :ok = Store.save_task(Map.delete(task, "direct_qa"))
+    set_project_state(table, issue.id, "Building")
+    assert :ok = Pipeline.reconcile()
+    assert {:ok, %{"status" => "blocked"}} = Store.get_task(issue.id)
+  end
+
+  test "an uncertain direct QA claim waits for an explicit Blocked to Ready transition" do
+    issue = %{issue("octo/app#63", 63) | labels: ["qa"]}
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    :ets.insert(table, {{:pull_request, issue.id}, %{number: 163, branch: issue.branch_name, base: "main", sha: "qa-sha", draft: true, merged: false}})
+
+    assert {:ok, task, "qa"} = Pipeline.prepare(issue)
+    assert :ok = Store.save_task(Map.put(task, "qa_claim_pending", true))
+    assert :ok = Pipeline.reconcile()
+    assert :ignore = Pipeline.prepare(issue)
+    assert {:ok, %{"status" => "blocked"}} = Store.get_task(issue.id)
+
+    set_project_state(table, issue.id, "Blocked")
+    assert :ok = Pipeline.reconcile()
+    set_project_state(table, issue.id, "Ready")
+    assert {:ok, %{"status" => "qa"}, "qa"} = Pipeline.prepare(issue)
+  end
+
   test "pipeline reconciliation blocks a Build checkpoint that conflicts with QA until the item is Ready" do
     issue = issue("octo/app#22", 22)
     issue = %{issue | state: "QA", native_ref: Map.put(issue.native_ref, :project_status, "QA")}
@@ -1588,6 +1680,8 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
          :ok <- save_status(issue, next, report["outcome"] == "merged") do
       evidence = %{
         "outcome" => report["outcome"],
+        "reason" => report["reason"],
+        "next_step" => report["next_step"],
         "issue" => %{"id" => issue.id, "url" => issue.url},
         "comment" => comment_evidence(issue, report_marker(issue, context, lane)),
         "project_item" => %{"id" => "item-#{issue.id}", "status" => target},
@@ -1694,16 +1788,21 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
     end
   end
 
-  defp normalize_agent_report(report, %{lane: :qa, task: task, host_checks: checks}) do
+  defp normalize_agent_report(report, %{lane: :qa, task: task, host_checks: checks, issue: issue}) do
     report = Map.put(report, "checks", checks)
     required = task["required_checks"] || []
 
-    if required_checks_passed?(required, checks) do
-      report
-    else
-      outcome = if Enum.any?(checks, &(&1["status"] == "unavailable")), do: "blocked", else: "changes_requested"
-      Map.put(report, "outcome", outcome)
-    end
+    report =
+      if required_checks_passed?(required, checks) do
+        report
+      else
+        outcome = if Enum.any?(checks, &(&1["status"] == "unavailable")), do: "blocked", else: "changes_requested"
+        Map.put(report, "outcome", outcome)
+      end
+
+    if "qa" in issue.labels and report["outcome"] in ["changes_requested", "failed", "defects_found"],
+      do: report |> Map.put("outcome", "blocked") |> Map.put("reason", "QA requires correction."),
+      else: report
   end
 
   defp normalize_agent_report(report, %{lane: :review, task: task}) do
@@ -1833,7 +1932,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
         "build" -> [status_value(:building)]
         "qa" -> [status_value(:qa)]
         "review" -> [status_value(:review), status_value(:human_review)]
-        "diagnostic" -> [status_value(:building), status_value(:qa), status_value(:review)]
+        "diagnostic" -> [status_value(:ready), status_value(:building), status_value(:qa), status_value(:review)]
         "finalize" -> [status_value(:human_review)]
       end
 

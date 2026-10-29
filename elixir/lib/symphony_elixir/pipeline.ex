@@ -99,7 +99,7 @@ defmodule SymphonyElixir.Pipeline do
     case normalize_phase_result(result, phase, report_locale(issue)) do
       {:ok, result} ->
         with :ok <- validate_remote_handoff(phase, result) do
-          finish_valid_phase(issue, task, phase, attempt, result)
+          finish_valid_phase(issue, clear_qa_claim(task, phase), phase, attempt, result)
         end
 
       {:error, reason} ->
@@ -107,6 +107,9 @@ defmodule SymphonyElixir.Pipeline do
         {:error, reason}
     end
   end
+
+  defp clear_qa_claim(task, "qa"), do: Map.drop(task, ["direct_qa", "qa_claim_pending", "qa_claim_reset_seen"])
+  defp clear_qa_claim(task, _phase), do: task
 
   @spec block_phase(Issue.t(), map(), String.t(), pos_integer(), String.t()) :: :ok | {:error, term()}
   def block_phase(%Issue{} = issue, task, phase, attempt, reason) when is_binary(reason) do
@@ -163,6 +166,9 @@ defmodule SymphonyElixir.Pipeline do
           {:ok, _task, _phase} = prepared -> finish_prepare(issue, prepared)
           other -> other
         end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -235,6 +241,7 @@ defmodule SymphonyElixir.Pipeline do
         "generation" => 1,
         "phase" => phase,
         "status" => if(phase == "qa", do: "qa", else: "building"),
+        "direct_qa" => phase == "qa",
         "attempts" => %{},
         "prior_findings" => [],
         "current_sha" => nil,
@@ -256,12 +263,24 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
+  defp prepare_task(%{"status" => "blocked", "qa_claim_pending" => true} = task, %Issue{} = issue) do
+    if task["qa_claim_reset_seen"] == true and issue.state == status_value(task, :ready) do
+      resume_direct_qa(task, issue)
+    else
+      :ignore
+    end
+  end
+
   defp prepare_task(%{"status" => "blocked"} = task, %Issue{} = issue) do
     if issue.state == status_value(task, :ready), do: resume_blocked_task(task, issue), else: :ignore
   end
 
   defp prepare_task(%{"status" => "human_review"} = task, %Issue{} = issue) do
-    if issue.state == status_value(task, :ready), do: resume_human_review_task(task), else: :ignore
+    cond do
+      issue.state != status_value(task, :ready) -> :ignore
+      Issue.routable?(issue, ["qa"]) -> resume_direct_qa(task, issue)
+      true -> resume_human_review_task(task)
+    end
   end
 
   defp prepare_task(%{"status" => "finalize"} = task, %Issue{} = issue) do
@@ -273,6 +292,12 @@ defmodule SymphonyElixir.Pipeline do
   defp prepare_task(%{"status" => "building"} = task, %Issue{} = issue) do
     if issue.state in [status_value(task, :ready), status_value(task, :building)],
       do: {:ok, task, task["phase"]},
+      else: :ignore
+  end
+
+  defp prepare_task(%{"status" => "qa", "direct_qa" => true} = task, %Issue{state: issue_state}) do
+    if issue_state in [status_value(task, :ready), status_value(task, :building), status_value(task, :qa)],
+      do: {:ok, task, "qa"},
       else: :ignore
   end
 
@@ -309,7 +334,52 @@ defmodule SymphonyElixir.Pipeline do
 
   defp seed_qa_pull_request(task, _issue), do: {:ok, task}
 
-  defp resume_blocked_task(%{"phase" => phase, "current_sha" => current_sha} = task, issue)
+  defp resume_blocked_task(%{"phase" => phase} = task, %Issue{} = issue) when phase in ["qa", "review"] do
+    if Issue.routable?(issue, ["qa"]),
+      do: resume_direct_qa(task, issue),
+      else: resume_blocked_other_task(task, issue)
+  end
+
+  defp resume_blocked_task(task, _issue), do: resume_blocked_task(task)
+
+  defp resume_direct_qa(task, issue) do
+    branch = task["branch"]
+    base = task["base_branch"]
+
+    with {:ok, delivery} <- direct_qa_delivery(Tracker.pull_request(issue), branch, base),
+         {:ok, [%Issue{state: state}]} <- Tracker.fetch_issues_by_ids([issue.id]),
+         true <- state == status_value(task, :ready) do
+      updated =
+        task
+        |> Map.drop(["qa_claim_pending", "qa_claim_reset_seen", "blocked_reason"])
+        |> Map.merge(%{"phase" => "qa", "status" => "qa", "direct_qa" => true})
+        |> Map.merge(delivery)
+        |> next_direct_qa_generation(task)
+
+      case Store.replace_task_if_unchanged(task, updated) do
+        :ok -> {:ok, updated, "qa"}
+        :stale -> :ignore
+        {:error, _reason} = error -> error
+      end
+    else
+      {:error, _reason} = error -> error
+      _ -> :ignore
+    end
+  end
+
+  defp direct_qa_delivery({:ok, %{sha: sha, number: number, branch: branch, base: base}}, branch, base)
+       when is_binary(sha) and sha != "" and is_integer(number),
+       do: {:ok, %{"current_sha" => sha, "pr_number" => number}}
+
+  defp direct_qa_delivery({:error, _reason} = error, _branch, _base), do: error
+  defp direct_qa_delivery(_result, _branch, _base), do: {:ok, %{"current_sha" => nil, "pr_number" => nil}}
+
+  defp next_direct_qa_generation(updated, %{"status" => "human_review", "generation" => generation}),
+    do: updated |> Map.put("generation", generation + 1) |> Map.put("attempts", %{})
+
+  defp next_direct_qa_generation(updated, _task), do: updated
+
+  defp resume_blocked_other_task(%{"phase" => phase, "current_sha" => current_sha} = task, issue)
        when phase in ["qa", "review"] and is_binary(current_sha) do
     case Tracker.pull_request(issue) do
       {:ok, %{sha: ^current_sha}} ->
@@ -326,13 +396,11 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp resume_blocked_task(%{"phase" => phase} = task, _issue) when phase in ["qa", "review"],
+  defp resume_blocked_other_task(%{"phase" => phase} = task, _issue) when phase in ["qa", "review"],
     do: restart_blocked_task_at_build(task)
 
-  defp resume_blocked_task(task, _issue), do: resume_blocked_task(task)
-
   defp restart_blocked_task_at_build(task),
-    do: task |> Map.put("phase", "build") |> Map.put("current_sha", nil) |> resume_blocked_task()
+    do: task |> Map.put("phase", "build") |> Map.put("current_sha", nil) |> Map.delete("direct_qa") |> resume_blocked_task()
 
   defp resume_blocked_task(task) do
     task = task |> Map.put("status", "building") |> Map.delete("blocked_reason")
@@ -345,6 +413,7 @@ defmodule SymphonyElixir.Pipeline do
       |> Map.put("generation", task["generation"] + 1)
       |> Map.put("phase", "build")
       |> Map.put("status", "building")
+      |> Map.delete("direct_qa")
       |> Map.put("attempts", %{})
       |> Map.put("current_sha", nil)
 
@@ -547,39 +616,87 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
+  defp reconcile_nonterminal_task(issue, %{"status" => "blocked", "qa_claim_pending" => true} = task) do
+    if issue.state == status_value(task, :blocked) and task["qa_claim_reset_seen"] != true,
+      do: reconcile_claim_reset(task),
+      else: :ok
+  end
+
   defp reconcile_nonterminal_task(issue, task) do
     case checkpoint_state_mismatch(task, issue) do
       {:mismatch, reason} -> block_checkpoint_mismatch(task, issue, reason)
       :ok -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp reconcile_claim_reset(task) do
+    case Store.replace_task_if_unchanged(task, Map.put(task, "qa_claim_reset_seen", true)) do
+      :stale -> :ok
+      result -> result
     end
   end
 
   defp checkpoint_state_mismatch(%{"status" => status} = task, %Issue{state: issue_state})
        when status in ["building", "qa", "review", "finalize"] do
+    with {:ok, claim_active} <- qa_claim_active(task) do
+      checkpoint_state_mismatch(task, issue_state, status, claim_active)
+    end
+  end
+
+  defp checkpoint_state_mismatch(_task, _issue), do: :ok
+
+  defp qa_claim_active(%{"status" => "qa", "qa_claim_pending" => true} = task) do
+    case get_in(task, ["attempts", "qa"]) do
+      attempt when is_integer(attempt) -> Store.pipeline_lease_active(task["issue_id"], task["generation"], "qa", attempt)
+      _ -> {:ok, false}
+    end
+  end
+
+  defp qa_claim_active(_task), do: {:ok, false}
+
+  defp checkpoint_state_mismatch(task, issue_state, status, claim_active) do
     expected_states =
       case status do
-        "building" -> [status_value(task, :ready), status_value(task, :building)]
-        "qa" -> [status_value(task, :qa)]
-        "review" -> [status_value(task, :review)]
-        "finalize" -> [status_value(task, :human_review), status_value(task, :building), status_value(task, :done), "closed"]
+        "building" ->
+          [status_value(task, :ready), status_value(task, :building)]
+
+        "qa" ->
+          qa_expected_states(task, claim_active)
+
+        "review" ->
+          [status_value(task, :review)]
+
+        "finalize" ->
+          [status_value(task, :human_review), status_value(task, :building), status_value(task, :done), "closed"]
       end
 
     if issue_state in expected_states or issue_state in [status_value(task, :done), status_value(task, :dropped), "closed"] do
       :ok
     else
       phase = task["phase"] || status
-      {:mismatch, "Pipeline checkpoint is #{String.capitalize(to_string(phase))} but tracker state is #{issue_state}; review the workpad and move the item to Ready to resume safely."}
+
+      if task["qa_claim_pending"] == true,
+        do: {:mismatch, "The QA claim outcome is uncertain; move the item to Blocked and then Ready to confirm a retry."},
+        else: {:mismatch, "Pipeline checkpoint is #{String.capitalize(to_string(phase))} but tracker state is #{issue_state}; review the workpad and move the item to Ready to resume safely."}
     end
   end
 
-  defp checkpoint_state_mismatch(_task, _issue), do: :ok
+  defp qa_expected_states(task, claim_active) do
+    if task["direct_qa"] == true and (task["qa_claim_pending"] != true or claim_active),
+      do: [status_value(task, :ready), status_value(task, :building), status_value(task, :qa)],
+      else: [status_value(task, :qa)]
+  end
 
   defp block_checkpoint_mismatch(task, issue, reason) do
     blocked = task |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
 
-    case Store.save_task(blocked) do
+    case Store.replace_task_if_unchanged(task, blocked) do
       :ok ->
         Logger.warning("Pipeline checkpoint mismatch for issue_id=#{issue.id} issue_identifier=#{issue.identifier}: #{reason}; leaving tracker state unchanged")
+        :ignore
+
+      :stale ->
         :ignore
 
       {:error, _reason} = error ->
@@ -819,13 +936,22 @@ defmodule SymphonyElixir.Pipeline do
     result = Map.put(result, "checks", checks)
 
     case remote_handoff(result) do
-      %{"outcome" => outcome} when is_binary(outcome) -> Map.put(result, "outcome", outcome)
-      _ -> result
+      %{"outcome" => "blocked", "reason" => reason} = handoff when is_binary(reason) ->
+        result |> Map.put("outcome", "blocked") |> Map.put("reason", reason) |> maybe_put("next_step", handoff["next_step"])
+
+      %{"outcome" => outcome} when is_binary(outcome) ->
+        Map.put(result, "outcome", outcome)
+
+      _ ->
+        result
     end
   end
 
   defp normalize_remote_result(result, phase) when phase in ["build", "review", "finalize"] do
     case remote_handoff(result) do
+      %{"outcome" => "blocked", "reason" => reason} = handoff when is_binary(reason) ->
+        result |> Map.put("outcome", "blocked") |> Map.put("reason", reason) |> maybe_put("next_step", handoff["next_step"])
+
       %{"outcome" => "ready", "pull_request_body" => body} when phase == "build" and is_binary(body) ->
         Map.merge(result, %{"outcome" => "ready", "pull_request_body" => body})
 
