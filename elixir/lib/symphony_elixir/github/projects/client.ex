@@ -894,6 +894,9 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          :ok <- claimable_project_status(issue, current, target_status, settings),
          {:ok, claim_state} <- begin_direct_qa_claim(issue, context),
          :ok <- ensure_claim_not_uncertain(claim_state, current, target_status),
+         :ok <- prepare_direct_qa_pr(issue, context, claim_state, settings, request_fun),
+         {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
+         :ok <- claimable_project_status(issue, current, target_status, settings),
          :ok <- maybe_set_project_status(current, target_status, settings, request_fun),
          {:ok, claimed} <- current_project_issue(issue, tracker_settings, request_fun),
          true <- project_status(claimed) == target_status,
@@ -915,6 +918,24 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp ensure_claim_not_uncertain(_state, _current, _target), do: :ok
+
+  defp prepare_direct_qa_pr(_issue, _context, :none, _settings, _request_fun), do: :ok
+
+  defp prepare_direct_qa_pr(issue, context, _claim_state, settings, request_fun) do
+    expected_sha = get_in(context, [:task, "current_sha"])
+
+    with true <- is_binary(expected_sha),
+         {:ok, %{} = pr} <- pull_request(issue, settings, request_fun),
+         true <- pr.sha == expected_sha,
+         {:ok, updated} <- update_pull_request_stage(pr, :draft, settings, request_fun),
+         true <- updated.sha == expected_sha and updated.draft do
+      :ok
+    else
+      false -> {:error, :pull_request_head_sha_mismatch}
+      {:error, _reason} = error -> error
+      _ -> {:error, :pull_request_not_found}
+    end
+  end
 
   defp confirm_direct_qa_claim(_issue, _context, :none), do: :ok
 
@@ -1071,6 +1092,14 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   @spec normalize_agent_report_for_test(map(), String.t(), map()) :: map()
   def normalize_agent_report_for_test(report, lane, context),
     do: normalize_agent_report(report, lane, context)
+
+  defp handoff_source_status("review", _issue, current, target, %{statuses: %{human_review: target, review: review}} = settings) do
+    allowed = if settings.merge_policy == "auto", do: [review], else: [target, review]
+
+    with :ok <- validate_merge_issue_open(current, %{"state" => "OPEN"}) do
+      expected_project_status(current, allowed)
+    end
+  end
 
   defp handoff_source_status(lane, issue, current, target, settings) do
     sources =
@@ -1588,7 +1617,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp validate_merge_policy(value) when value in ["human", "auto"], do: :ok
   defp validate_merge_policy(_value), do: invalid_settings(:invalid_merge_policy)
 
-  defp request_merge(issue, context, tracker_settings, settings, request_fun, _opts) do
+  defp request_merge(issue, context, tracker_settings, settings, request_fun, opts) do
     task = Map.get(context, :task) || %{}
     branch = task["branch"] || issue.branch_name
     base = task["base_branch"] || Map.get(profile_for_issue(issue, settings), :base_branch)
@@ -1599,12 +1628,21 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          true <- to_string(context.lane) == "review",
          :ok <- validate_agent_lease(context),
          {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
-         :ok <- expected_project_status(current, [settings.statuses.review, settings.statuses.human_review]),
+         :ok <- expected_project_status(current, [settings.statuses.human_review]),
          :ok <- ensure_merge_checks(task),
          {:ok, data} <- graphql(request_fun, @merge_query, variables, settings),
          %{} = pr <- find_pull_request(data, branch, base),
          :ok <- merge_gate(pr, task, get_in(data, ["repository", "ref", "target", "oid"])),
-         :ok <- merge_if_open(pr, task, settings, request_fun),
+         :ok <- validate_merge_review(issue, context, task, pr, settings, request_fun),
+         :ok <- validate_merge_base(pr, owner, name, get_in(data, ["repository", "ref", "target", "oid"]), task["current_sha"], settings, opts),
+         {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
+         :ok <- expected_project_status(current, [settings.statuses.human_review]),
+         :ok <- validate_merge_issue_open(current, pr),
+         {:ok, latest} <- graphql(request_fun, @merge_query, variables, settings),
+         %{} = latest_pr <- find_pull_request(latest, branch, base),
+         :ok <- merge_gate(latest_pr, task, get_in(latest, ["repository", "ref", "target", "oid"])),
+         :ok <- validate_unchanged_base(get_in(data, ["repository", "ref", "target", "oid"]), get_in(latest, ["repository", "ref", "target", "oid"])),
+         :ok <- merge_if_open(latest_pr, task, settings, request_fun),
          {:ok, merged_pr} <- confirmed_merged_pull_request(issue, branch, base, settings, request_fun) do
       {:ok,
        %{
@@ -1617,6 +1655,51 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       nil -> {:error, :pull_request_not_found}
       {:error, _reason} = error -> error
       _ -> {:error, :merge_gate_failed}
+    end
+  end
+
+  defp validate_unchanged_base(base, base), do: :ok
+  defp validate_unchanged_base(_base, _current), do: {:error, :pull_request_base_sha_mismatch}
+
+  defp validate_merge_issue_open(_issue, %{"state" => "MERGED"}), do: :ok
+
+  defp validate_merge_issue_open(issue, _pr) do
+    if normalize_state(ref_value(issue.native_ref, :issue_state)) == "open",
+      do: :ok,
+      else: {:error, :github_issue_closed}
+  end
+
+  defp validate_merge_base(%{"state" => "MERGED"}, _owner, _name, _base, _sha, _settings, _opts), do: :ok
+
+  defp validate_merge_base(_pr, owner, name, base, sha, settings, opts) do
+    path =
+      "/repos/#{URI.encode(owner, &URI.char_unreserved?/1)}/#{URI.encode(name, &URI.char_unreserved?/1)}/compare/#{URI.encode(base, &URI.char_unreserved?/1)}...#{URI.encode(sha, &URI.char_unreserved?/1)}"
+
+    rest_fun = Keyword.fetch!(opts, :github_rest)
+
+    case rest_fun.("GET", path, %{"per_page" => 1}, nil, settings) do
+      {:ok, %{status: status, body: %{"merge_base_commit" => %{"sha" => ^base}}}} when status in 200..299 -> :ok
+      {:ok, %{status: status}} when status in 200..299 -> {:error, :pull_request_base_not_in_head}
+      _ -> {:error, :pull_request_base_comparison_failed}
+    end
+  end
+
+  defp validate_merge_review(issue, context, task, pr, settings, request_fun) do
+    marker = agent_report_marker(issue, context, "review")
+
+    with {:ok, issue_ref} <- issue_repository_and_number(issue),
+         {:ok, comments} <- list_issue_comments(issue_ref, settings, request_fun, nil, []),
+         {:ok, viewer_data} <- graphql(request_fun, @viewer_query, %{}, settings),
+         viewer when is_binary(viewer) <- get_in(viewer_data, ["viewer", "login"]),
+         %{"body" => body} <- Enum.find(comments, &(get_in(&1, ["author", "login"]) == viewer and String.starts_with?(&1["body"] || "", marker <> "\n"))),
+         {:ok, report} <- decode_phase_report_comment(body),
+         true <- report["outcome"] == "passed" or (report["outcome"] == "merged" and pr["state"] == "MERGED"),
+         true <- report["sha"] == task["current_sha"],
+         %{"findings" => []} <- normalize_agent_report(report, "review", context) do
+      :ok
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :review_evidence_unavailable}
     end
   end
 
@@ -1659,6 +1742,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       true -> :ok
     end
   end
+
+  defp validate_github_checks(%{"statusCheckRollup" => nil}), do: :ok
 
   defp validate_github_checks(pr) do
     if get_in(pr, ["statusCheckRollup", "state"]) == "SUCCESS",

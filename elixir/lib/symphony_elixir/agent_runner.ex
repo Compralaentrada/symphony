@@ -12,6 +12,54 @@ defmodule SymphonyElixir.AgentRunner do
   @workspace_refresh_blockers [:project_branch_diverged, :project_branch_missing, :project_branch_dirty]
 
   @doc false
+  @spec preflight_skills(Issue.t(), map() | nil, atom() | String.t() | nil, worker_host()) ::
+          :ok | {:ok, :skills_preflighted} | {:error, term()}
+  def preflight_skills(%Issue{} = issue, task, phase, worker_host \\ nil) do
+    snapshot = Skills.attempt_snapshot(issue, task, phase)
+
+    if snapshot == [] do
+      :ok
+    else
+      opts = [phase: normalize_phase(phase), pipeline_task: task || %{}]
+      task = task || %{}
+      has_pull_request? = not is_nil(task["pr_number"])
+
+      workspace_opts = [
+        require_existing_project_branch: has_pull_request? and phase_with_pr?(opts),
+        create_project_branch: true,
+        refresh_project_branch: refresh_project_branch?(opts)
+      ]
+
+      case Workspace.create_for_issue(issue, worker_host, workspace_opts) do
+        {:ok, workspace} ->
+          preflight_verified_skills(workspace, snapshot, worker_host)
+
+        {:error, reason} ->
+          preflight_workspace_error(issue, snapshot, worker_host, reason)
+      end
+    end
+  end
+
+  defp preflight_verified_skills(workspace, snapshot, worker_host) do
+    with :ok <- verify_skill_snapshot(workspace, snapshot, worker_host), do: {:ok, :skills_preflighted}
+  end
+
+  defp preflight_workspace_error(issue, snapshot, worker_host, reason) when reason in @workspace_refresh_blockers do
+    case Workspace.create_for_issue(issue, worker_host, create_project_branch: false) do
+      {:ok, workspace} ->
+        with :ok <- verify_skill_snapshot(workspace, snapshot, worker_host) do
+          {:error, {:workspace_preflight, reason}}
+        end
+
+      {:error, fallback_reason} ->
+        {:error, {:workspace_preflight, fallback_reason}}
+    end
+  end
+
+  defp preflight_workspace_error(_issue, _snapshot, _worker_host, reason),
+    do: {:error, {:workspace_preflight, reason}}
+
+  @doc false
   @spec continue_with_issue_for_test(Issue.t(), ([String.t()] -> term())) ::
           {:continue, Issue.t()} | {:done, Issue.t()} | {:error, term()}
   def continue_with_issue_for_test(%Issue{} = issue, issue_state_fetcher)
@@ -42,7 +90,10 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
     diagnostic? = Keyword.get(opts, :diagnostic, false)
-    refresh_project_branch? = not diagnostic? and refresh_project_branch?(opts)
+
+    refresh_project_branch? =
+      not diagnostic? and not Keyword.get(opts, :skills_preflighted, false) and refresh_project_branch?(opts)
+
     task = Keyword.get(opts, :pipeline_task, %{})
     has_pull_request? = is_map(task) and not is_nil(Map.get(task, "pr_number"))
 
@@ -297,9 +348,13 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    selected_repo_skills = Skills.select(issue, selected_skill_phase(opts))
+    selected_skill_snapshot =
+      Skills.attempt_snapshot(issue, Keyword.get(opts, :pipeline_task), selected_skill_phase(opts))
 
-    opts = Keyword.put(opts, :selected_repo_skills, selected_repo_skills)
+    opts =
+      opts
+      |> Keyword.put(:selected_skill_snapshot, selected_skill_snapshot)
+      |> Keyword.put(:selected_repo_skills, Skills.names(selected_skill_snapshot))
 
     opts =
       Keyword.put_new(
@@ -684,6 +739,8 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp pipeline_phase_instructions(:review, _opts) do
+    merge_policy = Map.get(Config.settings!().tracker.provider, "merge_policy", "human")
+
     """
     Pipeline phase: autonomous code review. Before any other GitHub write, call `github_workflow` with operation `claim`; stop if the claim is rejected. This moves a requeued Ready item to Review and confirms an item already in Review. Then read the issue's workpad and all current-generation QA reports with `github_workflow` operation `read_workpad` before reviewing. Use those task records and `report_context.task` to identify the accepted commit, branch, QA findings, and findings to resolve. Include the task's branch, base branch, PR number, and current SHA in your report, plus every prior finding not explicitly resolved.
     Use the QA report's host-check evidence for its recorded SHA; do not require a separate GitHub status context for Symphony's host-run check.
@@ -691,8 +748,8 @@ defmodule SymphonyElixir.AgentRunner do
     The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
     Do not modify files. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
     Update the persistent workpad with review findings and resolutions using `github_workflow` operation `workpad`.
-    With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`, then call `request_merge`; if the host confirms the merge, hand off outcome `merged` so the host verifies it before closing the issue and moving the item to Done. If the gate rejects the request, leave the PR in Human Review.
-    Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
+    The configured merge policy is #{merge_policy}. With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`, then call `request_merge`; if the host confirms the merge, hand off outcome `merged` so the host verifies it before closing the issue and moving the item to Done. If the gate rejects the request, leave the PR in Human Review.
+    Finish with exactly one JSON object containing outcome (passed, merged, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end
 
@@ -741,12 +798,18 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp normalize_phase_report(report), do: report
 
-  defp ensure_skills_available(_workspace, _issue, _opts, worker_host) when is_binary(worker_host), do: :ok
+  defp ensure_skills_available(workspace, _issue, opts, worker_host) do
+    verify_skill_snapshot(workspace, Keyword.fetch!(opts, :selected_skill_snapshot), worker_host)
+  end
 
-  defp ensure_skills_available(workspace, issue, opts, nil),
-    do: Skills.ensure_available(workspace, issue, selected_skill_phase(opts))
+  defp verify_skill_snapshot(workspace, snapshot, nil), do: Skills.verify_snapshot(workspace, snapshot)
+  defp verify_skill_snapshot(workspace, snapshot, worker_host), do: Workspace.verify_skill_snapshot(workspace, snapshot, worker_host)
 
   defp selected_skill_phase(opts), do: if(Keyword.get(opts, :diagnostic, false), do: :diagnostic, else: Keyword.get(opts, :phase))
+
+  defp normalize_phase(phase) when is_atom(phase), do: phase
+  defp normalize_phase(phase) when phase in ["build", "qa", "review", "diagnostic", "finalize"], do: String.to_existing_atom(phase)
+  defp normalize_phase(_phase), do: nil
 
   defp do_run_codex_turns(
          app_session,
@@ -880,7 +943,7 @@ defmodule SymphonyElixir.AgentRunner do
     properties = %{
       "outcome" => %{
         "type" => "string",
-        "enum" => ["passed", "changes_requested", "blocked", "failed", "defects_found"]
+        "enum" => ["passed", "changes_requested", "blocked", "failed", "defects_found"] ++ if(phase == :review, do: ["merged"], else: [])
       },
       "summary" => %{"type" => "string"},
       "findings" => %{
