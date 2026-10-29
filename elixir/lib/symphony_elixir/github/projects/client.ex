@@ -1723,10 +1723,48 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          "sha" => task["current_sha"]
        }}
     else
-      false -> {:error, :auto_merge_not_authorized}
+      false ->
+        {:error, :auto_merge_not_authorized}
+
+      nil ->
+        {:error, :pull_request_not_found}
+
+      {:error, reason} when reason in [:pull_request_base_not_in_head, :pull_request_base_sha_mismatch] ->
+        with :ok <- requeue_stale_merge(issue, context, task, variables, tracker_settings, settings, request_fun) do
+          {:error, reason}
+        end
+
+      {:error, _reason} = error ->
+        error
+
+      _ ->
+        {:error, :merge_gate_failed}
+    end
+  end
+
+  defp requeue_stale_merge(issue, context, task, variables, tracker_settings, settings, request_fun) do
+    with :ok <- validate_agent_lease(context),
+         {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
+         :ok <- expected_project_status(current, [settings.statuses.human_review]),
+         {:ok, data} <- graphql(request_fun, @merge_query, variables, settings),
+         %{} = pr <- find_pull_request(data, variables["branch"], variables["base"]),
+         true <- pr["state"] == "OPEN" and pr["headRefOid"] == task["current_sha"],
+         :ok <- validate_merge_state(pr),
+         :ok <- validate_github_checks(pr),
+         :ok <- validate_merge_issue_open(current, pr),
+         :ok <- validate_merge_review(issue, context, task, pr, settings, request_fun),
+         {:ok, saved} <- Store.get_task(issue.id),
+         true <- saved["generation"] == context.generation and saved["phase"] == "review" and saved["current_sha"] == task["current_sha"],
+         :ok <- Store.replace_task_if_unchanged(saved, Map.put(saved, "stale_merge_retry", true)),
+         :ok <- set_item_status(current.native_ref, settings.statuses.ready, settings, request_fun),
+         {:ok, updated} <- current_project_issue(issue, tracker_settings, request_fun),
+         :ok <- expected_project_status(updated, [settings.statuses.ready]) do
+      :ok
+    else
+      false -> {:error, :pull_request_head_sha_mismatch}
       nil -> {:error, :pull_request_not_found}
-      {:error, _reason} = error -> error
-      _ -> {:error, :merge_gate_failed}
+      :stale -> {:error, :stale_agent_lease}
+      {:error, _} = error -> error
     end
   end
 

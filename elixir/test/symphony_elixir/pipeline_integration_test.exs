@@ -193,6 +193,37 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     stop_orchestrator(orchestrator)
   end
 
+  test "a stale merge requeues Build and repeats QA and Review after restart" do
+    issue = issue("octo/app#92", 92)
+    table = start_board([issue], %{issue.id => %{build: [build("updated", issue.id)], qa: [qa("updated")], review: [review("updated")]}})
+    pipeline_database!(table, retry_backoff_ms: 300_000)
+
+    assert {:ok, task, "build"} = Pipeline.prepare(issue)
+    old = task |> Map.put("phase", "review") |> Map.put("status", "review") |> Map.put("current_sha", "old-sha") |> Map.put("stale_merge_retry", true)
+    assert :ok = Store.save_task(old)
+    assert :ok = Pipeline.reconcile([issue.id])
+    assert :ok = Pipeline.reconcile()
+    assert {:ok, %{"status" => "review", "stale_merge_retry" => true}} = Store.get_task(issue.id)
+
+    orchestrator = start_orchestrator()
+    assert await(fn -> project_state(table, issue.id) == "Human Review" end), inspect({project_state(table, issue.id), Store.get_task(issue.id), report_phases(table, issue.id)})
+    assert report_phases(table, issue.id) == [:build, :qa, :review]
+    assert {:ok, %{"generation" => 2, "current_sha" => sha}} = Store.get_task(issue.id)
+    refute sha == "old-sha"
+    stop_orchestrator(orchestrator)
+  end
+
+  test "a stale merge also returns a QA-labelled issue to Build" do
+    issue = issue("octo/app#93", 93)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    assert {:ok, task, "build"} = Pipeline.prepare(issue)
+    task = task |> Map.put("phase", "review") |> Map.put("status", "human_review") |> Map.put("stale_merge_retry", true)
+    assert :ok = Store.save_task(task)
+
+    assert {:ok, %{"phase" => "build", "current_sha" => nil}, "build"} = Pipeline.prepare(%{issue | labels: ["qa"]})
+  end
+
   test "a lost Review handoff leaves the task in Human Review after restart" do
     issue = issue("octo/app#91", 91)
     table = start_board([issue], %{issue.id => %{build: [build("sha", issue.id)], qa: [qa("sha")], review: [review("sha")]}})

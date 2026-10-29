@@ -673,6 +673,19 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert {:error, :review_evidence_unavailable} = missing_review
     refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
 
+    {stale_base, queries} = run_merge_gate(%{base_not_ancestor: true})
+    assert {:error, :pull_request_base_not_in_head} = stale_base
+    assert Enum.any?(queries, &(&1 =~ "SymphonySetProjectStatus"))
+    refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
+
+    {missing_stale_review, queries} = run_merge_gate(%{pr_base_sha: "stale-base", review_report: :missing})
+    assert {:error, :review_evidence_unavailable} = missing_stale_review
+    refute Enum.any?(queries, &(&1 =~ "SymphonySetProjectStatus"))
+
+    {human_changed, queries} = run_merge_gate(%{base_not_ancestor: true, human_decision_changed: true})
+    assert {:error, :github_human_decision_changed} = human_changed
+    refute Enum.any?(queries, &(&1 =~ "SymphonySetProjectStatus"))
+
     {without_github_checks, queries} = run_merge_gate(%{github_check_rollup: nil})
     assert {:ok, %{"outcome" => "merged", "pull_request" => %{"merged" => true}}} = without_github_checks
     assert Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
@@ -2649,7 +2662,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert :ok = Store.begin_phase(issue_id, 1, "review", 1)
     {:ok, queries} = Agent.start_link(fn -> [] end)
 
-    request_fun = fn query, _variables, _settings ->
+    request_fun = fn query, variables, _settings ->
       Agent.update(queries, &[query | &1])
 
       cond do
@@ -2668,6 +2681,10 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
         query =~ "SymphonyPipelineMergePullRequest" ->
           body = %{"data" => %{"mergePullRequest" => %{"pullRequest" => %{"mergedAt" => "2026-10-23T08:00:00Z"}}}}
           {:ok, %{status: 200, body: body}}
+
+        query =~ "SymphonySetProjectStatus" ->
+          assert variables["optionId"] == "option-ready"
+          {:ok, %{status: 200, body: %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}}}
 
         query =~ "SymphonyPipelinePullRequest" ->
           merged_pull_request = %{
@@ -2745,7 +2762,15 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
   defp merge_gate_project(options, queries, number) do
     reads = Agent.get(queries, &Enum.count(&1, fn query -> query =~ "SymphonyProject(" end))
-    status = if options[:human_decision_changed] == true and reads > 1, do: "Building", else: "Human Review"
+    requeued = Agent.get(queries, &Enum.any?(&1, fn query -> query =~ "SymphonySetProjectStatus" end))
+
+    status =
+      cond do
+        requeued -> "Ready"
+        options[:human_decision_changed] == true and reads > 1 -> "Building"
+        true -> "Human Review"
+      end
+
     issue_state = if options[:issue_closed] == true and reads > 1, do: "CLOSED", else: "OPEN"
     {:ok, %{status: 200, body: project_response([issue_item("octo/app", number, status, issue_state)])}}
   end
