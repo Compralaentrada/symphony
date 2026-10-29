@@ -30,6 +30,7 @@ polling:
 workspace:
   root: ~/code/symphony-workspaces
 hooks:
+  timeout_ms: 300000
   before_remove: |
     if [ -f elixir/mix.exs ] && command -v mise >/dev/null 2>&1; then
       cd elixir && mise exec -- mix workspace.before_remove
@@ -38,7 +39,7 @@ agent:
   max_concurrent_agents: 3
   max_turns: 20
 codex:
-  command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-6-luna"' --config model_reasoning_effort=max app-server
+  command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-6-luna"' --config model_reasoning_effort=max --config 'mcp_servers.symphony_browser={command="npx",args=["--yes","@playwright/mcp@0.0.83","--headless","--isolated","--output-dir","'"$HOME"'/.symphony/playwright/'"${PWD##*/}"'"]}' app-server
   approval_policy: never
   thread_sandbox: danger-full-access
   turn_sandbox_policy:
@@ -48,6 +49,8 @@ codex:
 The installation-level `merge_policy` front matter key accepts `human` (the default) or `auto`. A configured top-level value takes precedence over `tracker.provider.merge_policy`; when omitted, an explicit provider value remains supported. With `auto`, Review requests the deterministic merge gate; when the reviewed head SHA, base SHA, and required checks pass, Symphony merges and verifies the PR before closing the issue and moving its Project item to Done. Symphony never approves PRs automatically.
 
 The gate requires the current attempt's approved Review report and verifies that the reviewed head contains the current base commit. It accepts a missing GitHub check rollup when the host checks passed; if GitHub reports a rollup, it must be successful. GitHub still enforces branch protection and mergeability.
+
+If the base advances before automatic merge, Symphony requeues the task for Build. Build merges the configured base into the task branch, then QA and Review run again on the resulting SHA. Other merge gate failures remain in Human Review.
 
 If an automatic Review handoff reaches Human Review but its response is lost, Symphony keeps the task there for a human decision rather than assuming who moved it.
 
@@ -129,6 +132,7 @@ Impeccable and TDD are not forced into unattended sessions.
 - Reproduce the issue signal before changing code. Plan the smallest change that fully meets its acceptance criteria.
 - Follow any issue-provided Validation, Test Plan, or Testing section.
 - For user-facing changes, include an end-to-end walkthrough. For application behavior changes, record the launch path, interaction, and expected result.
+- For visual verification, use the `symphony_browser` Playwright MCP tools in headless mode. Inspect desktop and narrow viewport sizes, capture evidence, and compare it with the approved reference. For Symphony Operations without live data or GitHub Projects credentials, run `cd elixir && mise exec -- mix run --no-start --no-halt test/visual/server.exs`, then open http://127.0.0.1:4987/ using the MCP tools. Stop the preview afterwards.
 - Run checks required by the issue and use targeted validation for the changed behavior.
 - Do not approve pull requests or merge them directly. With `human` policy, leave the PR in Human Review; with `auto`, request merge only through the deterministic gate after its checks pass.
 
