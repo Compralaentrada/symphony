@@ -2597,7 +2597,13 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
   test "partial dependency responses retain the issue and a corrected relationship can be read again" do
     partial =
       project_response([issue_item("octo/app", 7, "Ready")])
+      |> update_in(["data"], &Map.put(&1, "user", nil))
       |> Map.put("errors", [
+        %{
+          "type" => "NOT_FOUND",
+          "path" => ["user"],
+          "message" => "Could not resolve to a User with the login of 'acme'."
+        },
         %{
           "type" => "FORBIDDEN",
           "path" => ["organization", "projectV2", "items", "nodes", 0, "content", "blockedBy"],
@@ -2610,7 +2616,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
                {:ok, %{status: 200, body: partial}}
              end)
 
-    assert is_binary(invalid.dependency_error)
+    assert invalid.dependency_error =~ "access"
 
     corrected =
       issue_item("octo/app", 7, "Ready")

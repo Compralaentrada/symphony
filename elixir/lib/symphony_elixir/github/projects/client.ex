@@ -2386,12 +2386,20 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp graphql_body(_body), do: {:error, {:github_projects_api_error, "GitHub Projects GraphQL returned no data."}}
 
   defp dependency_graphql_errors?(errors) do
-    errors != [] and
-      Enum.all?(errors, fn
-        %{"path" => path} when is_list(path) -> "blockedBy" in path
-        _error -> false
-      end)
+    dependency_errors? = Enum.any?(errors, &dependency_graphql_error?/1)
+
+    dependency_errors? and
+      Enum.all?(errors, &(dependency_graphql_error?(&1) or absent_project_owner_graphql_error?(&1)))
   end
+
+  defp dependency_graphql_error?(%{"path" => path}) when is_list(path), do: "blockedBy" in path
+  defp dependency_graphql_error?(_error), do: false
+
+  defp absent_project_owner_graphql_error?(%{"type" => "NOT_FOUND", "path" => [owner]})
+       when owner in ["user", "organization"],
+       do: true
+
+  defp absent_project_owner_graphql_error?(_error), do: false
 
   defp absent_project_owner_error?(data, errors) do
     match?(
