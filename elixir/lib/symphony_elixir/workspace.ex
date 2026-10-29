@@ -24,6 +24,7 @@ defmodule SymphonyElixir.Workspace do
       issue_context(issue_or_identifier)
       |> Map.put(:require_existing_project_branch, Keyword.get(opts, :require_existing_project_branch, false))
       |> Map.put(:create_project_branch, Keyword.get(opts, :create_project_branch, true))
+      |> Map.put(:skip_project_profile_prepare, Keyword.get(opts, :skip_project_profile_prepare, false))
 
     refresh_project_branch? = Keyword.get(opts, :refresh_project_branch, false)
 
@@ -493,12 +494,21 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp prepare_workspace(workspace, issue_context, created?, worker_host, refresh_project_branch?) do
-    case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
-      :ok when not created? and refresh_project_branch? ->
-        maybe_sync_project_branch(workspace, issue_context, worker_host)
+    case {issue_context[:skip_project_profile_prepare], issue_context[:repository_profile_error]} do
+      {true, _error} ->
+        :ok
 
-      result ->
-        result
+      {false, error} when not is_nil(error) ->
+        {:error, {:repository_profile_invalid, error}}
+
+      _ ->
+        case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+          :ok when not created? and refresh_project_branch? ->
+            maybe_sync_project_branch(workspace, issue_context, worker_host)
+
+          result ->
+            result
+        end
     end
   end
 
@@ -527,6 +537,9 @@ defmodule SymphonyElixir.Workspace do
         run_hook(project_branch_command(issue_context), workspace, issue_context, "after_create", worker_host)
         |> project_branch_creation_result(issue_context)
 
+      {:error, {:workspace_hook_failed, "after_create", status, _output}} ->
+        {:error, {:repository_profile_invalid, {:prepare_command_failed, status}}}
+
       error ->
         error
     end
@@ -537,6 +550,18 @@ defmodule SymphonyElixir.Workspace do
          %{require_existing_project_branch: true}
        ),
        do: {:error, :project_branch_missing}
+
+  defp project_branch_creation_result(
+         {:error, {:workspace_hook_failed, "after_create", _status, output}},
+         %{base_branch: base_branch}
+       )
+       when is_binary(output) do
+    if String.contains?(output, "Configured base branch not found") do
+      {:error, {:repository_profile_invalid, {:base_branch_unavailable, base_branch}}}
+    else
+      {:error, {:repository_profile_invalid, :repository_unavailable}}
+    end
+  end
 
   defp project_branch_creation_result(result, _issue_context), do: result
 
@@ -986,17 +1011,29 @@ defmodule SymphonyElixir.Workspace do
     base_branch = Map.get(native_ref, :base_branch) || Map.get(native_ref, "base_branch")
     prepare_command = Map.get(native_ref, :prepare_command) || Map.get(native_ref, "prepare_command")
 
-    if Enum.all?([repository, base_branch, prepare_command, Map.get(issue, :branch_name)], &present_string?/1) do
+    readiness_error = project_profile_error(native_ref, base_branch, prepare_command)
+
+    if Enum.all?([repository, Map.get(issue, :branch_name)], &present_string?/1) do
       %{
         repository: repository,
         base_branch: base_branch,
         prepare_command: prepare_command,
-        branch_name: Map.get(issue, :branch_name)
+        branch_name: Map.get(issue, :branch_name),
+        repository_profile_error: readiness_error
       }
     end
   end
 
   defp project_workspace_profile(_issue), do: nil
+
+  defp project_profile_error(native_ref, base_branch, prepare_command) do
+    Map.get(native_ref, :repository_profile_error) || Map.get(native_ref, "repository_profile_error") ||
+      cond do
+        not present_string?(base_branch) -> :missing_base_branch
+        not present_string?(prepare_command) -> :missing_prepare_command
+        true -> nil
+      end
+  end
 
   defp project_branch_command(%{
          branch_name: branch_name,
