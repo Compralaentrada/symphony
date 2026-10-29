@@ -905,6 +905,11 @@ Failure handling:
   prepared directory.
 - Reused workspaces SHOULD NOT be destructively reset on population failure unless that policy is
   explicitly chosen and documented.
+- GitHub Projects selects the configured repository profile from the linked issue's repository.
+  Profile readiness is checked for that task by running its preparation command and verifying its
+  base branch. Missing profile requirements, inaccessible repositories, unavailable base branches,
+  and failed preparation block only tasks for the affected repository and are recorded by the
+  diagnostic lane; other configured repository profiles remain usable.
 - GitHub Projects repository profiles synchronize a reused issue branch when Build resumes without
   an accepted SHA. They fetch and fast-forward; if the local and remote branches have diverged, the
   task is blocked with a recovery instruction and the local workspace is preserved. Dirty workspace
