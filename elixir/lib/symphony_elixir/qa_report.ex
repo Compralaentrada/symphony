@@ -45,14 +45,16 @@ defmodule SymphonyElixir.QAReport do
 
   defp criteria_from_chunk(chunk) do
     case Enum.flat_map(chunk, &parse_criterion/1) do
-      [] -> prose_criterion(chunk)
+      [] -> prose_criteria(chunk)
       criteria -> criteria
     end
   end
 
-  defp prose_criterion(lines) do
-    text = lines |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == "")) |> Enum.join(" ")
-    if text == "", do: [], else: [text]
+  defp prose_criteria(lines) do
+    lines
+    |> Enum.chunk_by(&(String.trim(&1) == ""))
+    |> Enum.reject(&(String.trim(hd(&1)) == ""))
+    |> Enum.map(fn paragraph -> Enum.map_join(paragraph, " ", &String.trim/1) end)
   end
 
   defp parse_criterion(line) do

@@ -63,6 +63,18 @@ defmodule SymphonyElixir.QAReportTest do
              QAReport.criteria_from_description("## Acceptance Criteria\nThe result is clearly reported.")
   end
 
+  test "separate prose paragraphs require separate coverage" do
+    description = "## Acceptance Criteria\nFirst paragraph criterion.\n\nSecond paragraph criterion."
+    first_criterion = hd(report()["criteria"])
+    combined_criterion = Map.put(first_criterion, "criterion", "First paragraph criterion. Second paragraph criterion.")
+    incomplete_report = Map.put(report(), "criteria", [combined_criterion])
+
+    assert ["First paragraph criterion.", "Second paragraph criterion."] =
+             QAReport.criteria_from_description(description)
+
+    refute QAReport.valid?(incomplete_report, [], description)
+  end
+
   test "a criterion without a real evidence reference cannot be covered by the summary" do
     report = report()
 
