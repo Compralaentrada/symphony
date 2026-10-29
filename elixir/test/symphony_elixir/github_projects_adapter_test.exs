@@ -497,12 +497,28 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
     assert Enum.any?(queries, &(&1 =~ "SymphonyPipelinePullRequest"))
 
+    {missing_review, queries} = run_merge_gate(%{review_report: :missing})
+    assert {:error, :review_evidence_unavailable} = missing_review
+    refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
+
+    {without_github_checks, queries} = run_merge_gate(%{github_check_rollup: nil})
+    assert {:ok, %{"outcome" => "merged", "pull_request" => %{"merged" => true}}} = without_github_checks
+    assert Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
+
     {already_merged, queries} = run_merge_gate(%{pr_state: "MERGED"})
     assert {:ok, %{"outcome" => "merged", "pull_request" => %{"merged" => true}}} = already_merged
     refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
 
     for {scenario, expected_error} <- [
           {%{host_check_status: "failed"}, :host_checks_not_verified},
+          {%{human_decision_changed: true}, :github_human_decision_changed},
+          {%{issue_closed: true}, :github_issue_closed},
+          {%{base_not_ancestor: true}, :pull_request_base_not_in_head},
+          {%{base_changed: true}, :pull_request_base_sha_mismatch},
+          {%{review_outcome: "changes_requested"}, :review_evidence_unavailable},
+          {%{review_sha: String.duplicate("b", 40)}, :review_evidence_unavailable},
+          {%{review_author: "someone-else"}, :review_evidence_unavailable},
+          {%{prior_findings: [%{"id" => "QA-1"}]}, :review_evidence_unavailable},
           {%{github_check_status: "FAILURE"}, :required_github_checks_not_passed},
           {%{pr_head_sha: String.duplicate("b", 40)}, :pull_request_head_sha_mismatch},
           {%{pr_base_sha: "stale-base"}, :pull_request_base_sha_mismatch},
@@ -534,6 +550,58 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
                %{report | "resolutions" => [finding["id"] <> " — resolved: the check passed after the fix."]},
                "review",
                context
+             )
+  end
+
+  test "automatic Review does not overwrite a human move to Human Review" do
+    previous = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    root = Path.join(System.tmp_dir!(), "symphony-human-review-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    issue = %Issue{
+      id: "octo/app#90",
+      identifier: "octo/app#90",
+      branch_name: "symphony/octo-app-90",
+      state: "Review",
+      native_ref: %{repository: "octo/app", project_status: "Review"}
+    }
+
+    sha = String.duplicate("a", 40)
+    task = %{"issue_id" => issue.id, "generation" => 1, "phase" => "review", "attempts" => %{"review" => 1}, "current_sha" => sha}
+    assert :ok = Store.save_task(task)
+    assert :ok = Store.begin_phase(issue.id, 1, "review", 1)
+    report = %{"outcome" => "passed", "summary" => "Reviewed.", "sha" => sha, "findings" => [], "resolutions" => []}
+    body = "Review passed.\n\n<!-- symphony:report:json\n#{Jason.encode!(report)}\n-->"
+
+    request = fn _query, _variables, _settings ->
+      {:ok, %{status: 200, body: project_response([issue_item("octo/app", 90, "Human Review")])}}
+    end
+
+    context = %{issue: issue, lane: :review, generation: 1, attempt: 1, task: task}
+
+    assert {:error, :github_human_decision_changed} =
+             Client.agent_operation(issue, context, "handoff", %{"report" => report, "body" => body},
+               tracker_settings: tracker_settings(%{"merge_policy" => "auto"}),
+               projects_request: request
+             )
+
+    closed_request = fn _query, _variables, _settings ->
+      {:ok, %{status: 200, body: project_response([issue_item("octo/app", 90, "Review", "CLOSED")])}}
+    end
+
+    assert {:error, :github_issue_closed} =
+             Client.agent_operation(issue, context, "handoff", %{"report" => report, "body" => body},
+               tracker_settings: tracker_settings(%{"merge_policy" => "auto"}),
+               projects_request: closed_request
              )
   end
 
@@ -2110,6 +2178,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "branch" => branch,
       "base_branch" => "main",
       "current_sha" => sha,
+      "prior_findings" => Map.get(options, :prior_findings, []),
       "required_checks" => ["make -C elixir all"],
       "host_checks" => [
         %{
@@ -2129,32 +2198,16 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
       cond do
         query =~ "SymphonyProject(" ->
-          {:ok, %{status: 200, body: project_response([issue_item("octo/app", number, "Review")])}}
+          merge_gate_project(options, queries, number)
 
-        query =~ "SymphonyPipelineMergeGate" and Map.get(options, :provider_error, false) ->
-          {:error, :timeout}
+        query =~ "SymphonyPipelineViewer" ->
+          {:ok, %{status: 200, body: %{"data" => %{"viewer" => %{"login" => "agent"}}}}}
+
+        query =~ "SymphonyPipelineReportComments" ->
+          merge_gate_comments(options, issue, sha)
 
         query =~ "SymphonyPipelineMergeGate" ->
-          current_base_sha = Map.get(options, :current_base_sha, "base-current")
-          pr_state = Map.get(options, :pr_state, "OPEN")
-
-          pull_request = %{
-            "id" => "PR_#{number}",
-            "number" => number,
-            "url" => "https://github.com/octo/app/pull/#{number}",
-            "state" => pr_state,
-            "isDraft" => false,
-            "mergedAt" => if(pr_state == "MERGED", do: "2026-10-23T08:00:00Z"),
-            "baseRefName" => "main",
-            "baseRefOid" => Map.get(options, :pr_base_sha, current_base_sha),
-            "headRefName" => branch,
-            "headRefOid" => Map.get(options, :pr_head_sha, sha),
-            "statusCheckRollup" => %{"state" => Map.get(options, :github_check_status, "SUCCESS")}
-          }
-
-          current_ref = merge_gate_base_ref(current_base_sha)
-          body = %{"data" => %{"repository" => %{"ref" => current_ref, "pullRequests" => %{"nodes" => [pull_request]}}}}
-          {:ok, %{status: 200, body: body}}
+          merge_gate_query_with_changes(options, queries, number, branch, sha)
 
         query =~ "SymphonyPipelineMergePullRequest" ->
           body = %{"data" => %{"mergePullRequest" => %{"pullRequest" => %{"mergedAt" => "2026-10-23T08:00:00Z"}}}}
@@ -2189,12 +2242,65 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     result =
       Client.agent_operation(issue, context, "request_merge", %{},
         tracker_settings: tracker_settings(%{"merge_policy" => "auto"}),
-        projects_request: request_fun
+        projects_request: request_fun,
+        github_rest: fn "GET", _path, _params, _body, _settings -> merge_gate_comparison(options) end
       )
 
     calls = Agent.get(queries, &Enum.reverse/1)
     Agent.stop(queries)
     {result, calls}
+  end
+
+  defp merge_gate_query_with_changes(options, queries, number, branch, sha) do
+    reads = Agent.get(queries, &Enum.count(&1, fn query -> query =~ "SymphonyPipelineMergeGate" end))
+    options = if options[:base_changed] == true and reads > 1, do: Map.put(options, :current_base_sha, "new-base"), else: options
+    merge_gate_query(options, number, branch, sha)
+  end
+
+  defp merge_gate_comparison(options) do
+    base = if options[:base_not_ancestor], do: "different-base", else: Map.get(options, :current_base_sha, "base-current")
+    {:ok, %{status: 200, body: %{"merge_base_commit" => %{"sha" => base}}}}
+  end
+
+  defp merge_gate_query(%{provider_error: true}, _number, _branch, _sha), do: {:error, :timeout}
+
+  defp merge_gate_query(options, number, branch, sha) do
+    current_base_sha = Map.get(options, :current_base_sha, "base-current")
+    pr_state = Map.get(options, :pr_state, "OPEN")
+
+    pull_request = %{
+      "id" => "PR_#{number}",
+      "number" => number,
+      "url" => "https://github.com/octo/app/pull/#{number}",
+      "state" => pr_state,
+      "isDraft" => false,
+      "mergedAt" => if(pr_state == "MERGED", do: "2026-10-23T08:00:00Z"),
+      "baseRefName" => "main",
+      "baseRefOid" => Map.get(options, :pr_base_sha, current_base_sha),
+      "headRefName" => branch,
+      "headRefOid" => Map.get(options, :pr_head_sha, sha),
+      "statusCheckRollup" => Map.get(options, :github_check_rollup, %{"state" => Map.get(options, :github_check_status, "SUCCESS")})
+    }
+
+    current_ref = merge_gate_base_ref(current_base_sha)
+    body = %{"data" => %{"repository" => %{"ref" => current_ref, "pullRequests" => %{"nodes" => [pull_request]}}}}
+    {:ok, %{status: 200, body: body}}
+  end
+
+  defp merge_gate_project(options, queries, number) do
+    reads = Agent.get(queries, &Enum.count(&1, fn query -> query =~ "SymphonyProject(" end))
+    status = if options[:human_decision_changed] == true and reads > 1, do: "Building", else: "Human Review"
+    issue_state = if options[:issue_closed] == true and reads > 1, do: "CLOSED", else: "OPEN"
+    {:ok, %{status: 200, body: project_response([issue_item("octo/app", number, status, issue_state)])}}
+  end
+
+  defp merge_gate_comments(options, issue, sha) do
+    report = %{"outcome" => Map.get(options, :review_outcome, "passed"), "sha" => Map.get(options, :review_sha, sha), "findings" => [], "resolutions" => []}
+    marker = "<!-- symphony:report:start:#{Issue.execution_identity(issue)}:1:review:1 -->"
+    body = marker <> "\n<!-- symphony:report:json\n" <> Jason.encode!(report) <> "\n-->"
+    nodes = if options[:review_report] == :missing, do: [], else: [%{"body" => body, "author" => %{"login" => Map.get(options, :review_author, "agent")}}]
+    comments = %{"nodes" => nodes, "pageInfo" => %{"hasNextPage" => false}}
+    {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}}}
   end
 
   defp merge_gate_base_ref(nil), do: nil
