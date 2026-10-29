@@ -10,8 +10,8 @@ defmodule SymphonyElixir.GitHub.AgentTool do
   @github_workflow_tool "github_workflow"
   @workflow_operations %{
     "build" => ["claim", "read_workpad", "workpad", "handoff", "create_follow_up_issue"],
-    "qa" => ["read_workpad", "workpad", "handoff", "create_follow_up_issue"],
-    "review" => ["read_workpad", "workpad", "handoff", "create_follow_up_issue"],
+    "qa" => ["claim", "read_workpad", "workpad", "handoff", "create_follow_up_issue"],
+    "review" => ["claim", "read_workpad", "workpad", "handoff", "create_follow_up_issue"],
     "diagnostic" => ["read_workpad", "workpad", "handoff"],
     "finalize" => ["read_workpad", "workpad", "handoff"],
     "individual" => ["claim", "workpad", "handoff", "create_follow_up_issue", "release_claim"]
