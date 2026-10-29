@@ -1320,7 +1320,9 @@ Adapter output MUST satisfy Section 4.1.1. In addition:
   dispatched only through the restricted diagnostic lane; the orchestrator MUST NOT write the
   Project status. The diagnostic agent requests `Blocked` and records a correction through the
   mediated GitHub workflow. An unconfirmed status change leaves remote status authoritative and
-  MUST NOT start implementation.
+  MUST NOT start implementation; Symphony keeps a local blocked checkpoint instead of retrying
+  automatically. If the item remains `Ready`, Symphony resumes only after it observes the item
+  leave `Ready` and later return to `Ready`.
 - `dispatchable` MUST be explicit. It is `true` only when provider-specific eligibility checks
   pass; the generic scheduler never tries to reconstruct those checks from `native_ref`.
 - `native_ref` MUST be null or a JSON-safe object containing only non-secret values safe to expose

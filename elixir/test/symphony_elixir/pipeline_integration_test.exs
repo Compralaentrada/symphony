@@ -585,7 +585,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     stop_orchestrator(orchestrator)
   end
 
-  test "unconfirmed Blocked transition keeps Ready and does not start Build" do
+  test "unconfirmed Blocked transition waits for an observed requeue before Build" do
     reason = "GitHub denied access to a blocker. Grant read access, correct the relationship, then move the item to Ready."
     issue = %{issue("octo/app#47", 47) | dependency_error: reason}
     table = start_board([issue], %{})
@@ -599,10 +599,44 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert lookup(table, {:diagnostic_runner_calls, issue.id}) == 1
     assert agent_calls(table, issue.id) == 0
 
+    assert await(fn ->
+             match?(
+               {:ok, %{"status" => "blocked", "diagnostic_handoff_unconfirmed" => true}},
+               Store.get_task(issue.id)
+             )
+           end)
+
+    assert {:ok, %{result: %{"outcome" => "blocked", "reason" => local_reason, "next_step" => next_step}}} =
+             Store.latest_phase_result(issue.id, 1)
+
+    assert local_reason =~ "No se pudo confirmar"
+    assert next_step =~ "Ready"
+
     report = Jason.decode!(lookup(table, {:report, issue.id, "diagnostic"}))
     assert report["reason"] == reason
     assert report["next_step"] =~ "Ready"
 
+    stop_orchestrator(orchestrator)
+
+    corrected = %{fetch_issue(table, issue.id) | dependency_error: nil}
+    :ets.insert(table, {{:issue, issue.id}, corrected})
+    name = Module.concat(__MODULE__, "DiagnosticRequeue#{System.unique_integer([:positive])}")
+    {:ok, orchestrator} = Orchestrator.start_link(name: name, agent_runner: HoldingAgent)
+    refresh!(name, table)
+
+    assert project_state(table, issue.id) == "Ready"
+    assert agent_calls(table, issue.id, :build) == 0
+
+    set_project_state(table, issue.id, "Blocked")
+    refresh!(name, table)
+    assert {:ok, %{"status" => "blocked"} = task} = Store.get_task(issue.id)
+    refute Map.has_key?(task, "diagnostic_handoff_unconfirmed")
+
+    set_project_state(table, issue.id, "Ready")
+    refresh!(name, table)
+    assert await(fn -> lookup(table, {:held_agent_pid, issue.id}) != nil end)
+    assert agent_calls(table, issue.id, :build) == 1
+    send(lookup(table, {:held_agent_pid, issue.id}), :release)
     stop_orchestrator(orchestrator)
   end
 

@@ -340,11 +340,23 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue_id)
 
       {:error, reason} ->
-        retry_agent_down(state, issue_id, running_entry, session_id, reason)
+        if Map.get(running_entry, :diagnostic_attempt, false) do
+          defer_failed_diagnostic(state, issue_id, running_entry)
+        else
+          retry_agent_down(state, issue_id, running_entry, session_id, reason)
+        end
     end
   end
 
   defp handle_pipeline_agent_down(reason, state, issue_id, running_entry, session_id) do
+    if Map.get(running_entry, :diagnostic_attempt, false) do
+      defer_failed_diagnostic(state, issue_id, running_entry)
+    else
+      handle_pipeline_agent_down_failure(reason, state, issue_id, running_entry, session_id)
+    end
+  end
+
+  defp handle_pipeline_agent_down_failure(reason, state, issue_id, running_entry, session_id) do
     if input_required_blocker?(running_entry) do
       blocker = blocker_error(running_entry, "Codex requires operator input")
 
@@ -367,6 +379,23 @@ defmodule SymphonyElixir.Orchestrator do
       )
 
       retry_agent_down(state, issue_id, running_entry, session_id, reason)
+    end
+  end
+
+  defp defer_failed_diagnostic(state, issue_id, running_entry) do
+    case Pipeline.defer_unconfirmed_diagnostic(
+           running_entry.issue,
+           running_entry.pipeline_task,
+           running_entry.pipeline_phase,
+           running_entry.pipeline_attempt
+         ) do
+      :ok ->
+        Logger.warning("Diagnostic handoff could not be confirmed for #{issue_context(running_entry.issue)}; waiting for an observed human requeue before dispatch")
+        release_issue_claim(state, issue_id)
+
+      {:error, reason} ->
+        Logger.error("Unable to persist the diagnostic requeue checkpoint for #{issue_context(running_entry.issue)}: #{inspect(reason)}; keeping the local claim and not scheduling a retry")
+        state
     end
   end
 
@@ -1566,6 +1595,7 @@ defmodule SymphonyElixir.Orchestrator do
       pipeline_task: task,
       pipeline_phase: phase,
       pipeline_attempt: phase_attempt,
+      diagnostic_attempt: is_binary(issue.dependency_error) and issue.dependency_error != "",
       retry_attempt: normalize_retry_attempt(retry_attempt),
       started_at: DateTime.utc_now()
     }
