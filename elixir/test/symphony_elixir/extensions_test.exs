@@ -573,6 +573,13 @@ defmodule SymphonyElixir.ExtensionsTest do
     orchestrator_name = Module.concat(__MODULE__, :DashboardOrchestrator)
     snapshot = static_snapshot()
 
+    pipeline_entry =
+      snapshot.running
+      |> hd()
+      |> Map.merge(%{issue_id: "issue-pipeline", identifier: "MT-PIPELINE", pipeline_phase: "review"})
+
+    snapshot = put_in(snapshot.running, snapshot.running ++ [pipeline_entry])
+
     {:ok, orchestrator_pid} =
       StaticOrchestrator.start_link(
         name: orchestrator_name,
@@ -604,6 +611,25 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Offline"
     assert html =~ "Copy ID"
     assert html =~ "Latest activity"
+    assert html =~ "Pipeline phase"
+    assert html =~ "review"
+    assert length(Regex.scan(~r/Pipeline phase/, html)) == 1
+
+    [pipeline_payload] =
+      get(build_conn(), "/api/v1/state")
+      |> json_response(200)
+      |> Map.fetch!("running")
+      |> Enum.filter(&(&1["issue_identifier"] == "MT-PIPELINE"))
+
+    assert pipeline_payload["pipeline_phase"] == "review"
+
+    [regular_payload] =
+      get(build_conn(), "/api/v1/state")
+      |> json_response(200)
+      |> Map.fetch!("running")
+      |> Enum.filter(&(&1["issue_identifier"] == "MT-HTTP"))
+
+    refute Map.has_key?(regular_payload, "pipeline_phase")
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
@@ -652,6 +678,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       render(view) =~ "agent message content streaming: structured update"
     end)
 
+    refute render(view) =~ "Pipeline phase"
     refute render(view) =~ "javascript:alert"
   end
 

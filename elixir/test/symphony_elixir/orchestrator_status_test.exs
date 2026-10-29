@@ -166,6 +166,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_message: nil,
       last_codex_timestamp: nil,
       last_codex_event: nil,
+      pipeline_phase: "qa",
       started_at: started_at
     }
 
@@ -205,6 +206,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.session_id == "thread-live-turn-live"
     assert snapshot_entry.turn_count == 1
     assert snapshot_entry.last_codex_timestamp == now
+    assert snapshot_entry.pipeline_phase == "qa"
 
     assert snapshot_entry.last_codex_message == %{
              event: :notification,
@@ -300,6 +302,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.codex_output_tokens == 4
     assert snapshot_entry.codex_total_tokens == 16
     assert snapshot_entry.turn_count == 1
+    refute Map.has_key?(snapshot_entry, :pipeline_phase)
     assert is_integer(snapshot_entry.runtime_seconds)
 
     send(pid, {:DOWN, process_ref, :process, self(), :normal})
