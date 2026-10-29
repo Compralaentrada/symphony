@@ -29,8 +29,125 @@ defmodule SymphonyElixir.Pipeline.Store do
     end)
   end
 
+  @spec latest_phase_result(String.t(), pos_integer()) ::
+          {:ok, %{phase: String.t(), result: map(), updated_at: String.t()} | nil} | {:error, term()}
+  def latest_phase_result(issue_id, generation) do
+    with_db(fn conn ->
+      case query(
+             conn,
+             "SELECT phase, result, updated_at FROM pipeline_phases WHERE issue_id = ? AND generation = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+             [issue_id, generation]
+           ) do
+        {:ok, [[phase, result, updated_at]]} ->
+          {:ok, %{phase: phase, result: Jason.decode!(result), updated_at: updated_at}}
+
+        {:ok, []} ->
+          {:ok, nil}
+
+        {:error, _reason} = error ->
+          error
+      end
+    end)
+  end
+
   @spec save_task(map()) :: :ok | {:error, term()}
   def save_task(task), do: with_db(&save_task(&1, task))
+
+  @spec replace_task_if_unchanged(map(), map()) :: :ok | :stale | {:error, term()}
+  def replace_task_if_unchanged(previous, updated) do
+    with_db(fn conn ->
+      with :ok <- execute(conn, "BEGIN IMMEDIATE"),
+           {:ok, rows} <- query(conn, "SELECT payload FROM pipeline_tasks WHERE issue_id = ?", [previous["issue_id"]]),
+           result when result in [:ok, :stale] <- replace_matching_task(conn, rows, previous, updated),
+           :ok <- execute(conn, "COMMIT") do
+        result
+      else
+        {:error, _reason} = error ->
+          execute(conn, "ROLLBACK")
+          error
+      end
+    end)
+  end
+
+  defp replace_matching_task(conn, [[payload]], previous, updated) do
+    stored = Jason.decode!(payload)
+    comparable = if Map.has_key?(previous, "execution_identity"), do: Map.put_new(stored, "execution_identity", previous["execution_identity"]), else: stored
+    if comparable == previous, do: save_task(conn, updated), else: :stale
+  end
+
+  defp replace_matching_task(_conn, _rows, _previous, _updated), do: :stale
+
+  @spec begin_direct_qa_claim(String.t(), pos_integer(), pos_integer()) ::
+          {:ok, :none | :new | :pending} | {:error, term()}
+  def begin_direct_qa_claim(issue_id, generation, attempt) do
+    with_db(fn conn ->
+      with :ok <- execute(conn, "BEGIN IMMEDIATE"),
+           {:ok, rows} <-
+             query(
+               conn,
+               "SELECT t.payload, r.status FROM pipeline_tasks t JOIN pipeline_runs r ON r.issue_id = t.issue_id WHERE t.issue_id = ? AND r.generation = ? AND r.phase = 'qa' AND r.attempt = ?",
+               [issue_id, generation, attempt]
+             ),
+           {:ok, result} <- mark_direct_qa_claim(conn, rows, generation, attempt),
+           :ok <- execute(conn, "COMMIT") do
+        {:ok, result}
+      else
+        {:error, _reason} = error ->
+          execute(conn, "ROLLBACK")
+          error
+      end
+    end)
+  end
+
+  defp mark_direct_qa_claim(conn, [[payload, "running"]], generation, attempt) do
+    task = Jason.decode!(payload)
+
+    cond do
+      task["generation"] != generation or task["phase"] != "qa" or task["status"] not in ["qa", "building"] or get_in(task, ["attempts", "qa"]) != attempt ->
+        {:error, :stale_agent_lease}
+
+      task["direct_qa"] != true ->
+        {:ok, :none}
+
+      task["status"] != "qa" ->
+        {:error, :stale_agent_lease}
+
+      task["qa_claim_pending"] == true ->
+        {:ok, :pending}
+
+      true ->
+        with :ok <- save_task(conn, Map.put(task, "qa_claim_pending", true)), do: {:ok, :new}
+    end
+  end
+
+  defp mark_direct_qa_claim(_conn, _rows, _generation, _attempt), do: {:error, :stale_agent_lease}
+
+  @spec confirm_direct_qa_claim(String.t(), pos_integer(), pos_integer()) :: :ok | {:error, term()}
+  def confirm_direct_qa_claim(issue_id, generation, attempt) do
+    with_db(fn conn ->
+      with :ok <-
+             execute(
+               conn,
+               """
+               UPDATE pipeline_tasks SET payload = json_remove(payload, '$.direct_qa', '$.qa_claim_pending'), updated_at = ?
+               WHERE issue_id = ? AND json_extract(payload, '$.generation') = ?
+                 AND json_extract(payload, '$.phase') = 'qa'
+                 AND json_extract(payload, '$.status') = 'qa'
+                 AND json_extract(payload, '$.direct_qa') = 1
+                 AND json_extract(payload, '$.qa_claim_pending') = 1
+                 AND json_extract(payload, '$.attempts.qa') = ?
+                 AND EXISTS (SELECT 1 FROM pipeline_runs WHERE issue_id = ? AND generation = ? AND phase = 'qa' AND attempt = ? AND status = 'running')
+               """,
+               [timestamp(), issue_id, generation, attempt, issue_id, generation, attempt]
+             ),
+           {:ok, [[1]]} <- query(conn, "SELECT changes()") do
+        :ok
+      else
+        {:ok, _} -> {:error, :stale_agent_lease}
+        {:error, _reason} = error -> error
+      end
+    end)
+  end
 
   @spec begin_agent_lease(String.t(), String.t()) :: :ok | {:error, term()}
   def begin_agent_lease(issue_id, token) do
@@ -147,20 +264,25 @@ defmodule SymphonyElixir.Pipeline.Store do
 
   @spec agent_lease_active?(String.t(), pos_integer(), String.t(), pos_integer()) :: boolean()
   def agent_lease_active?(issue_id, generation, phase, attempt) do
+    case pipeline_lease_active(issue_id, generation, phase, attempt) do
+      {:ok, active} -> active
+      _ -> false
+    end
+  end
+
+  @spec pipeline_lease_active(String.t(), pos_integer(), String.t(), pos_integer()) ::
+          {:ok, boolean()} | {:error, term()}
+  def pipeline_lease_active(issue_id, generation, phase, attempt) do
     with_db(fn conn ->
       case query(
              conn,
              "SELECT t.payload, r.status FROM pipeline_tasks t JOIN pipeline_runs r ON r.issue_id = t.issue_id WHERE t.issue_id = ? AND r.generation = ? AND r.phase = ? AND r.attempt = ?",
              [issue_id, generation, phase, attempt]
            ) do
-        {:ok, rows} -> Enum.any?(rows, &active_pipeline_lease_row?(&1, generation, phase, attempt))
-        _ -> false
+        {:ok, rows} -> {:ok, Enum.any?(rows, &active_pipeline_lease_row?(&1, generation, phase, attempt))}
+        {:error, _reason} = error -> error
       end
     end)
-    |> case do
-      true -> true
-      _ -> false
-    end
   end
 
   defp active_pipeline_lease_row?([payload, status], generation, phase, attempt) do

@@ -166,6 +166,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_message: nil,
       last_codex_timestamp: nil,
       last_codex_event: nil,
+      pipeline_phase: "qa",
       started_at: started_at
     }
 
@@ -205,6 +206,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.session_id == "thread-live-turn-live"
     assert snapshot_entry.turn_count == 1
     assert snapshot_entry.last_codex_timestamp == now
+    assert snapshot_entry.pipeline_phase == "qa"
 
     assert snapshot_entry.last_codex_message == %{
              event: :notification,
@@ -300,6 +302,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.codex_output_tokens == 4
     assert snapshot_entry.codex_total_tokens == 16
     assert snapshot_entry.turn_count == 1
+    refute Map.has_key?(snapshot_entry, :pipeline_phase)
     assert is_integer(snapshot_entry.runtime_seconds)
 
     send(pid, {:DOWN, process_ref, :process, self(), :normal})
@@ -841,6 +844,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       due_at_ms: System.monotonic_time(:millisecond) + 5_000,
       identifier: "MT-500",
       issue_url: "https://example.org/issues/MT-500",
+      execution_identity: "PVT_project/PVTI_item/octo/app#500",
       error: "agent exited: :boom"
     }
 
@@ -858,11 +862,50 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
                due_in_ms: due_in_ms,
                identifier: "MT-500",
                issue_url: "https://example.org/issues/MT-500",
+               execution_identity: "PVT_project/PVTI_item/octo/app#500",
                error: "agent exited: :boom"
              }
            ] = snapshot.retrying
 
     assert due_in_ms > 0
+  end
+
+  test "retry snapshot retains the Projects execution identity" do
+    issue = %Issue{
+      id: "project-item-500",
+      identifier: "octo/app#500",
+      native_ref: %{
+        project_id: "PVT_project",
+        project_item_id: "PVTI_item",
+        repository: "octo/app",
+        issue_number: 500
+      },
+      url: "https://github.com/octo/app/issues/500"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :ProjectsRetryIdentityOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    ref = make_ref()
+    running_entry = lifecycle_running_entry(issue, ref, nil, self())
+
+    :sys.replace_state(pid, fn state ->
+      %{state | running: %{issue.id => running_entry}, claimed: MapSet.new([issue.id])}
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :worker_failed})
+
+    snapshot =
+      wait_for_snapshot(pid, fn
+        %{retrying: [%{execution_identity: "PVT_project/PVTI_item/octo/app#500"}]} -> true
+        _ -> false
+      end)
+
+    assert [%{execution_identity: "PVT_project/PVTI_item/octo/app#500"}] = snapshot.retrying
   end
 
   test "orchestrator snapshot includes poll countdown and checking status" do
@@ -960,6 +1003,39 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert is_integer(next_poll_in_ms)
     assert next_poll_in_ms >= 0
+  end
+
+  test "Project readiness errors prevent dispatching an agent" do
+    previous_client = Application.get_env(:symphony_elixir, :github_projects_client_module)
+    previous_owner = Application.get_env(:symphony_elixir, :projects_readiness_test_owner)
+
+    Application.put_env(
+      :symphony_elixir,
+      :github_projects_client_module,
+      SymphonyElixir.OrchestratorStatusTest.ReadinessClient
+    )
+
+    Application.put_env(:symphony_elixir, :projects_readiness_test_owner, self())
+    write_projects_workflow!()
+
+    orchestrator_name = Module.concat(__MODULE__, :ProjectReadinessOrchestrator)
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        agent_runner: SymphonyElixir.OrchestratorStatusTest.ReadinessAgentRunner
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      restore_application_env(:github_projects_client_module, previous_client)
+      restore_application_env(:projects_readiness_test_owner, previous_owner)
+    end)
+
+    assert_receive {:projects_readiness_fetch, states}, 1_000
+    assert "Ready" in states
+    refute_receive :projects_readiness_agent_started, 100
+    assert %{running: []} = GenServer.call(pid, :snapshot)
   end
 
   test "orchestrator poll cycle resets next refresh countdown after a check" do
@@ -1967,6 +2043,30 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
   defp restore_application_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
   defp restore_application_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
+end
+
+defmodule SymphonyElixir.OrchestratorStatusTest.ReadinessClient do
+  def fetch_issues_by_states(states) do
+    if "Ready" in states do
+      send(
+        Application.fetch_env!(:symphony_elixir, :projects_readiness_test_owner),
+        {:projects_readiness_fetch, states}
+      )
+
+      {:error, {:github_projects_configuration_error, "Project status field is incomplete."}}
+    else
+      {:ok, []}
+    end
+  end
+
+  def fetch_issues_by_ids(_ids), do: {:ok, []}
+end
+
+defmodule SymphonyElixir.OrchestratorStatusTest.ReadinessAgentRunner do
+  def run(_issue, _recipient, _opts) do
+    send(Application.fetch_env!(:symphony_elixir, :projects_readiness_test_owner), :projects_readiness_agent_started)
+    :ok
+  end
 end
 
 defmodule SymphonyElixir.OrchestratorStatusTest.ProjectsLifecycleClient do

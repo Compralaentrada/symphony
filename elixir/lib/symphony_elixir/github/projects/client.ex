@@ -4,8 +4,10 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   """
 
   alias SymphonyElixir.Config
+  alias SymphonyElixir.GitHub.AgentReport
   alias SymphonyElixir.Pipeline.Findings
   alias SymphonyElixir.Pipeline.Store
+  alias SymphonyElixir.PRBody
   alias SymphonyElixir.Tracker.Issue
 
   @default_graphql_url "https://api.github.com/graphql"
@@ -404,7 +406,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp dispatch_agent_operation(issue, context, operation, arguments, tracker_settings, settings, request_fun, opts) do
     case operation do
-      "claim" -> agent_claim(issue, tracker_settings, settings, request_fun)
+      "claim" -> agent_claim(issue, context, tracker_settings, settings, request_fun)
       "read_workpad" -> agent_read_workpad(issue, context, settings, request_fun)
       "workpad" -> agent_workpad(issue, arguments, settings, request_fun)
       "handoff" -> agent_handoff(issue, context, arguments, tracker_settings, settings, request_fun)
@@ -685,11 +687,13 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       status_option_ids: metadata.status_option_ids,
       project_status: project_status,
       issue_node_id: content["id"],
+      issue_number: number,
       issue_state: content["state"],
       issue_state_reason: content["stateReason"],
       repository: repository,
       base_branch: profile && profile.base_branch,
       prepare_command: profile && profile.prepare_command,
+      repository_profile_error: configured_profile_error(profile),
       required_checks: profile && profile.required_checks
     }
 
@@ -956,48 +960,108 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     end
   end
 
-  defp agent_claim(issue, tracker_settings, settings, request_fun) do
-    with {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
-         :ok <- claimable_project_status(issue, current, settings),
-         :ok <- maybe_set_project_status(current, settings.statuses.building, settings, request_fun),
+  defp agent_claim(issue, context, tracker_settings, settings, request_fun) do
+    with {:ok, target_status} <- claim_status(context.lane, settings),
+         {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
+         :ok <- claimable_project_status(issue, current, target_status, settings),
+         {:ok, claim_state} <- begin_direct_qa_claim(issue, context),
+         :ok <- ensure_claim_not_uncertain(claim_state, current, target_status),
+         :ok <- prepare_direct_qa_pr(issue, context, claim_state, settings, request_fun),
+         {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
+         :ok <- claimable_project_status(issue, current, target_status, settings),
+         :ok <- maybe_set_project_status(current, target_status, settings, request_fun),
          {:ok, claimed} <- current_project_issue(issue, tracker_settings, request_fun),
-         true <- project_status(claimed) == settings.statuses.building do
-      {:ok, project_evidence(issue, claimed, settings.statuses.building)}
+         true <- project_status(claimed) == target_status,
+         :ok <- confirm_direct_qa_claim(issue, context, claim_state) do
+      {:ok, project_evidence(issue, claimed, target_status)}
     else
       false -> {:error, :github_project_claim_not_verified}
       {:error, _reason} = error -> error
     end
   end
 
+  defp begin_direct_qa_claim(issue, %{lane: lane, generation: generation, attempt: attempt}) when lane in [:qa, "qa"],
+    do: Store.begin_direct_qa_claim(issue.id, generation, attempt)
+
+  defp begin_direct_qa_claim(_issue, _context), do: {:ok, :none}
+
+  defp ensure_claim_not_uncertain(:pending, current, target) do
+    if project_status(current) == target, do: :ok, else: {:error, :github_claim_outcome_uncertain}
+  end
+
+  defp ensure_claim_not_uncertain(_state, _current, _target), do: :ok
+
+  defp prepare_direct_qa_pr(_issue, _context, :none, _settings, _request_fun), do: :ok
+
+  defp prepare_direct_qa_pr(issue, context, _claim_state, settings, request_fun) do
+    expected_sha = get_in(context, [:task, "current_sha"])
+
+    with true <- is_binary(expected_sha),
+         {:ok, %{} = pr} <- pull_request(issue, settings, request_fun),
+         true <- pr.sha == expected_sha,
+         {:ok, updated} <- update_pull_request_stage(pr, :draft, settings, request_fun),
+         true <- updated.sha == expected_sha and updated.draft do
+      :ok
+    else
+      false -> {:error, :pull_request_head_sha_mismatch}
+      {:error, _reason} = error -> error
+      _ -> {:error, :pull_request_not_found}
+    end
+  end
+
+  defp confirm_direct_qa_claim(_issue, _context, :none), do: :ok
+
+  defp confirm_direct_qa_claim(issue, %{lane: lane, generation: generation, attempt: attempt}, _state) when lane in [:qa, "qa"],
+    do: Store.confirm_direct_qa_claim(issue.id, generation, attempt)
+
+  defp confirm_direct_qa_claim(_issue, _context, _state), do: :ok
+
+  defp claim_status(lane, settings) when lane in [:build, "build", :individual, "individual"], do: {:ok, settings.statuses.building}
+  defp claim_status(lane, settings) when lane in [:qa, "qa"], do: {:ok, settings.statuses.qa}
+  defp claim_status(lane, settings) when lane in [:review, "review"], do: {:ok, settings.statuses.review}
+  defp claim_status(_lane, _settings), do: {:error, :github_claim_not_supported_for_phase}
+
   defp agent_handoff(issue, context, arguments, tracker_settings, settings, request_fun) do
     lane = to_string(context.lane)
     report = normalize_report(Map.get(arguments, "report"))
     outcome = Map.get(arguments, "outcome") || report["outcome"]
-    report = report |> Map.put("outcome", outcome) |> normalize_agent_report(lane, context)
+    submitted_report = Map.put(report, "outcome", outcome)
+    report = normalize_agent_report(submitted_report, lane, context)
 
-    with {:ok, status} <- handoff_status(lane, report, settings),
+    with {:ok, body} <- AgentReport.normalize_body(Map.get(arguments, "body"), report, submitted_report),
+         :ok <- validate_agent_pr_body(lane, report, issue),
+         :ok <- AgentReport.validate_body(body, report),
+         {:ok, status} <- handoff_status(lane, report, settings),
          {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
-         :ok <- handoff_source_status(lane, current, status, settings),
+         :ok <- handoff_source_status(lane, issue, current, status, settings),
          {:ok, pr} <- handoff_pull_request(issue, context, report, tracker_settings, settings, request_fun),
          {:ok, pr} <- maybe_set_review_stage(issue, lane, report, pr, status, settings, tracker_settings, request_fun),
          {:ok, closed_issue} <-
            maybe_finalize_merged_issue(issue, context, report, pr, tracker_settings, settings, request_fun),
          {:ok, comment} <-
-           publish_agent_report(issue, context, report, status, settings, tracker_settings, request_fun),
+           publish_agent_report(issue, context, body, status, settings, tracker_settings, request_fun),
          {:ok, status_evidence} <-
            apply_project_status(issue, current, status, lane, settings, tracker_settings, request_fun) do
       {:ok,
        %{
          "outcome" => report["outcome"],
+         "reason" => report["reason"],
+         "next_step" => report["next_step"],
          "issue" => %{"id" => issue.id, "url" => issue.url},
          "closed_issue" => closed_issue,
          "project_item" => status_evidence,
          "comment" => comment,
          "pull_request" => pr,
+         "pull_request_body" => report["pull_request_body"],
          "sha" => report["sha"]
        }}
     end
   end
+
+  defp validate_agent_pr_body(lane, %{"outcome" => "ready"} = report, issue) when lane in ["build", "individual"],
+    do: PRBody.validate_agent_body(report["pull_request_body"], issue.id)
+
+  defp validate_agent_pr_body(_lane, _report, _issue), do: :ok
 
   defp handoff_status("build", %{"outcome" => "ready"}, settings), do: {:ok, settings.statuses.qa}
   defp handoff_status("build", %{"outcome" => outcome}, settings) when outcome in ["blocked", "no_changes"], do: {:ok, settings.statuses.blocked}
@@ -1023,27 +1087,30 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     required = get_in(context, [:task, "required_checks"]) || []
     report = Map.put(report, "checks", checks)
 
-    cond do
-      not required_checks_passed?(required, checks) and Enum.any?(checks, &(&1["status"] == "unavailable")) ->
-        report
-        |> Map.put("outcome", "blocked")
-        |> Map.put("reason", qa_text(context, :checks_unavailable))
+    normalized =
+      cond do
+        not required_checks_passed?(required, checks) and Enum.any?(checks, &(&1["status"] == "unavailable")) ->
+          report
+          |> Map.put("outcome", "blocked")
+          |> Map.put("reason", qa_text(context, :checks_unavailable))
 
-      not required_checks_passed?(required, checks) ->
-        report
-        |> Map.put("outcome", "changes_requested")
-        |> Map.put("summary", qa_text(context, :checks_failed))
+        not required_checks_passed?(required, checks) ->
+          report
+          |> Map.put("outcome", "changes_requested")
+          |> Map.put("summary", qa_text(context, :checks_failed))
 
-      report["outcome"] == "passed" and report["findings"] not in [nil, []] ->
-        Map.merge(report, %{
-          "outcome" => "changes_requested",
-          "summary" => qa_text(context, :findings),
-          "next_step" => qa_text(context, :next_step)
-        })
+        report["outcome"] == "passed" and report["findings"] not in [nil, []] ->
+          Map.merge(report, %{
+            "outcome" => "changes_requested",
+            "summary" => qa_text(context, :findings),
+            "next_step" => qa_text(context, :next_step)
+          })
 
-      true ->
-        report
-    end
+        true ->
+          report
+      end
+
+    block_qa_task_rework(normalized, context)
   end
 
   defp normalize_agent_report(report, "review", context) do
@@ -1060,12 +1127,29 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
     report = report |> Map.put("findings", findings) |> Map.merge(metadata)
 
-    if report["outcome"] == "passed" and findings != [],
-      do: Map.put(report, "outcome", "changes_requested"),
-      else: report
+    normalized =
+      if report["outcome"] == "passed" and findings != [],
+        do: Map.put(report, "outcome", "changes_requested"),
+        else: report
+
+    block_qa_task_rework(normalized, context)
   end
 
   defp normalize_agent_report(report, _lane, _context), do: report
+
+  defp block_qa_task_rework(%{"outcome" => outcome} = report, %{issue: %Issue{} = issue})
+       when outcome in ["changes_requested", "failed", "defects_found"] do
+    if Issue.routable?(issue, ["qa"]) do
+      report
+      |> Map.put("outcome", "blocked")
+      |> Map.put("reason", "QA found work requiring an external correction.")
+      |> Map.put("next_step", "Correct the existing delivery, then move the issue to Ready to rerun QA.")
+    else
+      report
+    end
+  end
+
+  defp block_qa_task_rework(report, _context), do: report
 
   defp qa_text(%{report_locale: :es}, :checks_unavailable), do: "Symphony no pudo ejecutar todas las comprobaciones requeridas."
   defp qa_text(%{report_locale: :es}, :checks_failed), do: "Falló alguna comprobación requerida o falta evidencia para confirmarla."
@@ -1081,19 +1165,33 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   def normalize_agent_report_for_test(report, lane, context),
     do: normalize_agent_report(report, lane, context)
 
-  defp handoff_source_status(lane, current, target, settings) do
+  defp handoff_source_status("review", _issue, current, target, %{statuses: %{human_review: target, review: review}} = settings) do
+    allowed = if settings.merge_policy == "auto", do: [review], else: [target, review]
+
+    with :ok <- validate_merge_issue_open(current, %{"state" => "OPEN"}) do
+      expected_project_status(current, allowed)
+    end
+  end
+
+  defp handoff_source_status(lane, issue, current, target, settings) do
     sources =
       case lane do
         "build" -> [settings.statuses.building]
         "qa" -> [settings.statuses.qa]
         "review" -> if(target == settings.statuses.done, do: [settings.statuses.review, settings.statuses.human_review], else: [settings.statuses.review])
-        "diagnostic" -> Enum.map([:ready, :building, :qa, :review, :human_review], &Map.fetch!(settings.statuses, &1))
+        "diagnostic" -> diagnostic_source_statuses(issue, settings)
         "finalize" -> [settings.statuses.human_review, settings.statuses.ready]
         "individual" -> [project_status(current)]
         _ -> []
       end
 
     expected_project_status(current, [target | sources])
+  end
+
+  defp diagnostic_source_statuses(issue, settings) do
+    if project_status(issue) == settings.statuses.ready,
+      do: [settings.statuses.ready],
+      else: Enum.map([:building, :qa, :review], &Map.fetch!(settings.statuses, &1))
   end
 
   defp handoff_pull_request(issue, context, _report, _tracker_settings, settings, request_fun)
@@ -1109,7 +1207,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     profile = profile_for_issue(issue, settings)
     branch = task["branch"] || issue.branch_name
     base = task["base_branch"] || profile.base_branch
-    body = delivery_body(issue, report)
+    body = delivery_body(report)
 
     with :ok <- validate_handoff_source_for_lane(lane, issue, tracker_settings, settings, request_fun),
          :ok <- validate_pipeline_delivery(issue, branch, sha, settings, request_fun),
@@ -1140,7 +1238,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp validate_build_handoff_source(issue, tracker_settings, settings, request_fun) do
     with {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun) do
-      handoff_source_status("build", current, settings.statuses.qa, settings)
+      handoff_source_status("build", issue, current, settings.statuses.qa, settings)
     end
   end
 
@@ -1163,14 +1261,35 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     stage = if outcome == "passed", do: :ready, else: :draft
 
     with {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
-         :ok <- handoff_source_status("review", current, target, settings),
+         :ok <- handoff_source_status("review", issue, current, target, settings),
          {:ok, %{} = pr} <- pull_request(issue, settings, request_fun),
          {:ok, updated} <- update_pull_request_stage(pr, stage, settings, request_fun) do
       {:ok, pr_evidence(updated)}
     end
   end
 
+  defp maybe_set_review_stage(issue, lane, %{"outcome" => "blocked"}, pr, target, settings, tracker_settings, request_fun)
+       when lane in ["qa", "review"] do
+    if Issue.routable?(issue, ["qa"]),
+      do: draft_blocked_qa_pr(issue, lane, pr, target, settings, tracker_settings, request_fun),
+      else: {:ok, pr}
+  end
+
   defp maybe_set_review_stage(_issue, _lane, _report, pr, _target, _settings, _tracker_settings, _request_fun), do: {:ok, pr}
+
+  defp draft_blocked_qa_pr(issue, lane, pr, target, settings, tracker_settings, request_fun) do
+    with {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
+         :ok <- handoff_source_status(lane, issue, current, target, settings),
+         {:ok, %{} = current_pr} <- pull_request(issue, settings, request_fun),
+         true <- current_pr.sha == pr["head_sha"],
+         {:ok, updated} <- update_pull_request_stage(current_pr, :draft, settings, request_fun) do
+      {:ok, pr_evidence(updated)}
+    else
+      false -> {:error, :pull_request_head_sha_mismatch}
+      {:error, _reason} = error -> error
+      _ -> {:error, :pull_request_not_found}
+    end
+  end
 
   defp maybe_finalize_merged_issue(_issue, _context, %{"outcome" => outcome}, _pr, _tracker_settings, _settings, _request_fun)
        when outcome != "merged",
@@ -1196,17 +1315,17 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp maybe_finalize_merged_issue(_issue, _context, _report, _pr, _tracker_settings, _settings, _request_fun),
     do: {:error, :invalid_merged_handoff}
 
-  defp publish_agent_report(issue, context, report, target, settings, tracker_settings, request_fun) do
+  defp publish_agent_report(issue, context, body, target, settings, tracker_settings, request_fun) do
     phase = to_string(context.lane)
     marker = agent_report_marker(issue, context, phase)
 
     with {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
-         :ok <- handoff_source_status(phase, current, target, settings),
+         :ok <- handoff_source_status(phase, issue, current, target, settings),
          {:ok, issue_ref} <- issue_repository_and_number(issue),
          {:ok, existing} <- find_issue_comment(marker, issue_ref, settings, request_fun, nil) do
       case existing do
-        %{} = comment -> update_owned_agent_report(comment, marker, phase, report, settings, request_fun)
-        nil -> create_agent_report(issue, marker, phase, report, settings, request_fun)
+        %{} = comment -> update_owned_agent_report(comment, marker, body, settings, request_fun)
+        nil -> create_agent_report(issue, marker, body, settings, request_fun)
       end
     end
   end
@@ -1240,7 +1359,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
        %{
          "issue" => %{"id" => issue.id, "url" => issue.url},
          "workpad" => if(workpad, do: task_comment(workpad)),
-         "phase_reports" => phase_reports
+         "phase_reports" => phase_reports,
+         "report_context" => agent_report_context(context)
        }}
     else
       nil -> {:error, :github_agent_identity_missing}
@@ -1252,15 +1372,25 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp current_generation_phase_reports(issue, generation, comments) do
     Enum.reduce(~w(build qa review finalize), %{}, fn phase, reports ->
       marker = phase_report_marker(issue, generation, phase)
+      legacy_marker = "<!-- symphony:report:start:#{issue.id}:#{generation}:#{phase}"
 
       phase_reports =
         comments
-        |> Enum.filter(&phase_report_comment?(&1["body"] || "", marker))
-        |> Enum.map(&Map.put(task_comment(&1), "attempt", phase_report_attempt(&1["body"] || "", marker)))
+        |> Enum.map(&phase_report_entry(&1, [marker, legacy_marker]))
+        |> Enum.reject(&is_nil/1)
         |> Enum.sort_by(& &1["attempt"])
 
       if phase_reports == [], do: reports, else: Map.put(reports, phase, phase_reports)
     end)
+  end
+
+  defp phase_report_entry(comment, markers) do
+    body = comment["body"] || ""
+
+    case Enum.find(markers, &phase_report_comment?(body, &1)) do
+      nil -> nil
+      matched_marker -> Map.put(task_comment(comment), "attempt", phase_report_attempt(body, matched_marker))
+    end
   end
 
   defp validate_review_qa_report(%{lane: lane, task: task}, phase_reports)
@@ -1284,7 +1414,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp latest_phase_report(phase_reports, phase), do: phase_reports |> Map.get(phase, []) |> List.last()
 
   defp phase_report_marker(issue, generation, phase),
-    do: "<!-- symphony:report:start:#{issue.id}:#{generation}:#{phase}"
+    do: "<!-- symphony:report:start:#{Issue.execution_identity(issue)}:#{generation}:#{phase}"
 
   defp phase_report_comment?(body, marker),
     do: String.contains?(body, marker <> " -->") or String.contains?(body, marker <> ":")
@@ -1297,15 +1427,41 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp decode_phase_report_comment(body) do
-    json =
-      body
-      |> String.split("\n")
-      |> Enum.drop_while(&(String.trim(&1) != "{"))
-      |> Enum.take_while(&(String.trim(&1) != "<!-- symphony:report:end -->"))
-      |> Enum.join("\n")
-      |> String.trim()
+    AgentReport.decode_comment(body)
+  end
 
-    if json == "", do: {:error, :invalid_phase_report}, else: Jason.decode(json)
+  defp agent_report_context(context) do
+    lane = to_string(context.lane)
+    task = context[:task]
+    task = if is_map(task), do: task, else: %{}
+
+    fields =
+      case lane do
+        "build" -> ["branch", "base_branch", "required_checks"]
+        "qa" -> ["current_sha", "required_checks"]
+        "review" -> ["branch", "base_branch", "pr_number", "current_sha", "prior_findings"]
+        "finalize" -> ["branch", "base_branch", "pr_number", "current_sha"]
+        _ -> []
+      end
+
+    report_context = %{"lane" => lane, "task" => Map.take(task, fields)}
+
+    if lane == "qa" do
+      locale = context[:report_locale] || :en
+
+      Map.merge(report_context, %{
+        "host_checks" => normalize_report_list(context[:host_checks]),
+        "report_locale" => to_string(locale),
+        "qa_text" => %{
+          "checks_unavailable" => qa_text(%{report_locale: locale}, :checks_unavailable),
+          "checks_failed" => qa_text(%{report_locale: locale}, :checks_failed),
+          "findings" => qa_text(%{report_locale: locale}, :findings),
+          "next_step" => qa_text(%{report_locale: locale}, :next_step)
+        }
+      })
+    else
+      report_context
+    end
   end
 
   defp list_issue_comments(issue_ref, settings, request_fun, cursor, comments) do
@@ -1384,8 +1540,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     marker <> "\n" <> content <> "\n" <> end_marker
   end
 
-  defp create_agent_report(issue, marker, phase, report, settings, request_fun) do
-    body = agent_report_body(marker, phase, report)
+  defp create_agent_report(issue, marker, agent_body, settings, request_fun) do
+    body = AgentReport.comment_body(marker, agent_body)
     subject_id = ref_value(issue.native_ref, :issue_node_id)
 
     with subject_id when is_binary(subject_id) <- subject_id,
@@ -1398,7 +1554,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     end
   end
 
-  defp update_owned_agent_report(comment, marker, phase, report, settings, request_fun) do
+  defp update_owned_agent_report(comment, marker, agent_body, settings, request_fun) do
     with {:ok, viewer_data} <- graphql(request_fun, @viewer_query, %{}, settings),
          viewer when is_binary(viewer) <- get_in(viewer_data, ["viewer", "login"]),
          true <- get_in(comment, ["author", "login"]) == viewer,
@@ -1407,7 +1563,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
              comment["body"] || "",
              marker,
              "<!-- symphony:report:end -->",
-             agent_report_body(marker, phase, report)
+             AgentReport.comment_body(marker, agent_body)
            ),
          {:ok, data} <- graphql(request_fun, @update_comment_mutation, %{"id" => comment["id"], "body" => body}, settings),
          %{} = updated <- get_in(data, ["updateIssueComment", "issueComment"]) do
@@ -1419,9 +1575,6 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       _ -> {:error, :github_agent_report_update_failed}
     end
   end
-
-  defp agent_report_body(marker, phase, report),
-    do: marker <> "\n## Symphony " <> String.capitalize(phase) <> " report\n\n" <> Jason.encode!(report, pretty: true) <> "\n<!-- symphony:report:end -->"
 
   defp replace_owned_comment_block(current, marker, end_marker, replacement) do
     with {start, _} <- :binary.match(current, marker),
@@ -1441,7 +1594,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp apply_project_status(issue, _current, target, lane, settings, tracker_settings, request_fun)
        when is_binary(target) do
     with {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
-         :ok <- handoff_source_status(lane, current, target, settings),
+         :ok <- handoff_source_status(lane, issue, current, target, settings),
          current_status = project_status(current),
          :ok <- ensure_project_status(current, current_status, target, settings, request_fun),
          {:ok, verified} <- current_project_issue(issue, tracker_settings, request_fun),
@@ -1466,13 +1619,17 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     end
   end
 
-  defp claimable_project_status(dispatched, current, settings) do
+  defp claimable_project_status(dispatched, current, target, settings) do
     ready = normalize_state(settings.statuses.ready)
-    building = normalize_state(settings.statuses.building)
+    target = normalize_state(target)
     dispatched_status = normalize_state(ref_value(dispatched.native_ref || %{}, :project_status))
     current_status = normalize_state(project_status(current))
+    building = normalize_state(settings.statuses.building)
+    qa = normalize_state(settings.statuses.qa)
+    allowed = [{ready, ready}, {ready, target}, {target, target}]
+    allowed = if target == qa, do: [{building, building}, {building, qa} | allowed], else: allowed
 
-    if {dispatched_status, current_status} in [{ready, ready}, {ready, building}, {building, building}],
+    if {dispatched_status, current_status} in allowed,
       do: :ok,
       else: {:error, :github_human_decision_changed}
   end
@@ -1526,40 +1683,13 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp required_checks_passed?(_required, _checks), do: false
 
-  defp delivery_body(issue, report) do
-    """
-    <!-- symphony:delivery:start -->
-    Issue: #{issue.url}
-
-    ## Summary
-    #{report["summary"] || "Build completed."}
-
-    ## Acceptance criteria
-    #{markdown_items(report["criteria"])}
-
-    ## Changes
-    #{markdown_items(report["changes"])}
-
-    ## Checks
-    #{markdown_items(report["checks"])}
-
-    ## Build SHA
-    `#{report["sha"]}`
-    <!-- symphony:delivery:end -->
-    """
-    |> String.trim()
-  end
-
-  defp markdown_items(items) when is_list(items) and items != [],
-    do: Enum.map_join(items, "\n", &("- " <> if(is_binary(&1), do: &1, else: Jason.encode!(&1))))
-
-  defp markdown_items(_items), do: "- None reported."
+  defp delivery_body(report), do: PRBody.delivery_block(report["pull_request_body"])
 
   defp validate_merge_policy(nil), do: :ok
   defp validate_merge_policy(value) when value in ["human", "auto"], do: :ok
   defp validate_merge_policy(_value), do: invalid_settings(:invalid_merge_policy)
 
-  defp request_merge(issue, context, tracker_settings, settings, request_fun, _opts) do
+  defp request_merge(issue, context, tracker_settings, settings, request_fun, opts) do
     task = Map.get(context, :task) || %{}
     branch = task["branch"] || issue.branch_name
     base = task["base_branch"] || Map.get(profile_for_issue(issue, settings), :base_branch)
@@ -1570,12 +1700,21 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          true <- to_string(context.lane) == "review",
          :ok <- validate_agent_lease(context),
          {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
-         :ok <- expected_project_status(current, [settings.statuses.review, settings.statuses.human_review]),
+         :ok <- expected_project_status(current, [settings.statuses.human_review]),
          :ok <- ensure_merge_checks(task),
          {:ok, data} <- graphql(request_fun, @merge_query, variables, settings),
          %{} = pr <- find_pull_request(data, branch, base),
          :ok <- merge_gate(pr, task, get_in(data, ["repository", "ref", "target", "oid"])),
-         :ok <- merge_if_open(pr, task, settings, request_fun),
+         :ok <- validate_merge_review(issue, context, task, pr, settings, request_fun),
+         :ok <- validate_merge_base(pr, owner, name, get_in(data, ["repository", "ref", "target", "oid"]), task["current_sha"], settings, opts),
+         {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
+         :ok <- expected_project_status(current, [settings.statuses.human_review]),
+         :ok <- validate_merge_issue_open(current, pr),
+         {:ok, latest} <- graphql(request_fun, @merge_query, variables, settings),
+         %{} = latest_pr <- find_pull_request(latest, branch, base),
+         :ok <- merge_gate(latest_pr, task, get_in(latest, ["repository", "ref", "target", "oid"])),
+         :ok <- validate_unchanged_base(get_in(data, ["repository", "ref", "target", "oid"]), get_in(latest, ["repository", "ref", "target", "oid"])),
+         :ok <- merge_if_open(latest_pr, task, settings, request_fun),
          {:ok, merged_pr} <- confirmed_merged_pull_request(issue, branch, base, settings, request_fun) do
       {:ok,
        %{
@@ -1588,6 +1727,51 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       nil -> {:error, :pull_request_not_found}
       {:error, _reason} = error -> error
       _ -> {:error, :merge_gate_failed}
+    end
+  end
+
+  defp validate_unchanged_base(base, base), do: :ok
+  defp validate_unchanged_base(_base, _current), do: {:error, :pull_request_base_sha_mismatch}
+
+  defp validate_merge_issue_open(_issue, %{"state" => "MERGED"}), do: :ok
+
+  defp validate_merge_issue_open(issue, _pr) do
+    if normalize_state(ref_value(issue.native_ref, :issue_state)) == "open",
+      do: :ok,
+      else: {:error, :github_issue_closed}
+  end
+
+  defp validate_merge_base(%{"state" => "MERGED"}, _owner, _name, _base, _sha, _settings, _opts), do: :ok
+
+  defp validate_merge_base(_pr, owner, name, base, sha, settings, opts) do
+    path =
+      "/repos/#{URI.encode(owner, &URI.char_unreserved?/1)}/#{URI.encode(name, &URI.char_unreserved?/1)}/compare/#{URI.encode(base, &URI.char_unreserved?/1)}...#{URI.encode(sha, &URI.char_unreserved?/1)}"
+
+    rest_fun = Keyword.fetch!(opts, :github_rest)
+
+    case rest_fun.("GET", path, %{"per_page" => 1}, nil, settings) do
+      {:ok, %{status: status, body: %{"merge_base_commit" => %{"sha" => ^base}}}} when status in 200..299 -> :ok
+      {:ok, %{status: status}} when status in 200..299 -> {:error, :pull_request_base_not_in_head}
+      _ -> {:error, :pull_request_base_comparison_failed}
+    end
+  end
+
+  defp validate_merge_review(issue, context, task, pr, settings, request_fun) do
+    marker = agent_report_marker(issue, context, "review")
+
+    with {:ok, issue_ref} <- issue_repository_and_number(issue),
+         {:ok, comments} <- list_issue_comments(issue_ref, settings, request_fun, nil, []),
+         {:ok, viewer_data} <- graphql(request_fun, @viewer_query, %{}, settings),
+         viewer when is_binary(viewer) <- get_in(viewer_data, ["viewer", "login"]),
+         %{"body" => body} <- Enum.find(comments, &(get_in(&1, ["author", "login"]) == viewer and String.starts_with?(&1["body"] || "", marker <> "\n"))),
+         {:ok, report} <- decode_phase_report_comment(body),
+         true <- report["outcome"] == "passed" or (report["outcome"] == "merged" and pr["state"] == "MERGED"),
+         true <- report["sha"] == task["current_sha"],
+         %{"findings" => []} <- normalize_agent_report(report, "review", context) do
+      :ok
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :review_evidence_unavailable}
     end
   end
 
@@ -1606,10 +1790,41 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp merge_gate(pr, task, current_base_sha) do
+    head_sha = task["current_sha"]
+
+    with :ok <- validate_merge_shas(head_sha, current_base_sha),
+         :ok <- validate_merge_identity(pr, head_sha, current_base_sha),
+         :ok <- validate_github_checks(pr) do
+      validate_merge_state(pr)
+    end
+  end
+
+  defp validate_merge_shas(head_sha, base_sha) do
     cond do
-      pr["headRefOid"] != task["current_sha"] -> {:error, :pull_request_head_sha_mismatch}
-      pr["baseRefOid"] != current_base_sha -> {:error, :pull_request_base_sha_mismatch}
-      get_in(pr, ["statusCheckRollup", "state"]) != "SUCCESS" -> {:error, :required_github_checks_not_passed}
+      not sha_available?(head_sha) -> {:error, :pull_request_head_sha_unavailable}
+      not sha_available?(base_sha) -> {:error, :pull_request_base_sha_unavailable}
+      true -> :ok
+    end
+  end
+
+  defp validate_merge_identity(pr, head_sha, base_sha) do
+    cond do
+      pr["headRefOid"] != head_sha -> {:error, :pull_request_head_sha_mismatch}
+      pr["baseRefOid"] != base_sha -> {:error, :pull_request_base_sha_mismatch}
+      true -> :ok
+    end
+  end
+
+  defp validate_github_checks(%{"statusCheckRollup" => nil}), do: :ok
+
+  defp validate_github_checks(pr) do
+    if get_in(pr, ["statusCheckRollup", "state"]) == "SUCCESS",
+      do: :ok,
+      else: {:error, :required_github_checks_not_passed}
+  end
+
+  defp validate_merge_state(pr) do
+    cond do
       pr["state"] == "MERGED" and is_binary(pr["mergedAt"]) -> :ok
       pr["state"] == "OPEN" and pr["isDraft"] == false -> :ok
       true -> {:error, :pull_request_not_mergeable}
@@ -1641,6 +1856,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       {:error, _reason} = error -> error
     end
   end
+
+  defp sha_available?(sha), do: is_binary(sha) and sha != ""
 
   defp close_merged_issue(issue, settings, request_fun) do
     if issue.state == "closed" do
@@ -1983,15 +2200,15 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp create_pull_request(issue, repository, attrs, settings, request_fun) do
     variables = %{"owner" => repository.owner, "name" => repository.name}
 
-    with {:ok, data} <- graphql(request_fun, @repository_query, variables, settings),
+    with body when is_binary(body) and byte_size(body) in 1..60_000 <- attrs[:body],
+         {:ok, data} <- graphql(request_fun, @repository_query, variables, settings),
          repository_id when is_binary(repository_id) <- get_in(data, ["repository", "id"]),
-         {:ok, issue_ref} <- issue_repository_and_number(issue),
          input = %{
            "repositoryId" => repository_id,
            "baseRefName" => attrs.base,
            "headRefName" => attrs.branch,
            "title" => issue.title,
-           "body" => attrs[:body] || "Fixes ##{issue_ref["number"]}\n\nCreated by Symphony after the Build phase.",
+           "body" => body,
            "draft" => true
          },
          {:ok, created} <- graphql(request_fun, @create_pull_request_mutation, %{"input" => input}, settings),
@@ -1999,6 +2216,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       {:ok, normalize_pull_request(pr)}
     else
       {:error, _reason} = error -> error
+      body when not is_binary(body) -> {:error, :github_pull_request_body_required}
+      body when is_binary(body) and byte_size(body) not in 1..60_000 -> {:error, :github_pull_request_body_required}
       _ -> {:error, {:github_projects_api_error, "GitHub did not create the pipeline pull request."}}
     end
   end
@@ -2185,7 +2404,6 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          {:ok, graphql_url} <- graphql_url_setting(provider),
          {:ok, token} <- token_setting(provider),
          :ok <- validate_merge_policy(provider["merge_policy"]),
-         :ok <- validate_pipeline_profiles(profiles),
          :ok <- validate_routing_settings(tracker_settings) do
       {:ok,
        Map.merge(project, %{
@@ -2213,8 +2431,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp repository_settings(provider) do
     case repository_profiles(provider["repositories"]) do
-      nil -> invalid_settings(:invalid_repository_profiles)
-      profiles -> {:ok, profiles}
+      profiles when is_map(profiles) and map_size(profiles) > 0 -> {:ok, profiles}
+      _ -> invalid_settings(:invalid_repository_profiles)
     end
   end
 
@@ -2251,26 +2469,13 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp repository_profiles(profiles) when is_list(profiles) and profiles != [] do
-    Enum.reduce_while(profiles, %{}, fn profile, acc ->
+    Enum.reduce(profiles, %{}, fn profile, acc ->
       repository = normalize_string(profile_value(profile, "repository"))
       base_branch = normalize_string(profile_value(profile, "base_branch"))
       prepare_command = normalize_string(profile_value(profile, "prepare_command"))
       required_checks = normalize_required_checks(profile_value(profile, "required_checks"))
-      key = normalize_repository(repository)
 
-      if valid_repository?(repository) and present_string?(base_branch) and
-           present_string?(prepare_command) and not is_nil(required_checks) and not Map.has_key?(acc, key) do
-        normalized = %{
-          repository: repository,
-          base_branch: base_branch,
-          prepare_command: prepare_command,
-          required_checks: required_checks
-        }
-
-        {:cont, Map.put(acc, key, normalized)}
-      else
-        {:halt, nil}
-      end
+      put_repository_profile(acc, repository, base_branch, prepare_command, required_checks)
     end)
   end
 
@@ -2285,13 +2490,39 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp normalize_required_checks(_checks), do: nil
 
-  defp validate_pipeline_profiles(profiles) do
-    if Enum.any?(profiles, fn {_repo, profile} -> profile.required_checks == [] end) do
-      invalid_settings(:pipeline_requires_repository_required_checks)
-    else
-      :ok
+  defp repository_profile_error(base_branch, prepare_command, required_checks) do
+    cond do
+      is_nil(base_branch) -> :missing_base_branch
+      is_nil(prepare_command) -> :missing_prepare_command
+      is_nil(required_checks) -> :invalid_required_checks
+      required_checks == [] -> :missing_required_checks
+      true -> nil
     end
   end
+
+  defp put_repository_profile(acc, repository, base_branch, prepare_command, required_checks) do
+    key = normalize_repository(repository)
+
+    cond do
+      not valid_repository?(repository) ->
+        acc
+
+      Map.has_key?(acc, key) ->
+        Map.update!(acc, key, &%{&1 | readiness_error: :duplicate_repository_profile})
+
+      true ->
+        Map.put(acc, key, %{
+          repository: repository,
+          base_branch: base_branch,
+          prepare_command: prepare_command,
+          required_checks: required_checks || [],
+          readiness_error: repository_profile_error(base_branch, prepare_command, required_checks)
+        })
+    end
+  end
+
+  defp configured_profile_error(profile) when is_map(profile), do: profile.readiness_error
+  defp configured_profile_error(_profile), do: nil
 
   defp valid_active_states(states) when is_list(states) do
     normalized = MapSet.new(states, &normalize_state/1)

@@ -10,8 +10,8 @@ defmodule SymphonyElixir.GitHub.AgentTool do
   @github_workflow_tool "github_workflow"
   @workflow_operations %{
     "build" => ["claim", "read_workpad", "workpad", "handoff", "create_follow_up_issue"],
-    "qa" => ["read_workpad", "workpad", "handoff", "create_follow_up_issue"],
-    "review" => ["read_workpad", "workpad", "handoff", "create_follow_up_issue"],
+    "qa" => ["claim", "read_workpad", "workpad", "handoff", "create_follow_up_issue"],
+    "review" => ["claim", "read_workpad", "workpad", "handoff", "create_follow_up_issue"],
     "diagnostic" => ["read_workpad", "workpad", "handoff"],
     "finalize" => ["read_workpad", "workpad", "handoff"],
     "individual" => ["claim", "workpad", "handoff", "create_follow_up_issue", "release_claim"]
@@ -183,13 +183,27 @@ defmodule SymphonyElixir.GitHub.AgentTool do
         "required" => ["operation"],
         "properties" => %{
           "operation" => %{"type" => "string", "enum" => operations},
-          "report" => %{"type" => ["object", "null"], "additionalProperties" => true},
+          "report" => %{
+            "type" => ["object", "null"],
+            "additionalProperties" => true,
+            "properties" => %{
+              "pull_request_body" => %{
+                "type" => "string",
+                "description" =>
+                  "For a ready Build or individual handoff, the complete description following .github/pull_request_template.md, with `Fixes #<issue-number>`. Do not include Symphony delivery markers; the host adds them."
+              }
+            }
+          },
           "outcome" => %{"type" => ["string", "null"]},
           "reason" => %{"type" => ["string", "null"]},
           "sha" => %{"type" => ["string", "null"]},
           "finding" => %{"type" => ["object", "null"]},
           "title" => %{"type" => ["string", "null"]},
-          "body" => %{"type" => ["string", "null"]}
+          "body" => %{
+            "type" => ["string", "null"],
+            "description" =>
+              "For handoff, the complete issue comment with one hidden symphony:report:json HTML comment whose JSON exactly matches report. Keep the PR description in report.pull_request_body."
+          }
         }
       }
     }

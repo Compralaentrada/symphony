@@ -837,8 +837,14 @@ Part B: Tracker state refresh
 - For each running issue:
   - If tracker state is terminal: terminate worker and clean workspace.
   - If tracker state is still active and routable: update the in-memory issue snapshot.
+    - If the issue had prior successful refresh omissions, clear the omission counter and log recovery.
   - If tracker state is active but no longer routable: terminate worker without workspace cleanup.
   - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
+- For each requested ID omitted from a successful refresh, log the issue identifier, consecutive
+  omission count, and number of normalized issues returned. Keep the same agent, claim, slot, and
+  workspace after the first omission. Stop the agent and release its claim and slot after the second
+  consecutive omission, preserving the workspace and remote Project state.
+- A tracker read error does not change omission counts or stop active workers.
 - If state refresh fails, keep workers running and try again on the next tick.
 
 ### 8.6 Startup Terminal Workspace Cleanup
@@ -902,6 +908,11 @@ Failure handling:
   prepared directory.
 - Reused workspaces SHOULD NOT be destructively reset on population failure unless that policy is
   explicitly chosen and documented.
+- GitHub Projects selects the configured repository profile from the linked issue's repository.
+  Profile readiness is checked for that task by running its preparation command and verifying its
+  base branch. Missing profile requirements, inaccessible repositories, unavailable base branches,
+  and failed preparation block only tasks for the affected repository and are recorded by the
+  diagnostic lane; other configured repository profiles remain usable.
 - GitHub Projects repository profiles synchronize a reused issue branch when Build resumes without
   an accepted SHA. They fetch and fast-forward; if the local and remote branches have diverged, the
   task is blocked with a recovery instruction and the local workspace is preserved. Dirty workspace
@@ -919,6 +930,10 @@ Failure handling:
   evidence where available. When a blocked QA or Review task is requeued after the PR head changed
   or the PR is missing, it restarts at Build so the accepted SHA and subsequent QA and Review
   evidence are refreshed together.
+- If a nonterminal phase checkpoint conflicts with the current nonterminal tracker state, a GitHub
+  Projects implementation SHOULD preserve the checkpoint and workspace, record a local blocker with
+  the mismatch reason, and leave the visible tracker state unchanged. Moving the item to `Ready`
+  explicitly requeues the work from the preserved checkpoint.
 
 ### 9.4 Workspace Hooks
 
@@ -1650,6 +1665,37 @@ Minimum endpoints:
     }
     ```
 
+Optional pipeline endpoint:
+
+- `GET /api/v1/delivery`
+  - Returns persisted pipeline tasks with a current lookup in the configured tracker by each task's
+    stable issue ID.
+  - The nested `task` contains the local pipeline record. `tracker_issue.issue` contains the
+    tracker's current `id`, `identifier`, `title`, `url`, and `state` when found. Its `lookup` is
+    `found`, `missing`, or `error`; `issue` is `null` for `missing` and `error`. The tracker state
+    is never inferred from the stored task.
+  - A local journal read failure returns `503` with error code `delivery_unavailable`.
+
+  ```json
+  {
+    "tasks": [
+      {
+        "task": { "issue_id": "abc123", "phase": "qa", "status": "qa" },
+        "tracker_issue": {
+          "lookup": "found",
+          "issue": {
+            "id": "abc123",
+            "identifier": "MT-649",
+            "title": "Review pipeline delivery",
+            "url": "https://tracker.example/issues/MT-649",
+            "state": "Human Review"
+          }
+        }
+      }
+    ]
+  }
+  ```
+
 API design notes:
 
 - The JSON shapes above are the RECOMMENDED baseline for interoperability and debugging ergonomics.
@@ -1908,13 +1954,22 @@ function reconcile_running_issues(state):
     if issue.state in terminal_states:
       state = terminate_running_issue(state, issue.id, cleanup_workspace=true)
     else if issue.state in active_states and issue_routable(issue):
+      misses = get(state.running[issue.id], "consecutive_missing_refreshes", 0)
+      if misses > 0:
+        log_recovery(issue, misses)
+      clear(state.running[issue.id], "consecutive_missing_refreshes")
       state.running[issue.id].issue = issue
     else:
       state = terminate_running_issue(state, issue.id, cleanup_workspace=false)
 
   returned_ids = set(issue.id for issue in refreshed)
   for missing_id in running_ids - returned_ids:
-    state = terminate_running_issue(state, missing_id, cleanup_workspace=false)
+    misses = get(state.running[missing_id], "consecutive_missing_refreshes", 0) + 1
+    log_omission(missing_id, misses, length(refreshed))
+    if misses >= 2:
+      state = terminate_running_issue(state, missing_id, cleanup_workspace=false)
+    else:
+      state.running[missing_id].consecutive_missing_refreshes = misses
 
   return state
 ```
@@ -2114,7 +2169,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 ### 17.2 Workspace Manager and Safety
 
-- Deterministic workspace path per issue identifier
+- Deterministic workspace path per issue identifier; GitHub Projects paths use the full Project,
+  item, repository, and issue execution identity
 - Missing workspace directory is created
 - Existing workspace directory is reused
 - Existing non-directory path at workspace location is handled safely (replace or fail per
@@ -2124,10 +2180,12 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored
-- Workspace path sanitization, stable original-identifier-hash collision resistance, and root
-  containment invariants are enforced before agent launch
+- Workspace path sanitization, stable original-key-hash collision resistance, and root containment
+  invariants are enforced before agent launch
 - Identifiers unchanged by sanitization keep their deterministic workspace key; conformance tests
   include distinct identifiers that sanitize to the same text and verify distinct keys
+- Same-number issues in different repositories have separate task identities, workspace paths,
+  branches, and repository-scoped pull request lookups
 - Agent launch uses the per-issue workspace path as cwd and rejects out-of-root paths
 
 ### 17.3 Issue Tracker Adapter
@@ -2154,6 +2212,9 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `dispatchable=false` issues are not eligible
 - Required-label filtering is case-insensitive and applies after adapter normalization
 - Active-state issue refresh updates running entry state
+- One successful ID-refresh omission keeps the same active worker; a second consecutive omission
+  stops it and releases its claim and slot while preserving the workspace
+- A visible active refresh clears the omission counter; tracker errors do not increment it
 - Non-active state stops running agent without workspace cleanup
 - Terminal state stops running agent and cleans workspace
 - Reconciliation with no running issues is a no-op

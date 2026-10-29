@@ -1,7 +1,10 @@
 defmodule SymphonyElixir.Pipeline do
   @moduledoc false
 
-  alias SymphonyElixir.{Config, Pipeline.Findings, Pipeline.Store, Tracker}
+  require Logger
+
+  alias SymphonyElixir.Codex.Skills
+  alias SymphonyElixir.{Config, Pipeline.Findings, Pipeline.Store, PRBody, Tracker}
   alias SymphonyElixir.Tracker.Issue
 
   @phases ~w(build qa review finalize)
@@ -33,10 +36,22 @@ defmodule SymphonyElixir.Pipeline do
     if confidence >= @report_locale_confidence, do: :es, else: :en
   end
 
-  @spec reconcile() :: :ok | {:error, term()}
-  def reconcile do
+  @spec delivery_tasks() :: {:ok, [map()]} | {:error, term()}
+  def delivery_tasks do
     with {:ok, tasks} <- Store.tasks() do
-      reconcile_tasks(tasks)
+      issue_ids = Enum.map(tasks, & &1["issue_id"])
+
+      tracker_issues =
+        if issue_ids == [], do: {:ok, []}, else: Tracker.fetch_issues_by_ids(issue_ids)
+
+      {:ok, project_delivery_tasks(tasks, tracker_issues)}
+    end
+  end
+
+  @spec reconcile([String.t()]) :: :ok | {:error, term()}
+  def reconcile(running_issue_ids \\ []) do
+    with {:ok, tasks} <- Store.tasks() do
+      reconcile_tasks(tasks, running_issue_ids)
     end
   end
 
@@ -85,7 +100,7 @@ defmodule SymphonyElixir.Pipeline do
     case normalize_phase_result(result, phase, report_locale(issue)) do
       {:ok, result} ->
         with :ok <- validate_remote_handoff(phase, result) do
-          finish_valid_phase(issue, task, phase, attempt, result)
+          finish_valid_phase(issue, clear_qa_claim(task, phase), phase, attempt, result)
         end
 
       {:error, reason} ->
@@ -93,6 +108,9 @@ defmodule SymphonyElixir.Pipeline do
         {:error, reason}
     end
   end
+
+  defp clear_qa_claim(task, "qa"), do: Map.drop(task, ["direct_qa", "qa_claim_pending", "qa_claim_reset_seen"])
+  defp clear_qa_claim(task, _phase), do: task
 
   @spec block_phase(Issue.t(), map(), String.t(), pos_integer(), String.t()) :: :ok | {:error, term()}
   def block_phase(%Issue{} = issue, task, phase, attempt, reason) when is_binary(reason) do
@@ -127,18 +145,68 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp prepare_from_checkpoint(issue, existing) do
+    existing = if is_map(existing), do: Map.put_new(existing, "execution_identity", Issue.execution_identity(issue)), else: existing
     _ = if(Tracker.agent_owned_writes?(), do: Store.supersede_pending_operations(issue.id), else: execute_pending(issue))
 
     case Store.pending_operations(issue.id) do
       {:ok, []} ->
-        case prepare_task(existing, issue) do
-          {:ok, _task, _phase} = prepared -> finish_prepare(issue, prepared)
-          other -> other
-        end
+        prepare_from_checkpoint_without_pending(issue, existing)
 
       _ ->
         :ignore
     end
+  end
+
+  defp prepare_from_checkpoint_without_pending(issue, existing) do
+    case checkpoint_state_mismatch(existing, issue) do
+      {:mismatch, reason} ->
+        block_checkpoint_mismatch(existing, issue, reason)
+
+      :ok ->
+        prepare_checkpoint(issue, existing)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp prepare_checkpoint(issue, existing) do
+    with {:ok, task} <- ensure_effective_config(existing, issue),
+         {:ok, _task, _phase} = prepared <- prepare_task(task, issue) do
+      finish_prepare(issue, prepared)
+    end
+  end
+
+  defp project_delivery_tasks(tasks, {:ok, issues}) do
+    issues_by_id = Map.new(issues, &{&1.id, &1})
+
+    Enum.map(tasks, fn task ->
+      tracker_issue =
+        case Map.get(issues_by_id, task["issue_id"]) do
+          %Issue{} = issue ->
+            %{
+              "lookup" => "found",
+              "issue" => %{
+                "id" => issue.id,
+                "identifier" => issue.identifier,
+                "title" => issue.title,
+                "url" => issue.url,
+                "state" => issue.state
+              }
+            }
+
+          nil ->
+            %{"lookup" => "missing", "issue" => nil}
+        end
+
+      %{"task" => task, "tracker_issue" => tracker_issue}
+    end)
+  end
+
+  defp project_delivery_tasks(tasks, {:error, _reason}) do
+    Enum.map(tasks, fn task ->
+      %{"task" => task, "tracker_issue" => %{"lookup" => "error", "issue" => nil}}
+    end)
   end
 
   defp finish_prepare(issue, prepared) do
@@ -166,23 +234,29 @@ defmodule SymphonyElixir.Pipeline do
   defp prepare_task(nil, %Issue{} = issue) do
     if issue.state in [issue_status_value(issue, :ready), issue_status_value(issue, :building)] do
       profile = issue.native_ref || %{}
+      phase = if Issue.routable?(issue, ["qa"]), do: "qa", else: "build"
 
       task = %{
         "issue_id" => issue.id,
+        "execution_identity" => Issue.execution_identity(issue),
         "repository" => profile_value(profile, :repository),
         "branch" => issue.branch_name,
         "base_branch" => profile_value(profile, :base_branch),
         "required_checks" => profile_value(profile, :required_checks) || [],
         "generation" => 1,
-        "phase" => "build",
-        "status" => "building",
+        "phase" => phase,
+        "status" => if(phase == "qa", do: "qa", else: "building"),
+        "direct_qa" => phase == "qa",
         "attempts" => %{},
+        "effective_config" => Skills.effective_config(issue),
         "prior_findings" => [],
         "current_sha" => nil,
         "pr_number" => nil
       }
 
-      with :ok <- Store.save_task(task), do: {:ok, task, "build"}
+      with {:ok, task} <- seed_qa_pull_request(task, issue),
+           :ok <- Store.save_task(task),
+           do: {:ok, task, phase}
     else
       :ignore
     end
@@ -195,12 +269,24 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
+  defp prepare_task(%{"status" => "blocked", "qa_claim_pending" => true} = task, %Issue{} = issue) do
+    if task["qa_claim_reset_seen"] == true and issue.state == status_value(task, :ready) do
+      resume_direct_qa(task, issue)
+    else
+      :ignore
+    end
+  end
+
   defp prepare_task(%{"status" => "blocked"} = task, %Issue{} = issue) do
     if issue.state == status_value(task, :ready), do: resume_blocked_task(task, issue), else: :ignore
   end
 
   defp prepare_task(%{"status" => "human_review"} = task, %Issue{} = issue) do
-    if issue.state == status_value(task, :ready), do: resume_human_review_task(task), else: :ignore
+    cond do
+      issue.state != status_value(task, :ready) -> :ignore
+      Issue.routable?(issue, ["qa"]) -> resume_direct_qa(task, issue)
+      true -> resume_human_review_task(task)
+    end
   end
 
   defp prepare_task(%{"status" => "finalize"} = task, %Issue{} = issue) do
@@ -215,6 +301,12 @@ defmodule SymphonyElixir.Pipeline do
       else: :ignore
   end
 
+  defp prepare_task(%{"status" => "qa", "direct_qa" => true} = task, %Issue{state: issue_state}) do
+    if issue_state in [status_value(task, :ready), status_value(task, :building), status_value(task, :qa)],
+      do: {:ok, task, "qa"},
+      else: :ignore
+  end
+
   defp prepare_task(%{"status" => status} = task, %Issue{state: issue_state})
        when status in ["building", "qa", "review"] do
     phase = task["phase"]
@@ -226,7 +318,197 @@ defmodule SymphonyElixir.Pipeline do
 
   defp prepare_task(_task, _issue), do: :ignore
 
-  defp resume_blocked_task(%{"phase" => phase, "current_sha" => current_sha} = task, issue)
+  @spec record_skill_readiness(Issue.t(), map(), :ok | {:error, term()}) :: {:ok, map()} | {:error, term()}
+  def record_skill_readiness(%Issue{} = _issue, task, :ok) do
+    task = Map.delete(task, "skill_readiness")
+
+    with :ok <- Store.save_task(task), do: {:ok, task}
+  end
+
+  def record_skill_readiness(%Issue{} = issue, task, {:error, reason}) do
+    {summary, next_step} = skill_readiness_diagnostic(issue, task, reason)
+    task = Map.put(task, "skill_readiness", %{"status" => "failed", "reason" => summary, "next_step" => next_step})
+
+    with :ok <- Store.save_task(task), do: {:ok, task}
+  end
+
+  defp ensure_effective_config(%{"effective_config" => %{"skills" => skills}} = task, _issue) when is_map(skills),
+    do: {:ok, task}
+
+  defp ensure_effective_config(%{"status" => status} = task, %Issue{} = issue)
+       when status in ["building", "qa", "review", "blocked", "human_review"] do
+    task = Map.put(task, "effective_config", Skills.effective_config(issue))
+
+    with :ok <- Store.save_task(task), do: {:ok, task}
+  end
+
+  defp ensure_effective_config(task, _issue), do: {:ok, task}
+
+  defp skill_readiness_diagnostic(issue, task, {:required_skill_unavailable, skill, path}) do
+    skill_diagnostic(issue, task, skill, path, "missing", "unavailable")
+  end
+
+  defp skill_readiness_diagnostic(issue, task, {:required_skill_unavailable, skill, path, _reason}) do
+    skill_diagnostic(issue, task, skill, path, "missing", "unavailable")
+  end
+
+  defp skill_readiness_diagnostic(issue, task, {:skill_fingerprint_mismatch, skill, expected, actual, path}) do
+    skill_diagnostic(issue, task, skill, path, expected, actual)
+  end
+
+  defp skill_readiness_diagnostic(issue, task, {:skill_file_mismatch, skill, expected, actual, path}) do
+    skill_diagnostic(issue, task, skill, path, expected, actual)
+  end
+
+  defp skill_readiness_diagnostic(issue, task, {:skill_snapshot_unavailable, _status, output}) do
+    output = IO.iodata_to_binary(output)
+
+    case parse_skill_snapshot_error(output) do
+      {:file_mismatch, skill, path, expected, actual} ->
+        skill_diagnostic(issue, task, skill, Path.join([".agents", "skills", skill, path]), expected, actual)
+
+      {:fingerprint_mismatch, skill, expected, actual} ->
+        path = Path.join([".agents", "skills", skill, "CHECKSUMS.sha256"])
+        skill_diagnostic(issue, task, skill, path, expected, actual)
+
+      {:missing_file, skill, path} ->
+        skill_diagnostic(issue, task, skill, path, "missing", "unavailable")
+
+      {:file_list_mismatch, skill} ->
+        path = Path.join([".agents", "skills", skill])
+        skill_diagnostic(issue, task, skill, path, "catalog file set", "different file set")
+
+      nil ->
+        skill_readiness_diagnostic(issue, task, output)
+    end
+  end
+
+  defp skill_readiness_diagnostic(issue, _task, reason) do
+    if report_locale(issue) == :es do
+      {"No se pudo validar el catálogo de skills: #{inspect(reason)}",
+       "Compara los archivos indicados con el catálogo elixir/priv/skills/catalog.lock.json y restaura la versión fijada; la issue seguirá en Ready y Symphony volverá a comprobar readiness."}
+    else
+      {"The skill catalog could not be validated: #{inspect(reason)}",
+       "Compare the reported files with elixir/priv/skills/catalog.lock.json and restore the pinned version; the issue will remain Ready and Symphony will retry automatically."}
+    end
+  end
+
+  defp parse_skill_snapshot_error(output) do
+    patterns = [
+      {:file_mismatch, ~r/Skill file checksum mismatch: \.agents\/skills\/([a-z0-9-]+)\/(.+) expected=([[:xdigit:]]+) actual=([[:xdigit:]]+)/},
+      {:fingerprint_mismatch, ~r/Skill fingerprint mismatch: ([a-z0-9-]+) expected=([[:xdigit:]]+)\s+actual=([[:xdigit:]]+)/},
+      {:missing_file, ~r/Required skill file is missing: (\S+)/},
+      {:file_list_mismatch, ~r/Skill file list differs from the lock: ([a-z0-9-]+)/}
+    ]
+
+    Enum.find_value(patterns, fn {kind, pattern} ->
+      case Regex.run(pattern, output, capture: :all_but_first) do
+        nil -> nil
+        captures -> {kind, captures}
+      end
+    end)
+    |> normalize_skill_snapshot_error()
+  end
+
+  defp normalize_skill_snapshot_error({:file_mismatch, [skill, path, expected, actual]}), do: {:file_mismatch, skill, path, expected, actual}
+  defp normalize_skill_snapshot_error({:fingerprint_mismatch, [skill, expected, actual]}), do: {:fingerprint_mismatch, skill, expected, actual}
+
+  defp normalize_skill_snapshot_error({:missing_file, [path]}) do
+    skill = path |> Path.split() |> Enum.at(-2)
+    {:missing_file, skill, path}
+  end
+
+  defp normalize_skill_snapshot_error({:file_list_mismatch, [skill]}), do: {:file_list_mismatch, skill}
+  defp normalize_skill_snapshot_error(nil), do: nil
+
+  defp skill_diagnostic(issue, task, skill, path, expected, actual) do
+    pin = Enum.find(Skills.attempt_snapshot(issue, task, task["phase"]), &(&1["name"] == skill)) || %{}
+    version = pin["version"] || "unknown"
+    fingerprint = pin["fingerprint"] || expected
+    expected = if expected == "missing", do: fingerprint, else: expected
+    actual = if actual == "unavailable", do: "missing", else: actual
+
+    if report_locale(issue) == :es do
+      {
+        "La skill #{skill} no coincide con el catálogo fijado (esperado #{expected}, observado #{actual}) en #{path}.",
+        "Restaura #{path} a la versión #{version} con huella #{fingerprint}; la issue seguirá en Ready y Symphony volverá a comprobar readiness."
+      }
+    else
+      {
+        "Skill #{skill} does not match the pinned catalog (expected #{expected}, observed #{actual}) at #{path}.",
+        "Restore #{path} to version #{version} with fingerprint #{fingerprint}; the issue will remain Ready and Symphony will retry readiness."
+      }
+    end
+  end
+
+  defp seed_qa_pull_request(%{"phase" => "qa"} = task, issue) do
+    expected_branch = task["branch"]
+    expected_base = task["base_branch"]
+
+    case Tracker.pull_request(issue) do
+      {:ok, %{number: number, branch: ^expected_branch, base: ^expected_base, sha: sha}}
+      when is_integer(number) and is_binary(sha) and sha != "" ->
+        {:ok, Map.merge(task, %{"current_sha" => sha, "pr_number" => number})}
+
+      {:ok, _pull_request} ->
+        {:ok, task}
+
+      :ignore ->
+        {:ok, task}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp seed_qa_pull_request(task, _issue), do: {:ok, task}
+
+  defp resume_blocked_task(%{"phase" => phase} = task, %Issue{} = issue) when phase in ["qa", "review"] do
+    if Issue.routable?(issue, ["qa"]),
+      do: resume_direct_qa(task, issue),
+      else: resume_blocked_other_task(task, issue)
+  end
+
+  defp resume_blocked_task(task, _issue), do: resume_blocked_task(task)
+
+  defp resume_direct_qa(task, issue) do
+    branch = task["branch"]
+    base = task["base_branch"]
+
+    with {:ok, delivery} <- direct_qa_delivery(Tracker.pull_request(issue), branch, base),
+         {:ok, [%Issue{state: state}]} <- Tracker.fetch_issues_by_ids([issue.id]),
+         true <- state == status_value(task, :ready) do
+      updated =
+        task
+        |> Map.drop(["qa_claim_pending", "qa_claim_reset_seen", "blocked_reason"])
+        |> Map.merge(%{"phase" => "qa", "status" => "qa", "direct_qa" => true})
+        |> Map.merge(delivery)
+        |> next_direct_qa_generation(task)
+
+      case Store.replace_task_if_unchanged(task, updated) do
+        :ok -> {:ok, updated, "qa"}
+        :stale -> :ignore
+        {:error, _reason} = error -> error
+      end
+    else
+      {:error, _reason} = error -> error
+      _ -> :ignore
+    end
+  end
+
+  defp direct_qa_delivery({:ok, %{sha: sha, number: number, branch: branch, base: base}}, branch, base)
+       when is_binary(sha) and sha != "" and is_integer(number),
+       do: {:ok, %{"current_sha" => sha, "pr_number" => number}}
+
+  defp direct_qa_delivery({:error, _reason} = error, _branch, _base), do: error
+  defp direct_qa_delivery(_result, _branch, _base), do: {:ok, %{"current_sha" => nil, "pr_number" => nil}}
+
+  defp next_direct_qa_generation(updated, %{"status" => "human_review", "generation" => generation}),
+    do: updated |> Map.put("generation", generation + 1) |> Map.put("attempts", %{})
+
+  defp next_direct_qa_generation(updated, _task), do: updated
+
+  defp resume_blocked_other_task(%{"phase" => phase, "current_sha" => current_sha} = task, issue)
        when phase in ["qa", "review"] and is_binary(current_sha) do
     case Tracker.pull_request(issue) do
       {:ok, %{sha: ^current_sha}} ->
@@ -243,16 +525,14 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp resume_blocked_task(%{"phase" => phase} = task, _issue) when phase in ["qa", "review"],
+  defp resume_blocked_other_task(%{"phase" => phase} = task, _issue) when phase in ["qa", "review"],
     do: restart_blocked_task_at_build(task)
 
-  defp resume_blocked_task(task, _issue), do: resume_blocked_task(task)
-
   defp restart_blocked_task_at_build(task),
-    do: task |> Map.put("phase", "build") |> Map.put("current_sha", nil) |> resume_blocked_task()
+    do: task |> Map.put("phase", "build") |> Map.put("current_sha", nil) |> Map.delete("direct_qa") |> resume_blocked_task()
 
   defp resume_blocked_task(task) do
-    task = Map.put(task, "status", "building")
+    task = task |> Map.put("status", "building") |> Map.delete("blocked_reason")
     with :ok <- Store.save_task(task), do: {:ok, task, task["phase"]}
   end
 
@@ -262,6 +542,7 @@ defmodule SymphonyElixir.Pipeline do
       |> Map.put("generation", task["generation"] + 1)
       |> Map.put("phase", "build")
       |> Map.put("status", "building")
+      |> Map.delete("direct_qa")
       |> Map.put("attempts", %{})
       |> Map.put("current_sha", nil)
 
@@ -289,7 +570,8 @@ defmodule SymphonyElixir.Pipeline do
 
   defp finish_valid_phase(issue, task, "build", attempt, %{"outcome" => "ready", "sha" => sha} = result)
        when is_binary(sha) do
-    with :ok <- Tracker.validate_pipeline_delivery(issue, task["branch"], sha) do
+    with :ok <- PRBody.validate_agent_body(result["pull_request_body"], issue.id),
+         :ok <- Tracker.validate_pipeline_delivery(issue, task["branch"], sha) do
       handoff = remote_handoff(result)
       pr_number = get_in(handoff, ["pull_request", "number"])
       next = task |> Map.merge(%{"phase" => "qa", "status" => "qa", "current_sha" => sha}) |> maybe_put("pr_number", pr_number)
@@ -299,7 +581,7 @@ defmodule SymphonyElixir.Pipeline do
           "branch" => task["branch"],
           "base" => task["base_branch"],
           "sha" => sha,
-          "body" => pull_request_body(issue, result)
+          "body" => PRBody.delivery_block(result["pull_request_body"])
         }),
         report_op(next, "build", attempt, result),
         status_op(next, :qa, nil, attempt)
@@ -410,24 +692,30 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp reconcile_tasks([]), do: :ok
+  defp reconcile_tasks([], _running_issue_ids), do: :ok
 
-  defp reconcile_tasks(tasks) do
+  defp reconcile_tasks(tasks, running_issue_ids) do
     case Tracker.fetch_issues_by_ids(Enum.map(tasks, & &1["issue_id"])) do
       {:ok, issues} ->
         issues_by_id = Map.new(issues, &{&1.id, &1})
-        Enum.each(tasks, &reconcile_task(&1, issues_by_id))
+        Enum.each(tasks, &reconcile_task(&1, issues_by_id, running_issue_ids))
 
       {:error, _reason} ->
         :ok
     end
   end
 
-  defp reconcile_task(%{"issue_id" => issue_id} = task, issues_by_id) do
+  defp reconcile_task(%{"issue_id" => issue_id} = task, issues_by_id, running_issue_ids) do
     case Map.get(issues_by_id, issue_id) do
       %Issue{} = issue ->
         _ = execute_pending(issue)
-        reconcile_task_issue(issue, task)
+
+        if issue_id in running_issue_ids and task["phase"] == "review" and
+             issue.state in [status_value(task, :human_review), "closed"] do
+          :ok
+        else
+          reconcile_task_issue(issue, task)
+        end
 
       _ ->
         :ok
@@ -456,6 +744,12 @@ defmodule SymphonyElixir.Pipeline do
   defp reconcile_nonterminal_task(issue, %{"status" => "human_review"} = task),
     do: reconcile_human_review(issue, task)
 
+  defp reconcile_nonterminal_task(issue, %{"status" => "review", "phase" => "review"} = task) do
+    if issue.state == status_value(task, :human_review),
+      do: Store.save_task(Map.put(task, "status", "human_review")),
+      else: reconcile_checkpoint(issue, task)
+  end
+
   defp reconcile_nonterminal_task(issue, %{"status" => "blocked", "drop_pending" => true} = task) do
     case human_drop_reason(issue) do
       {:ok, reason} -> drop_task(issue, task, reason)
@@ -463,7 +757,96 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp reconcile_nonterminal_task(_issue, _task), do: :ok
+  defp reconcile_nonterminal_task(issue, %{"status" => "blocked", "qa_claim_pending" => true} = task) do
+    if issue.state == status_value(task, :blocked) and task["qa_claim_reset_seen"] != true,
+      do: reconcile_claim_reset(task),
+      else: :ok
+  end
+
+  defp reconcile_nonterminal_task(issue, task), do: reconcile_checkpoint(issue, task)
+
+  defp reconcile_checkpoint(issue, task) do
+    case checkpoint_state_mismatch(task, issue) do
+      {:mismatch, reason} -> block_checkpoint_mismatch(task, issue, reason)
+      :ok -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp reconcile_claim_reset(task) do
+    case Store.replace_task_if_unchanged(task, Map.put(task, "qa_claim_reset_seen", true)) do
+      :stale -> :ok
+      result -> result
+    end
+  end
+
+  defp checkpoint_state_mismatch(%{"status" => status} = task, %Issue{state: issue_state})
+       when status in ["building", "qa", "review", "finalize"] do
+    with {:ok, claim_active} <- qa_claim_active(task) do
+      checkpoint_state_mismatch(task, issue_state, status, claim_active)
+    end
+  end
+
+  defp checkpoint_state_mismatch(_task, _issue), do: :ok
+
+  defp qa_claim_active(%{"status" => "qa", "qa_claim_pending" => true} = task) do
+    case get_in(task, ["attempts", "qa"]) do
+      attempt when is_integer(attempt) -> Store.pipeline_lease_active(task["issue_id"], task["generation"], "qa", attempt)
+      _ -> {:ok, false}
+    end
+  end
+
+  defp qa_claim_active(_task), do: {:ok, false}
+
+  defp checkpoint_state_mismatch(task, issue_state, status, claim_active) do
+    expected_states =
+      case status do
+        "building" ->
+          [status_value(task, :ready), status_value(task, :building)]
+
+        "qa" ->
+          qa_expected_states(task, claim_active)
+
+        "review" ->
+          [status_value(task, :review)]
+
+        "finalize" ->
+          [status_value(task, :human_review), status_value(task, :building), status_value(task, :done), "closed"]
+      end
+
+    if issue_state in expected_states or issue_state in [status_value(task, :done), status_value(task, :dropped), "closed"] do
+      :ok
+    else
+      phase = task["phase"] || status
+
+      if task["qa_claim_pending"] == true,
+        do: {:mismatch, "The QA claim outcome is uncertain; move the item to Blocked and then Ready to confirm a retry."},
+        else: {:mismatch, "Pipeline checkpoint is #{String.capitalize(to_string(phase))} but tracker state is #{issue_state}; review the workpad and move the item to Ready to resume safely."}
+    end
+  end
+
+  defp qa_expected_states(task, claim_active) do
+    if task["direct_qa"] == true and (task["qa_claim_pending"] != true or claim_active),
+      do: [status_value(task, :ready), status_value(task, :building), status_value(task, :qa)],
+      else: [status_value(task, :qa)]
+  end
+
+  defp block_checkpoint_mismatch(task, issue, reason) do
+    blocked = task |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
+
+    case Store.replace_task_if_unchanged(task, blocked) do
+      :ok ->
+        Logger.warning("Pipeline checkpoint mismatch for issue_id=#{issue.id} issue_identifier=#{issue.identifier}: #{reason}; leaving tracker state unchanged")
+        :ignore
+
+      :stale ->
+        :ignore
+
+      {:error, _reason} = error ->
+        Logger.error("Unable to persist pipeline checkpoint mismatch for issue_id=#{issue.id} issue_identifier=#{issue.identifier}: #{inspect(error)}")
+        error
+    end
+  end
 
   defp reconcile_unmerged_done(issue, task, status) do
     _ = {issue, task, status}
@@ -529,54 +912,6 @@ defmodule SymphonyElixir.Pipeline do
   defp ensure_pull_request_sha(%{sha: sha}, sha) when is_binary(sha), do: :ok
   defp ensure_pull_request_sha(_pr, _sha), do: {:error, :pull_request_head_sha_mismatch}
 
-  defp pull_request_body(issue, result) do
-    """
-    <!-- symphony:delivery -->
-
-    Fixes #{issue.id}
-
-    ## Summary
-
-    #{result["summary"]}
-
-    ## Acceptance criteria
-
-    #{markdown_items(result["criteria"])}
-
-    ## Changes
-
-    #{markdown_items(result["changes"])}
-
-    ## Checks
-
-    #{markdown_items(result["checks"])}
-
-    ## Evidence
-
-    - Build SHA: `#{result["sha"]}`
-
-    ## Risks and limitations
-
-    #{markdown_items(result["risks"])}
-
-    ## Next step
-
-    #{result["next_step"]}
-    """
-    |> String.trim()
-  end
-
-  defp markdown_items(items) when is_list(items) do
-    case items do
-      [] -> "- None reported."
-      items -> Enum.map_join(items, "\n", &("- " <> markdown_item(&1)))
-    end
-  end
-
-  defp markdown_items(_items), do: "- None reported."
-  defp markdown_item(item) when is_binary(item), do: item
-  defp markdown_item(item), do: Jason.encode!(item)
-
   defp complete_merged_task(task, number) do
     next = task |> Map.merge(%{"phase" => "finalize", "status" => "finalize", "pr_number" => number})
     Store.save_task(next)
@@ -641,7 +976,7 @@ defmodule SymphonyElixir.Pipeline do
   defp report_ops(task, phase, attempt, result), do: [report_op(task, phase, attempt, result)]
 
   defp report_op(task, phase, attempt, result) do
-    marker = "<!-- symphony:#{task["issue_id"]}:#{task["generation"]}:#{phase}:#{attempt} -->"
+    marker = "<!-- symphony:#{task["execution_identity"] || task["issue_id"]}:#{task["generation"]}:#{phase}:#{attempt} -->"
     body = marker <> "\n\n## Symphony #{String.capitalize(phase)} report\n\n" <> Jason.encode!(result, pretty: true)
     operation(task, "report", %{"marker" => marker, "body" => body, "phase" => phase})
   end
@@ -656,7 +991,7 @@ defmodule SymphonyElixir.Pipeline do
       )
 
   defp operation(task, kind, payload, salt \\ nil) do
-    key = Enum.join([task["issue_id"], task["generation"], task["phase"], kind, :erlang.phash2({payload, salt})], ":")
+    key = Enum.join([task["execution_identity"] || task["issue_id"], task["generation"], task["phase"], kind, :erlang.phash2({payload, salt})], ":")
     %{key: key, issue_id: task["issue_id"], kind: kind, payload: payload}
   end
 
@@ -744,15 +1079,30 @@ defmodule SymphonyElixir.Pipeline do
     result = Map.put(result, "checks", checks)
 
     case remote_handoff(result) do
-      %{"outcome" => outcome} when is_binary(outcome) -> Map.put(result, "outcome", outcome)
-      _ -> result
+      %{"outcome" => "blocked", "reason" => reason} = handoff when is_binary(reason) ->
+        result |> Map.put("outcome", "blocked") |> Map.put("reason", reason) |> maybe_put("next_step", handoff["next_step"])
+
+      %{"outcome" => outcome} when is_binary(outcome) ->
+        Map.put(result, "outcome", outcome)
+
+      _ ->
+        result
     end
   end
 
   defp normalize_remote_result(result, phase) when phase in ["build", "review", "finalize"] do
     case remote_handoff(result) do
-      %{"outcome" => outcome} when is_binary(outcome) -> Map.put(result, "outcome", outcome)
-      _ -> result
+      %{"outcome" => "blocked", "reason" => reason} = handoff when is_binary(reason) ->
+        result |> Map.put("outcome", "blocked") |> Map.put("reason", reason) |> maybe_put("next_step", handoff["next_step"])
+
+      %{"outcome" => "ready", "pull_request_body" => body} when phase == "build" and is_binary(body) ->
+        Map.merge(result, %{"outcome" => "ready", "pull_request_body" => body})
+
+      %{"outcome" => outcome} when is_binary(outcome) ->
+        Map.put(result, "outcome", outcome)
+
+      _ ->
+        result
     end
   end
 

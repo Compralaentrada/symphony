@@ -1,5 +1,6 @@
 defmodule SymphonyElixir.TestSupport do
   @workflow_prompt "You are an agent for this repository."
+  @skill_source_root Path.expand("../../..", __DIR__)
 
   defmacro __using__(_opts) do
     quote do
@@ -72,9 +73,14 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   def required_skill_fixture_hook do
-    "mkdir -p .agents/skills/ponytail .agents/skills/tdd .agents/skills/code-review && " <>
-      "touch .agents/skills/ponytail/SKILL.md .agents/skills/tdd/SKILL.md .agents/skills/code-review/SKILL.md"
+    Enum.map_join(["ponytail", "tdd", "code-review", "impeccable", "humanizer"], " && ", fn skill ->
+      source = Path.join([@skill_source_root, ".agents", "skills", skill])
+
+      "mkdir -p .agents/skills && rm -rf .agents/skills/#{skill} && cp -R #{shell_quote(source)} .agents/skills/#{skill}"
+    end)
   end
+
+  defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
 
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)

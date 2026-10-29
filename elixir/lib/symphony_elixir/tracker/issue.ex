@@ -5,8 +5,8 @@ defmodule SymphonyElixir.Tracker.Issue do
   `id` is the stable dispatch identity for the configured tracker scope. It may
   differ from a provider's underlying issue ID when the scheduled item is a
   board or project entry. `native_ref` carries non-secret provider identifiers
-  needed by provider-native agent tools. `identifier` remains the human-readable
-  value used to derive the workspace key and must be unique within that scope.
+  needed by provider-native agent tools. `execution_identity/1` names workspaces
+  and artifacts; `identifier` remains the human-readable value used by the UI.
   """
 
   defstruct [
@@ -56,6 +56,22 @@ defmodule SymphonyElixir.Tracker.Issue do
     labels
   end
 
+  @spec execution_identity(t()) :: String.t()
+  def execution_identity(%__MODULE__{} = issue) do
+    ref = issue.native_ref || %{}
+    project_id = native_ref_value(ref, :project_id)
+    project_item_id = native_ref_value(ref, :project_item_id)
+    repository = native_ref_value(ref, :repository)
+    issue_number = native_ref_value(ref, :issue_number)
+
+    if present?(project_id) and present?(project_item_id) and present?(repository) and
+         (is_integer(issue_number) or present?(issue_number)) do
+      "#{project_id}/#{project_item_id}/#{repository}##{issue_number}"
+    else
+      issue.identifier || issue.id || "issue"
+    end
+  end
+
   @spec routable?(t(), [String.t()]) :: boolean()
   def routable?(%__MODULE__{dispatchable: true, labels: labels}, required_labels)
       when is_list(labels) and is_list(required_labels) do
@@ -70,4 +86,7 @@ defmodule SymphonyElixir.Tracker.Issue do
     |> String.trim()
     |> String.downcase()
   end
+
+  defp native_ref_value(ref, key), do: Map.get(ref, key) || Map.get(ref, Atom.to_string(key))
+  defp present?(value), do: is_binary(value) and String.trim(value) != ""
 end
