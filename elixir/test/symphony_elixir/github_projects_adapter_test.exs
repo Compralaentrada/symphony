@@ -3,6 +3,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
   alias SymphonyElixir.GitHub.{AgentReport, AgentTool, Projects.Adapter, Projects.Client}
   alias SymphonyElixir.GitHubProjectsAdapterTest.FakeGitHubProjectsClient
+  alias SymphonyElixir.Pipeline
   alias SymphonyElixir.Pipeline.Store
 
   test "tracker selects the GitHub Projects adapter" do
@@ -1911,24 +1912,87 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     refute Enum.any?(calls, fn {query, _} -> query =~ "updateProjectV2ItemFieldValue" or query =~ "addComment" end)
   end
 
-  test "issues with the same number in different repositories have distinct identities" do
+  test "same-number issues in different repositories get independent tasks, workspaces, branches, and PRs" do
+    root = Path.join(System.tmp_dir!(), "symphony-project-identity-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(root, "workspaces")
+    previous_database_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+
+    File.mkdir_p!(root)
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+    write_projects_workflow!(workspace_root)
+
+    on_exit(fn ->
+      case previous_database_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    app_source = create_test_repository!(Path.join(root, "octo-app"), "octo/app")
+    docs_source = create_test_repository!(Path.join(root, "other-app"), "other/app")
+
     settings =
       tracker_settings(%{
         "repositories" => [
-          %{"repository" => "octo/app", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]},
-          %{"repository" => "octo/docs", "base_branch" => "main", "prepare_command" => "true", "required_checks" => ["true"]}
+          project_repository("octo/app", app_source),
+          project_repository("other/app", docs_source)
         ]
       })
 
+    app_item = issue_item("octo/app", 7, "Ready") |> Map.put("id", "PVTI_app_7")
+    docs_item = issue_item("other/app", 7, "Ready") |> Map.put("id", "PVTI_other_app_7")
+
     assert {:ok, [app, docs]} =
              Client.fetch_issues_by_states_for_test(["Ready"], settings, fn _query, _variables, _settings ->
-               {:ok, %{status: 200, body: project_response([issue_item("octo/app", 7, "Ready"), issue_item("octo/docs", 7, "Ready")])}}
+               {:ok, %{status: 200, body: project_response([app_item, docs_item])}}
              end)
 
     assert app.id == "octo/app#7"
-    assert docs.id == "octo/docs#7"
+    assert docs.id == "other/app#7"
     refute app.id == docs.id
+    assert Issue.execution_identity(app) =~ app.native_ref.project_id
+    assert Issue.execution_identity(app) =~ app.native_ref.project_item_id
+    assert Issue.execution_identity(app) =~ "octo/app#7"
+    refute Issue.execution_identity(app) == Issue.execution_identity(docs)
     refute Workspace.workspace_key(app) == Workspace.workspace_key(docs)
+    assert Workspace.workspace_key(app) =~ "PVT_kwDOProject"
+    assert Workspace.workspace_key(app) =~ "PVTI_app_7"
+    assert app.branch_name == "symphony/octo-app-7"
+    assert docs.branch_name == "symphony/other-app-7"
+
+    assert {:ok, app_task, "build"} = Pipeline.prepare(app)
+    assert {:ok, docs_task, "build"} = Pipeline.prepare(docs)
+    assert app_task["execution_identity"] == Issue.execution_identity(app)
+    assert docs_task["execution_identity"] == Issue.execution_identity(docs)
+    refute app_task["execution_identity"] == docs_task["execution_identity"]
+    assert {:ok, ^app_task} = Store.get_task(app.id)
+    assert {:ok, ^docs_task} = Store.get_task(docs.id)
+
+    assert {:ok, app_workspace} = Workspace.create_for_issue(app)
+    assert {:ok, docs_workspace} = Workspace.create_for_issue(docs)
+    assert Path.basename(app_workspace) == Workspace.workspace_key(app)
+    assert Path.basename(docs_workspace) == Workspace.workspace_key(docs)
+    refute app_workspace == docs_workspace
+    assert git!(app_workspace, ["branch", "--show-current"]) == app.branch_name
+    assert git!(docs_workspace, ["branch", "--show-current"]) == docs.branch_name
+    assert File.read!(Path.join(app_workspace, "repository.txt")) == "octo/app\n"
+    assert File.read!(Path.join(docs_workspace, "repository.txt")) == "other/app\n"
+
+    for {issue, owner, repository} <- [{app, "octo", "app"}, {docs, "other", "app"}] do
+      assert {:ok, pull_request} =
+               Client.pull_request_for_test(issue, settings, fn query, variables, _settings ->
+                 assert query =~ "repository(owner: $owner, name: $name)"
+                 assert variables["owner"] == owner
+                 assert variables["name"] == repository
+                 assert variables["branch"] == issue.branch_name
+                 {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [pipeline_pr(issue, "")]}}}}}}
+               end)
+
+      assert pull_request.branch == issue.branch_name
+      assert pull_request.url == "https://github.com/#{owner}/#{repository}/pull/107"
+    end
   end
 
   test "reads native blockers with repository-qualified identities and ignores title matches" do
@@ -2245,10 +2309,12 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
   end
 
   defp pipeline_pr(issue, body) do
+    repository = Map.get(issue.native_ref || %{}, :repository) || Map.get(issue.native_ref || %{}, "repository") || "octo/app"
+
     %{
       "id" => "PR_pipeline",
       "number" => 107,
-      "url" => "https://github.com/octo/app/pull/107",
+      "url" => "https://github.com/#{repository}/pull/107",
       "state" => "OPEN",
       "isDraft" => true,
       "mergedAt" => nil,
@@ -2280,7 +2346,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     }
   end
 
-  defp write_projects_workflow! do
+  defp write_projects_workflow!(workspace_root \\ Path.join(System.tmp_dir!(), "symphony_workspaces")) do
     File.write!(
       Workflow.workflow_file_path(),
       """
@@ -2298,6 +2364,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
               prepare_command: "true"
               required_checks: ["true"]
           token: test-token
+      workspace:
+        root: "#{workspace_root}"
       ---
 
       Work on {{ issue.identifier }}.
@@ -2305,6 +2373,31 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     )
 
     assert :ok = WorkflowStore.force_reload()
+  end
+
+  defp project_repository(repository, source) do
+    %{
+      "repository" => repository,
+      "base_branch" => "main",
+      "prepare_command" => "git init -b main && git remote add origin #{source}",
+      "required_checks" => ["true"]
+    }
+  end
+
+  defp create_test_repository!(path, repository) do
+    File.mkdir_p!(path)
+    git!(path, ["init", "-b", "main"])
+    git!(path, ["config", "user.name", "Test User"])
+    git!(path, ["config", "user.email", "test@example.com"])
+    File.write!(Path.join(path, "repository.txt"), "#{repository}\n")
+    git!(path, ["add", "repository.txt"])
+    git!(path, ["commit", "-m", "initial"])
+    path
+  end
+
+  defp git!(path, args) do
+    {output, 0} = System.cmd("git", ["-C", path | args], stderr_to_stdout: true)
+    String.trim(output)
   end
 
   defp restore_application_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
