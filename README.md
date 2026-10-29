@@ -7,6 +7,8 @@ correspondiente y ejecuta las fases necesarias con Codex.
 ## Qué hace
 
 - Coordina varios repositorios desde un único GitHub Project v2 mediante perfiles de repositorio.
+- Comprueba por separado el acceso, la rama base y la preparación del perfil seleccionado; un fallo
+  bloquea solo las tareas de ese repositorio y deja un diagnóstico.
 - Aísla cada ejecución de Projects con el proyecto, el elemento, el repositorio y el número de issue;
   cada workspace y búsqueda de PR queda vinculado al repositorio correcto.
 - Ejecuta Build, QA y Review en sesiones separadas. QA vincula cada criterio con una prueba o

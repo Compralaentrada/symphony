@@ -187,7 +187,10 @@ Notes:
   `qa`, `review`, `human_review`, and `dropped` status values, include the active phase statuses in
   `tracker.active_states`, include `Dropped` in `tracker.terminal_states`, and set nonempty
   `required_checks` for each repository profile. The Symphony host also needs Git push credentials
-  for each profile; pipeline agents do not receive the tracker token.
+  for each profile; pipeline agents do not receive the tracker token. Symphony selects the profile
+  from the linked repository and checks its preparation command and base branch for that task. A
+  missing profile requirement, inaccessible repository, unavailable base branch, or failed setup
+  blocks tasks for that repository with a diagnostic; other configured repositories remain usable.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`

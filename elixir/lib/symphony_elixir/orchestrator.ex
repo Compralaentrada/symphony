@@ -1362,6 +1362,23 @@ defmodule SymphonyElixir.Orchestrator do
     )
   end
 
+  defp apply_skill_preflight(
+         state,
+         issue,
+         entry,
+         {:error, {:workspace_preflight, {:repository_profile_invalid, _reason}}}
+       ) do
+    start_claimed_pipeline_issue(
+      state,
+      issue,
+      entry.preflight_task,
+      entry.preflight_phase,
+      entry.preflight_attempt,
+      entry.worker_host,
+      false
+    )
+  end
+
   defp apply_skill_preflight(state, issue, entry, {:error, {:workspace_preflight, reason}}),
     do: schedule_pipeline_retry(state, issue, entry.preflight_attempt, entry.worker_host, "Workspace preflight failed", reason)
 
@@ -1493,8 +1510,12 @@ defmodule SymphonyElixir.Orchestrator do
     send(recipient, {:pipeline_phase_result, issue.id, task["generation"], phase, runtime.phase_attempt, result})
   end
 
-  defp diagnose_system_blocker(runner, issue, recipient, opts, {:system_blocker, _report} = blocker) do
-    if Pipeline.enabled?(), do: runner.run(issue, recipient, Keyword.put(opts, :diagnostic, true)), else: blocker
+  defp diagnose_system_blocker(runner, issue, recipient, opts, {:system_blocker, report} = blocker) do
+    if Pipeline.enabled?() do
+      runner.run(issue, recipient, opts |> Keyword.put(:diagnostic, true) |> Keyword.put(:system_blocker_report, report))
+    else
+      blocker
+    end
   end
 
   defp diagnose_system_blocker(_runner, _issue, _recipient, _opts, result), do: result
@@ -2069,6 +2090,7 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_event: metadata.last_codex_event,
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
+        |> Map.merge(if metadata[:pipeline_phase], do: %{pipeline_phase: metadata.pipeline_phase}, else: %{})
       end)
 
     retrying =

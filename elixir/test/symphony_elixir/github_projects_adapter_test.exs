@@ -2360,6 +2360,64 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     refute Enum.any?(calls, fn {query, _} -> query =~ "updateProjectV2ItemFieldValue" or query =~ "addComment" end)
   end
 
+  test "repository profile preparation is selected by repo and an invalid profile stays isolated" do
+    root = Path.join(System.tmp_dir!(), "symphony-project-profiles-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(root, "workspaces")
+    File.mkdir_p!(root)
+    write_projects_workflow!(workspace_root)
+
+    mix_source = create_test_repository!(Path.join(root, "mix-source"), "example-org/mix-app")
+    node_source = create_test_repository!(Path.join(root, "node-source"), "another-org/node-app")
+
+    profiles = [
+      project_repository("example-org/mix-app", mix_source)
+      |> Map.put(
+        "prepare_command",
+        "git clone --quiet '#{mix_source}' . && printf '%s\\n' 'mix-runtime' > runtime.txt && printf '%s\\n' \"$SYMPHONY_REPOSITORY\" > selected-repository.txt"
+      ),
+      project_repository("another-org/node-app", node_source)
+      |> Map.put(
+        "prepare_command",
+        "git clone --quiet '#{node_source}' . && printf '%s\\n' 'node-runtime' > runtime.txt && printf '%s\\n' \"$SYMPHONY_REPOSITORY\" > selected-repository.txt"
+      ),
+      %{"repository" => "broken-org/unready-app", "base_branch" => "main", "required_checks" => ["true"]}
+    ]
+
+    settings = tracker_settings(%{"repositories" => profiles})
+
+    items = [
+      issue_item("example-org/mix-app", 71, "Ready")
+      |> put_in(["content", "body"], "issue mentions another-org/node-app"),
+      issue_item("another-org/node-app", 72, "Ready"),
+      issue_item("broken-org/unready-app", 73, "Ready")
+    ]
+
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    assert :ok = Client.validate_settings(settings)
+
+    assert {:ok, issues} =
+             Client.fetch_issues_by_states_for_test(["Ready"], settings, fn _query, _variables, _settings ->
+               {:ok, %{status: 200, body: project_response(items)}}
+             end)
+
+    mix_issue = Enum.find(issues, &(&1.id == "example-org/mix-app#71"))
+    node_issue = Enum.find(issues, &(&1.id == "another-org/node-app#72"))
+    invalid_issue = Enum.find(issues, &(&1.id == "broken-org/unready-app#73"))
+
+    assert invalid_issue.dispatchable
+    assert invalid_issue.native_ref.repository_profile_error == :missing_prepare_command
+    assert {:error, {:repository_profile_invalid, :missing_prepare_command}} = Workspace.create_for_issue(invalid_issue)
+
+    assert {:ok, mix_workspace} = Workspace.create_for_issue(mix_issue)
+    assert File.read!(Path.join(mix_workspace, "runtime.txt")) == "mix-runtime\n"
+    assert File.read!(Path.join(mix_workspace, "selected-repository.txt")) == "example-org/mix-app\n"
+
+    assert {:ok, node_workspace} = Workspace.create_for_issue(node_issue)
+    assert File.read!(Path.join(node_workspace, "runtime.txt")) == "node-runtime\n"
+    assert File.read!(Path.join(node_workspace, "selected-repository.txt")) == "another-org/node-app\n"
+  end
+
   test "same-number issues in different repositories get independent tasks, workspaces, branches, and PRs" do
     root = Path.join(System.tmp_dir!(), "symphony-project-identity-#{System.unique_integer([:positive])}")
     workspace_root = Path.join(root, "workspaces")

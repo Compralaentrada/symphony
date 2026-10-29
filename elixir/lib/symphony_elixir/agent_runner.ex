@@ -100,7 +100,8 @@ defmodule SymphonyElixir.AgentRunner do
     workspace_opts = [
       require_existing_project_branch: has_pull_request? and phase_with_pr?(opts) and not diagnostic?,
       create_project_branch: not diagnostic?,
-      refresh_project_branch: refresh_project_branch?
+      refresh_project_branch: refresh_project_branch?,
+      skip_project_profile_prepare: diagnostic?
     ]
 
     case Workspace.create_for_issue(issue, worker_host, workspace_opts) do
@@ -127,8 +128,9 @@ defmodule SymphonyElixir.AgentRunner do
     else
       is_missing_pr_branch? = has_pull_request? and phase_with_pr?(opts) and reason == :project_branch_missing
       refresh_blocked? = refresh_project_branch? and reason in @workspace_refresh_blockers
+      profile_blocked? = match?({:repository_profile_invalid, _}, reason)
 
-      if refresh_blocked? or is_missing_pr_branch?,
+      if profile_blocked? or refresh_blocked? or is_missing_pr_branch?,
         do: {:phase_result, {:system_blocker, blocked_workspace_report(reason, issue)}},
         else: {:error, reason}
     end
@@ -247,6 +249,17 @@ defmodule SymphonyElixir.AgentRunner do
     }
   end
 
+  defp blocked_workspace_report({:repository_profile_invalid, reason}, issue) do
+    {summary, next_step} = repository_profile_blocker_content(reason, Pipeline.report_locale(issue))
+
+    %{
+      "outcome" => "blocked",
+      "summary" => summary,
+      "reason" => summary,
+      "next_step" => next_step
+    }
+  end
+
   defp blocked_workspace_report(reason, issue) when is_atom(reason) do
     {summary, next_step} = blocked_workspace_report_content(reason, Pipeline.report_locale(issue))
 
@@ -311,6 +324,60 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp blocked_workspace_report_content(:project_pr_head_unavailable, _locale),
     do: {"Symphony could not verify the PR head before QA/Review.", "Restore or create the PR, then move the issue from Blocked to Ready to rerun Build, QA, and Review."}
+
+  defp repository_profile_blocker_content(:missing_base_branch, :es),
+    do: {"El perfil del repositorio no configura base_branch.", "Configura la rama base del repositorio y mueve la issue de Blocked a Ready para reintentar."}
+
+  defp repository_profile_blocker_content(:missing_base_branch, _locale),
+    do: {"The repository profile does not configure base_branch.", "Configure the repository base branch, then move the issue from Blocked to Ready to retry."}
+
+  defp repository_profile_blocker_content(:missing_prepare_command, :es),
+    do: {"El perfil del repositorio no configura prepare_command.", "Configura el comando de preparación del workspace y mueve la issue de Blocked a Ready para reintentar."}
+
+  defp repository_profile_blocker_content(:missing_prepare_command, _locale),
+    do: {"The repository profile does not configure prepare_command.", "Configure the workspace preparation command, then move the issue from Blocked to Ready to retry."}
+
+  defp repository_profile_blocker_content(:missing_required_checks, :es),
+    do: {"El perfil del repositorio no configura required_checks.", "Configura al menos una comprobación requerida para este repositorio y mueve la issue de Blocked a Ready para reintentar."}
+
+  defp repository_profile_blocker_content(:missing_required_checks, _locale),
+    do: {"The repository profile does not configure required_checks.", "Configure at least one required check for this repository, then move the issue from Blocked to Ready to retry."}
+
+  defp repository_profile_blocker_content(:invalid_required_checks, :es),
+    do: {"El perfil del repositorio contiene required_checks inválidos.", "Corrige las comprobaciones requeridas y mueve la issue de Blocked a Ready para reintentar."}
+
+  defp repository_profile_blocker_content(:invalid_required_checks, _locale),
+    do: {"The repository profile contains invalid required_checks.", "Correct the required checks, then move the issue from Blocked to Ready to retry."}
+
+  defp repository_profile_blocker_content(:duplicate_repository_profile, :es),
+    do: {"Hay más de un perfil configurado para el repositorio.", "Deja un solo perfil para este repositorio y mueve la issue de Blocked a Ready para reintentar."}
+
+  defp repository_profile_blocker_content(:duplicate_repository_profile, _locale),
+    do: {"More than one profile is configured for this repository.", "Keep one profile for this repository, then move the issue from Blocked to Ready to retry."}
+
+  defp repository_profile_blocker_content(:repository_unavailable, :es),
+    do: {"No se pudo acceder al repositorio al preparar el workspace.", "Comprueba el acceso del host y la disponibilidad del repositorio, y mueve la issue de Blocked a Ready para reintentar."}
+
+  defp repository_profile_blocker_content(:repository_unavailable, _locale),
+    do: {"The repository could not be accessed while preparing the workspace.", "Check host access and repository availability, then move the issue from Blocked to Ready to retry."}
+
+  defp repository_profile_blocker_content({:base_branch_unavailable, branch}, :es),
+    do: {"La rama base configurada #{branch} no está disponible en el repositorio.", "Corrige base_branch en el perfil y mueve la issue de Blocked a Ready para reintentar."}
+
+  defp repository_profile_blocker_content({:base_branch_unavailable, branch}, _locale),
+    do: {"The configured base branch #{branch} is not available in the repository.", "Correct base_branch in the profile, then move the issue from Blocked to Ready to retry."}
+
+  defp repository_profile_blocker_content({:prepare_command_failed, status}, :es),
+    do: {"El comando prepare_command del perfil falló con código #{status}.", "Corrige el comando de preparación del workspace y mueve la issue de Blocked a Ready para reintentar."}
+
+  defp repository_profile_blocker_content({:prepare_command_failed, status}, _locale),
+    do: {"The profile prepare_command failed with exit status #{status}.", "Correct the workspace preparation command, then move the issue from Blocked to Ready to retry."}
+
+  defp repository_profile_blocker_content(_reason, :es),
+    do: {"El perfil del repositorio no está listo para preparar el workspace.", "Corrige la configuración o el acceso del perfil y mueve la issue de Blocked a Ready para reintentar."}
+
+  defp repository_profile_blocker_content(_reason, _locale),
+    do: {"The repository profile is not ready to prepare the workspace.", "Correct the profile configuration or access, then move the issue from Blocked to Ready to retry."}
 
   defp refresh_project_branch?(opts) do
     task = Keyword.get(opts, :pipeline_task, %{})
@@ -662,13 +729,23 @@ defmodule SymphonyElixir.AgentRunner do
   defp capture_handoff_attempt(_message, _key), do: :ok
 
   defp phase_instructions(phase, opts) do
-    if Keyword.get(opts, :diagnostic, false), do: diagnostic_phase_instructions(phase), else: pipeline_phase_instructions(phase, opts)
+    if Keyword.get(opts, :diagnostic, false), do: diagnostic_phase_instructions(phase, opts), else: pipeline_phase_instructions(phase, opts)
   end
 
-  defp diagnostic_phase_instructions(phase) do
+  defp diagnostic_phase_instructions(phase, opts) do
+    host_finding =
+      case Keyword.get(opts, :system_blocker_report) do
+        %{"summary" => summary} when is_binary(summary) ->
+          "The host preflight observed: #{summary}. Verify it when possible, then preserve it in the workpad and blocked report."
+
+        _ ->
+          ""
+      end
+
     """
     Pipeline lane: Diagnostic for #{phase}.
     Read the issue workpad and current-generation phase reports with `github_workflow` operation `read_workpad`. Independently inspect the task workspace and the repository's current pull request using read-only commands and GitHub reads. Diagnose why the normal phase cannot safely continue, using only saved task records and observed facts.
+    #{host_finding}
     Record the diagnosis and recovery step in the persistent workpad with `github_workflow` operation `workpad`, then use `github_workflow` operation `handoff`, outcome `blocked`, with the complete report matching the #{phase} JSON schema. The host verifies and checkpoints your report.
     Do not edit files, push, merge, or change the pull request. Do not guess at missing evidence.
     """
