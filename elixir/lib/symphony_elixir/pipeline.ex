@@ -3,6 +3,7 @@ defmodule SymphonyElixir.Pipeline do
 
   require Logger
 
+  alias SymphonyElixir.Codex.Skills
   alias SymphonyElixir.{Config, Pipeline.Findings, Pipeline.Store, PRBody, Tracker}
   alias SymphonyElixir.Tracker.Issue
 
@@ -159,10 +160,14 @@ defmodule SymphonyElixir.Pipeline do
         block_checkpoint_mismatch(existing, issue, reason)
 
       :ok ->
-        case prepare_task(existing, issue) do
-          {:ok, _task, _phase} = prepared -> finish_prepare(issue, prepared)
-          other -> other
-        end
+        prepare_checkpoint(issue, existing)
+    end
+  end
+
+  defp prepare_checkpoint(issue, existing) do
+    with {:ok, task} <- ensure_effective_config(existing, issue),
+         {:ok, _task, _phase} = prepared <- prepare_task(task, issue) do
+      finish_prepare(issue, prepared)
     end
   end
 
@@ -235,6 +240,7 @@ defmodule SymphonyElixir.Pipeline do
         "phase" => "build",
         "status" => "building",
         "attempts" => %{},
+        "effective_config" => Skills.effective_config(issue),
         "prior_findings" => [],
         "current_sha" => nil,
         "pr_number" => nil
@@ -283,6 +289,129 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp prepare_task(_task, _issue), do: :ignore
+
+  @spec record_skill_readiness(Issue.t(), map(), :ok | {:error, term()}) :: {:ok, map()} | {:error, term()}
+  def record_skill_readiness(%Issue{} = _issue, task, :ok) do
+    task = Map.delete(task, "skill_readiness")
+
+    with :ok <- Store.save_task(task), do: {:ok, task}
+  end
+
+  def record_skill_readiness(%Issue{} = issue, task, {:error, reason}) do
+    {summary, next_step} = skill_readiness_diagnostic(issue, task, reason)
+    task = Map.put(task, "skill_readiness", %{"status" => "failed", "reason" => summary, "next_step" => next_step})
+
+    with :ok <- Store.save_task(task), do: {:ok, task}
+  end
+
+  defp ensure_effective_config(%{"effective_config" => %{"skills" => skills}} = task, _issue) when is_map(skills),
+    do: {:ok, task}
+
+  defp ensure_effective_config(%{"status" => status} = task, %Issue{} = issue)
+       when status in ["building", "qa", "review", "blocked", "human_review"] do
+    task = Map.put(task, "effective_config", Skills.effective_config(issue))
+
+    with :ok <- Store.save_task(task), do: {:ok, task}
+  end
+
+  defp ensure_effective_config(task, _issue), do: {:ok, task}
+
+  defp skill_readiness_diagnostic(issue, task, {:required_skill_unavailable, skill, path}) do
+    skill_diagnostic(issue, task, skill, path, "missing", "unavailable")
+  end
+
+  defp skill_readiness_diagnostic(issue, task, {:required_skill_unavailable, skill, path, _reason}) do
+    skill_diagnostic(issue, task, skill, path, "missing", "unavailable")
+  end
+
+  defp skill_readiness_diagnostic(issue, task, {:skill_fingerprint_mismatch, skill, expected, actual, path}) do
+    skill_diagnostic(issue, task, skill, path, expected, actual)
+  end
+
+  defp skill_readiness_diagnostic(issue, task, {:skill_file_mismatch, skill, expected, actual, path}) do
+    skill_diagnostic(issue, task, skill, path, expected, actual)
+  end
+
+  defp skill_readiness_diagnostic(issue, task, {:skill_snapshot_unavailable, _status, output}) do
+    output = IO.iodata_to_binary(output)
+
+    case parse_skill_snapshot_error(output) do
+      {:file_mismatch, skill, path, expected, actual} ->
+        skill_diagnostic(issue, task, skill, Path.join([".agents", "skills", skill, path]), expected, actual)
+
+      {:fingerprint_mismatch, skill, expected, actual} ->
+        path = Path.join([".agents", "skills", skill, "CHECKSUMS.sha256"])
+        skill_diagnostic(issue, task, skill, path, expected, actual)
+
+      {:missing_file, skill, path} ->
+        skill_diagnostic(issue, task, skill, path, "missing", "unavailable")
+
+      {:file_list_mismatch, skill} ->
+        path = Path.join([".agents", "skills", skill])
+        skill_diagnostic(issue, task, skill, path, "catalog file set", "different file set")
+
+      nil ->
+        skill_readiness_diagnostic(issue, task, output)
+    end
+  end
+
+  defp skill_readiness_diagnostic(issue, _task, reason) do
+    if report_locale(issue) == :es do
+      {"No se pudo validar el catálogo de skills: #{inspect(reason)}",
+       "Compara los archivos indicados con el catálogo elixir/priv/skills/catalog.lock.json y restaura la versión fijada; la issue seguirá en Ready y Symphony volverá a comprobar readiness."}
+    else
+      {"The skill catalog could not be validated: #{inspect(reason)}",
+       "Compare the reported files with elixir/priv/skills/catalog.lock.json and restore the pinned version; the issue will remain Ready and Symphony will retry automatically."}
+    end
+  end
+
+  defp parse_skill_snapshot_error(output) do
+    patterns = [
+      {:file_mismatch, ~r/Skill file checksum mismatch: \.agents\/skills\/([a-z0-9-]+)\/(.+) expected=([[:xdigit:]]+) actual=([[:xdigit:]]+)/},
+      {:fingerprint_mismatch, ~r/Skill fingerprint mismatch: ([a-z0-9-]+) expected=([[:xdigit:]]+)\s+actual=([[:xdigit:]]+)/},
+      {:missing_file, ~r/Required skill file is missing: (\S+)/},
+      {:file_list_mismatch, ~r/Skill file list differs from the lock: ([a-z0-9-]+)/}
+    ]
+
+    Enum.find_value(patterns, fn {kind, pattern} ->
+      case Regex.run(pattern, output, capture: :all_but_first) do
+        nil -> nil
+        captures -> {kind, captures}
+      end
+    end)
+    |> normalize_skill_snapshot_error()
+  end
+
+  defp normalize_skill_snapshot_error({:file_mismatch, [skill, path, expected, actual]}), do: {:file_mismatch, skill, path, expected, actual}
+  defp normalize_skill_snapshot_error({:fingerprint_mismatch, [skill, expected, actual]}), do: {:fingerprint_mismatch, skill, expected, actual}
+
+  defp normalize_skill_snapshot_error({:missing_file, [path]}) do
+    skill = path |> Path.split() |> Enum.at(-2)
+    {:missing_file, skill, path}
+  end
+
+  defp normalize_skill_snapshot_error({:file_list_mismatch, [skill]}), do: {:file_list_mismatch, skill}
+  defp normalize_skill_snapshot_error(nil), do: nil
+
+  defp skill_diagnostic(issue, task, skill, path, expected, actual) do
+    pin = Enum.find(Skills.attempt_snapshot(issue, task, task["phase"]), &(&1["name"] == skill)) || %{}
+    version = pin["version"] || "unknown"
+    fingerprint = pin["fingerprint"] || expected
+    expected = if expected == "missing", do: fingerprint, else: expected
+    actual = if actual == "unavailable", do: "missing", else: actual
+
+    if report_locale(issue) == :es do
+      {
+        "La skill #{skill} no coincide con el catálogo fijado (esperado #{expected}, observado #{actual}) en #{path}.",
+        "Restaura #{path} a la versión #{version} con huella #{fingerprint}; la issue seguirá en Ready y Symphony volverá a comprobar readiness."
+      }
+    else
+      {
+        "Skill #{skill} does not match the pinned catalog (expected #{expected}, observed #{actual}) at #{path}.",
+        "Restore #{path} to version #{version} with fingerprint #{fingerprint}; the issue will remain Ready and Symphony will retry readiness."
+      }
+    end
+  end
 
   defp resume_blocked_task(%{"phase" => phase, "current_sha" => current_sha} = task, issue)
        when phase in ["qa", "review"] and is_binary(current_sha) do

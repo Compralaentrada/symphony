@@ -424,6 +424,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_kind: "memory",
       workspace_root: test_root,
       poll_interval_ms: 10,
+      hook_after_create: required_skill_fixture_hook(),
       hook_before_run: "printf '%s\\n' \"$$\" >> '#{hook_pid_file}'; mkfifo \"#{hook_fifo}\"; : > \"#{hook_marker}\"; read _ < \"#{hook_fifo}\"",
       hook_timeout_ms: 60_000
     )

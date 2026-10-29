@@ -132,6 +132,30 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
+  def handle_info({:skill_preflight_result, issue_id, pid, result}, %{running: running} = state) do
+    case Map.get(running, issue_id) do
+      %{pid: ^pid, skill_preflight: true} = entry ->
+        Process.demonitor(entry.ref, [:flush])
+        {_entry, state} = pop_running_entry(state, issue_id)
+        state = %{state | claimed: MapSet.delete(state.claimed, issue_id)}
+
+        case refresh_issue_for_dispatch(entry.preflight_issue) do
+          {:ok, issue} ->
+            {:noreply, finish_current_skill_preflight(state, issue, entry, result)}
+
+          {:skip, %Issue{} = issue} ->
+            cleanup_terminal_preflight_issue(issue, entry)
+            {:noreply, state}
+
+          _ ->
+            {:noreply, state}
+        end
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info(
         {:DOWN, ref, :process, _pid, reason},
         %{running: running} = state
@@ -145,7 +169,13 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
 
-        state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
+        state =
+          if running_entry[:skill_preflight] do
+            state = %{state | claimed: MapSet.delete(state.claimed, issue_id)}
+            schedule_pipeline_retry(state, running_entry.issue, running_entry.preflight_attempt, running_entry.worker_host, "Skill preflight exited", reason)
+          else
+            handle_agent_down(reason, state, issue_id, running_entry, session_id)
+          end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id} reason=#{inspect(reason)}")
 
@@ -745,6 +775,9 @@ defmodule SymphonyElixir.Orchestrator do
       nil ->
         release_issue_claim(state, issue_id)
 
+      %{skill_preflight: true} ->
+        state
+
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
         state = record_session_completion_totals(state, running_entry)
 
@@ -1199,21 +1232,29 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp claim_and_spawn_legacy_issue(state, issue, attempt, worker_host) do
+    spawn_skill_preflight(state, issue, nil, nil, attempt, worker_host)
+  end
+
+  defp claim_legacy_issue(state, issue, attempt, worker_host, skills_preflighted?) do
     case Tracker.claim_issue(issue) do
       result when result in [:ok, :ignore] ->
-        spawn_issue_on_worker_host(state, issue, attempt, self(), worker_host)
+        spawn_issue_on_worker_host(state, issue, attempt, self(), worker_host, skills_preflighted?)
 
       {:error, reason} ->
-        Logger.warning("Unable to claim tracker item for #{issue_context(issue)}: #{inspect(reason)}; scheduling retry")
-        next_attempt = if is_integer(attempt), do: attempt + 1, else: 1
-
-        schedule_issue_retry(state, issue.id, next_attempt, %{
-          identifier: issue.identifier,
-          issue_url: issue.url,
-          error: "tracker claim failed: #{inspect(reason)}",
-          worker_host: worker_host
-        })
+        retry_legacy_issue(state, issue, attempt, worker_host, reason, "tracker claim failed")
     end
+  end
+
+  defp retry_legacy_issue(state, issue, attempt, worker_host, reason, message) do
+    Logger.warning("#{message} for #{issue_context(issue)}: #{inspect(reason)}; scheduling retry")
+    next_attempt = if is_integer(attempt), do: attempt + 1, else: 1
+
+    schedule_issue_retry(state, issue.id, next_attempt, %{
+      identifier: issue.identifier,
+      issue_url: issue.url,
+      error: "#{message}: #{inspect(reason)}",
+      worker_host: worker_host
+    })
   end
 
   defp start_pipeline_issue(state, issue, retry_attempt, worker_host) do
@@ -1230,13 +1271,130 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp start_prepared_pipeline_issue(state, issue, task, phase, retry_attempt, worker_host) do
+    spawn_skill_preflight(state, issue, task, phase, retry_attempt, worker_host)
+  end
+
+  defp spawn_skill_preflight(state, issue, task, phase, attempt, worker_host) do
+    recipient = self()
+    runner = state.agent_runner
+
+    case Task.Supervisor.start_child(state.task_supervisor, fn ->
+           receive do
+             :run -> send(recipient, {:skill_preflight_result, issue.id, self(), preflight_skills(runner, issue, task, phase, worker_host)})
+           end
+         end) do
+      {:ok, pid} ->
+        ref = Process.monitor(pid)
+        entry = pipeline_running_entry(issue, task || %{}, phase, 0, attempt, worker_host, pid, ref)
+        entry = Map.merge(entry, %{skill_preflight: true, preflight_issue: issue, preflight_task: task, preflight_phase: phase, preflight_attempt: attempt})
+
+        cancel_preflight_retry(state.retry_attempts[issue.id])
+
+        send(pid, :run)
+        %{state | running: Map.put(state.running, issue.id, entry), claimed: MapSet.put(state.claimed, issue.id), retry_attempts: Map.delete(state.retry_attempts, issue.id)}
+
+      {:error, reason} ->
+        schedule_pipeline_retry(state, issue, attempt, worker_host, "Unable to start skill preflight", reason)
+    end
+  end
+
+  defp cancel_preflight_retry(%{timer_ref: timer_ref}) when is_reference(timer_ref), do: Process.cancel_timer(timer_ref)
+  defp cancel_preflight_retry(_retry), do: :ok
+
+  defp cleanup_terminal_preflight_issue(issue, entry) do
+    if terminal_issue_state?(issue.state, terminal_state_set()) and not pending_finalization_issue?(issue),
+      do: cleanup_issue_workspace(issue, entry)
+  end
+
+  defp finish_current_skill_preflight(state, issue, entry, result) do
+    fields = [:state, :labels, :branch_name, :native_ref]
+
+    if Map.take(issue, fields) == Map.take(entry.preflight_issue, fields),
+      do: finish_skill_preflight(state, issue, entry, result),
+      else: state
+  end
+
+  defp finish_skill_preflight(state, issue, %{preflight_phase: nil} = entry, {:ok, preflighted?}),
+    do: claim_legacy_issue(state, issue, entry.preflight_attempt, entry.worker_host, preflighted?)
+
+  defp finish_skill_preflight(state, issue, %{preflight_phase: nil} = entry, {:error, reason}),
+    do: retry_legacy_issue(state, issue, entry.preflight_attempt, entry.worker_host, reason, "skill readiness failed")
+
+  defp finish_skill_preflight(state, issue, entry, result) do
+    generation = entry.preflight_task["generation"]
+    expected_phase = entry.preflight_phase
+
+    case Pipeline.prepare(issue) do
+      {:ok, %{"generation" => ^generation} = task, ^expected_phase} ->
+        if Map.drop(task, ["skill_readiness"]) == Map.drop(entry.preflight_task, ["skill_readiness"]) do
+          apply_skill_preflight(state, issue, %{entry | preflight_task: task}, result)
+        else
+          state
+        end
+
+      _ ->
+        state
+    end
+  end
+
+  defp apply_skill_preflight(state, issue, entry, {:ok, preflighted?}) do
+    start_ready_pipeline_issue(
+      state,
+      issue,
+      entry.preflight_task,
+      entry.preflight_phase,
+      entry.preflight_attempt,
+      entry.worker_host,
+      preflighted?
+    )
+  end
+
+  defp apply_skill_preflight(state, issue, entry, {:error, {:workspace_preflight, reason}})
+       when reason in [:project_branch_dirty, :project_branch_diverged, :project_branch_missing] do
+    start_claimed_pipeline_issue(
+      state,
+      issue,
+      entry.preflight_task,
+      entry.preflight_phase,
+      entry.preflight_attempt,
+      entry.worker_host,
+      false
+    )
+  end
+
+  defp apply_skill_preflight(state, issue, entry, {:error, {:workspace_preflight, reason}}),
+    do: schedule_pipeline_retry(state, issue, entry.preflight_attempt, entry.worker_host, "Workspace preflight failed", reason)
+
+  defp apply_skill_preflight(state, issue, entry, {:error, reason}),
+    do: persist_skill_readiness_failure(state, issue, entry.preflight_task, reason)
+
+  defp start_ready_pipeline_issue(state, issue, task, phase, retry_attempt, worker_host, skills_preflighted?) do
+    case Pipeline.record_skill_readiness(issue, task, :ok) do
+      {:ok, task} ->
+        start_claimed_pipeline_issue(state, issue, task, phase, retry_attempt, worker_host, skills_preflighted?)
+
+      {:error, reason} ->
+        schedule_pipeline_retry(state, issue, retry_attempt, worker_host, "Unable to save skill readiness", reason)
+    end
+  end
+
+  defp start_claimed_pipeline_issue(state, issue, task, phase, retry_attempt, worker_host, skills_preflighted?) do
     claim_result = if pipeline_claimable_state?(issue), do: Tracker.claim_issue(issue), else: :ok
 
     case claim_result do
       result when result in [:ok, :ignore] ->
         case Pipeline.begin_phase(issue, task, phase) do
           {:ok, task, phase_attempt} ->
-            spawn_pipeline_worker(state, issue, task, phase, phase_attempt, retry_attempt, worker_host)
+            spawn_pipeline_worker(
+              state,
+              issue,
+              task,
+              phase,
+              phase_attempt,
+              retry_attempt,
+              worker_host,
+              skills_preflighted?
+            )
 
           {:error, reason} ->
             schedule_pipeline_retry(state, issue, retry_attempt, worker_host, "Unable to start pipeline phase", reason)
@@ -1247,17 +1405,54 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp persist_skill_readiness_failure(state, issue, task, reason) do
+    case Pipeline.record_skill_readiness(issue, task, {:error, reason}) do
+      {:ok, updated_task} ->
+        if task["skill_readiness"] != updated_task["skill_readiness"] do
+          Logger.warning("Skill readiness failed before claim for #{issue_context(issue)}: #{updated_task["skill_readiness"]["reason"]}; #{updated_task["skill_readiness"]["next_step"]}")
+        end
+
+        state
+
+      {:error, save_reason} ->
+        Logger.warning("Skill readiness failed before claim for #{issue_context(issue)}: #{inspect(reason)}; unable to persist diagnosis: #{inspect(save_reason)}")
+        state
+    end
+  end
+
+  defp preflight_skills(runner, issue, task, phase, worker_host) do
+    result =
+      if Code.ensure_loaded?(runner) and function_exported?(runner, :preflight_skills, 4) do
+        runner.preflight_skills(issue, task, phase, worker_host)
+      else
+        :ok
+      end
+
+    case result do
+      {:ok, :skills_preflighted} -> {:ok, true}
+      :ok -> {:ok, false}
+      {:error, _reason} = error -> error
+      other -> {:error, {:invalid_skill_preflight_result, other}}
+    end
+  end
+
   defp pipeline_claimable_state?(issue) do
     issue.state in ["Ready", "Building"]
   end
 
-  defp spawn_pipeline_worker(state, issue, task, phase, phase_attempt, retry_attempt, worker_host) do
+  defp spawn_pipeline_worker(state, issue, task, phase, phase_attempt, retry_attempt, worker_host, skills_preflighted?) do
     recipient = self()
     runner = state.agent_runner
 
     child = fn ->
       receive do
-        :run -> run_pipeline_phase(runner, recipient, issue, task, phase, phase_attempt, retry_attempt, worker_host)
+        :run ->
+          run_pipeline_phase(runner, recipient, issue, task, phase, %{
+            phase_attempt: phase_attempt,
+            retry_attempt: retry_attempt,
+            worker_host: worker_host,
+            skills_preflighted?: skills_preflighted?
+          })
       end
     end
 
@@ -1280,21 +1475,22 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp run_pipeline_phase(runner, recipient, issue, task, phase, phase_attempt, retry_attempt, worker_host) do
+  defp run_pipeline_phase(runner, recipient, issue, task, phase, runtime) do
     opts = [
-      attempt: retry_attempt,
-      worker_host: worker_host,
+      attempt: runtime.retry_attempt,
+      worker_host: runtime.worker_host,
       phase: String.to_existing_atom(phase),
       pipeline_task: task,
       generation: task["generation"],
-      phase_attempt: phase_attempt,
-      prior_findings: task["prior_findings"] || []
+      phase_attempt: runtime.phase_attempt,
+      prior_findings: task["prior_findings"] || [],
+      skills_preflighted: runtime.skills_preflighted?
     ]
 
     result = runner.run(issue, recipient, opts)
     result = diagnose_system_blocker(runner, issue, recipient, opts, result)
 
-    send(recipient, {:pipeline_phase_result, issue.id, task["generation"], phase, phase_attempt, result})
+    send(recipient, {:pipeline_phase_result, issue.id, task["generation"], phase, runtime.phase_attempt, result})
   end
 
   defp diagnose_system_blocker(runner, issue, recipient, opts, {:system_blocker, _report} = blocker) do
@@ -1339,12 +1535,12 @@ defmodule SymphonyElixir.Orchestrator do
     })
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, skills_preflighted?) do
     lease_token = if Tracker.agent_owned_writes?(), do: Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
 
     case begin_legacy_agent_lease(issue, lease_token) do
       :ok ->
-        spawn_legacy_agent(state, issue, attempt, recipient, worker_host, lease_token)
+        spawn_legacy_agent(state, issue, attempt, recipient, worker_host, lease_token, skills_preflighted?)
 
       {:error, reason} ->
         schedule_issue_retry(state, issue.id, attempt || 1, %{
@@ -1361,13 +1557,14 @@ defmodule SymphonyElixir.Orchestrator do
   defp begin_legacy_agent_lease(issue, token),
     do: Pipeline.Store.begin_agent_lease(issue.id, token)
 
-  defp spawn_legacy_agent(state, issue, attempt, recipient, worker_host, lease_token) do
+  defp spawn_legacy_agent(state, issue, attempt, recipient, worker_host, lease_token, skills_preflighted?) do
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
            try do
              AgentRunner.run(issue, recipient,
                attempt: attempt,
                worker_host: worker_host,
-               github_lease_token: lease_token
+               github_lease_token: lease_token,
+               skills_preflighted: skills_preflighted?
              )
            after
              end_legacy_agent_lease(issue, lease_token)
@@ -1607,6 +1804,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_active_retry(state, issue, attempt, metadata) do
+    if Map.has_key?(state.running, issue.id) do
+      {:noreply, state}
+    else
+      handle_active_retry_without_worker(state, issue, attempt, metadata)
+    end
+  end
+
+  defp handle_active_retry_without_worker(state, issue, attempt, metadata) do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
