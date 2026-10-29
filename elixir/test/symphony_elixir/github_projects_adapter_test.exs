@@ -570,80 +570,83 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert Enum.take(Agent.get(remote, &Enum.reverse(&1.events)), 3) == [:pull_request_read, :pull_request_read, :issue_closed]
   end
 
-  test "the diagnostic lane can block an invalid dependency after a Ready requeue" do
-    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
-    root = Path.join(System.tmp_dir!(), "symphony-project-diagnostic-finalize-#{System.unique_integer([:positive])}")
-    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+  for initial_status <- ["Ready", "Human Review"] do
+    test "the diagnostic lane can block an invalid dependency from #{initial_status}" do
+      initial_status = unquote(initial_status)
+      previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+      root = Path.join(System.tmp_dir!(), "symphony-project-diagnostic-finalize-#{System.unique_integer([:positive])}")
+      Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
 
-    on_exit(fn ->
-      case previous_path do
-        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
-        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      on_exit(fn ->
+        case previous_path do
+          {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+          :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+        end
+
+        File.rm_rf!(root)
+      end)
+
+      number = System.unique_integer([:positive])
+      issue_id = "octo/app##{number}"
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: issue_id,
+        url: "https://github.com/octo/app/issues/#{number}",
+        state: initial_status,
+        native_ref: %{repository: "octo/app", base_branch: "main", issue_node_id: "I_issue_#{number}"}
+      }
+
+      task = %{"issue_id" => issue_id, "generation" => 1, "phase" => "finalize", "attempts" => %{"finalize" => 1}}
+      assert :ok = Store.save_task(task)
+      assert :ok = Store.begin_phase(issue_id, 1, "finalize", 1)
+      {:ok, remote} = Agent.start_link(fn -> %{status: initial_status} end)
+
+      request_fun = fn query, _variables, _settings ->
+        Agent.get_and_update(remote, fn data ->
+          cond do
+            query =~ "SymphonyProject" ->
+              {{:ok, %{status: 200, body: project_response([issue_item("octo/app", number, data.status)])}}, data}
+
+            query =~ "SymphonyPipelineReportComments" ->
+              comments = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
+              body = %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}
+              {{:ok, %{status: 200, body: body}}, data}
+
+            query =~ "SymphonyAddIssueComment" ->
+              comment = %{"id" => "IC_diagnostic", "url" => "https://github.com/octo/app/issues/#{number}#issuecomment-1"}
+              body = %{"data" => %{"addComment" => %{"commentEdge" => %{"node" => comment}}}}
+              {{:ok, %{status: 200, body: body}}, data}
+
+            query =~ "SymphonySetProjectStatus" ->
+              body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
+              {{:ok, %{status: 200, body: body}}, %{data | status: "Blocked"}}
+
+            true ->
+              flunk("unexpected GitHub Projects query: #{query}")
+          end
+        end)
       end
 
-      File.rm_rf!(root)
-    end)
+      reason = "GitHub could not read complete blocker data. Correct the relationship, then move the Project item to Ready."
+      report = %{"outcome" => "blocked", "summary" => reason, "reason" => reason, "next_step" => "Correct the relationship, then move the Project item to Ready."}
+      markdown = "## Diagnostic report\n\n#{reason}\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
+      context = %{issue: issue, lane: :diagnostic, lease_phase: :finalize, generation: 1, attempt: 1, task: task}
 
-    number = System.unique_integer([:positive])
-    issue_id = "octo/app##{number}"
+      assert {:ok, result} =
+               Client.agent_operation(
+                 issue,
+                 context,
+                 "handoff",
+                 %{"outcome" => "blocked", "report" => report, "body" => markdown},
+                 tracker_settings: tracker_settings(),
+                 projects_request: request_fun
+               )
 
-    issue = %Issue{
-      id: issue_id,
-      identifier: issue_id,
-      url: "https://github.com/octo/app/issues/#{number}",
-      state: "Ready",
-      native_ref: %{repository: "octo/app", base_branch: "main", issue_node_id: "I_issue_#{number}"}
-    }
-
-    task = %{"issue_id" => issue_id, "generation" => 1, "phase" => "finalize", "attempts" => %{"finalize" => 1}}
-    assert :ok = Store.save_task(task)
-    assert :ok = Store.begin_phase(issue_id, 1, "finalize", 1)
-    {:ok, remote} = Agent.start_link(fn -> %{status: "Ready"} end)
-
-    request_fun = fn query, _variables, _settings ->
-      Agent.get_and_update(remote, fn data ->
-        cond do
-          query =~ "SymphonyProject" ->
-            {{:ok, %{status: 200, body: project_response([issue_item("octo/app", number, data.status)])}}, data}
-
-          query =~ "SymphonyPipelineReportComments" ->
-            comments = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
-            body = %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}
-            {{:ok, %{status: 200, body: body}}, data}
-
-          query =~ "SymphonyAddIssueComment" ->
-            comment = %{"id" => "IC_diagnostic", "url" => "https://github.com/octo/app/issues/#{number}#issuecomment-1"}
-            body = %{"data" => %{"addComment" => %{"commentEdge" => %{"node" => comment}}}}
-            {{:ok, %{status: 200, body: body}}, data}
-
-          query =~ "SymphonySetProjectStatus" ->
-            body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
-            {{:ok, %{status: 200, body: body}}, %{data | status: "Blocked"}}
-
-          true ->
-            flunk("unexpected GitHub Projects query: #{query}")
-        end
-      end)
+      assert result["project_item"]["status"] == "Blocked"
+      assert result["comment"]["id"] == "IC_diagnostic"
+      assert Agent.get(remote, & &1.status) == "Blocked"
     end
-
-    reason = "GitHub could not read complete blocker data. Correct the relationship, then move the Project item to Ready."
-    report = %{"outcome" => "blocked", "summary" => reason, "reason" => reason, "next_step" => "Correct the relationship, then move the Project item to Ready."}
-    markdown = "## Diagnostic report\n\n#{reason}\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
-    context = %{issue: issue, lane: :diagnostic, lease_phase: :finalize, generation: 1, attempt: 1, task: task}
-
-    assert {:ok, result} =
-             Client.agent_operation(
-               issue,
-               context,
-               "handoff",
-               %{"outcome" => "blocked", "report" => report, "body" => markdown},
-               tracker_settings: tracker_settings(),
-               projects_request: request_fun
-             )
-
-    assert result["project_item"]["status"] == "Blocked"
-    assert result["comment"]["id"] == "IC_diagnostic"
-    assert Agent.get(remote, & &1.status) == "Blocked"
   end
 
   test "merge gate merges only with approved checks and current SHA and base evidence" do

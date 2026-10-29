@@ -645,9 +645,9 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
     issue = %{
       issue("octo/app#48", 48)
-      | state: "Ready",
+      | state: "Human Review",
         dependency_error: reason,
-        native_ref: %{repository: "octo/app", base_branch: "main", project_status: "Ready"}
+        native_ref: %{repository: "octo/app", base_branch: "main", project_status: "Human Review"}
     }
 
     table = start_board([issue], %{})
@@ -2378,7 +2378,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
           [status_value(:review), status_value(:human_review)]
 
         "diagnostic" ->
-          Enum.map([:ready, :building, :qa, :review], &status_value/1)
+          Enum.map([:ready, :building, :qa, :review, :human_review], &status_value/1)
 
         "finalize" ->
           [status_value(:human_review), status_value(:ready)]

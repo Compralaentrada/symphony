@@ -1191,7 +1191,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp diagnostic_source_statuses(issue, settings) do
     if project_status(issue) == settings.statuses.ready,
       do: [settings.statuses.ready],
-      else: Enum.map([:building, :qa, :review], &Map.fetch!(settings.statuses, &1))
+      else: Enum.map([:building, :qa, :review, :human_review], &Map.fetch!(settings.statuses, &1))
   end
 
   defp handoff_pull_request(issue, context, _report, _tracker_settings, settings, request_fun)

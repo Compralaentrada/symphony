@@ -33,7 +33,8 @@ limpio en ese SHA. Si una tarea bloqueada en QA o Review vuelve de `Blocked` a `
 cambiado o sin PR, reinicia en `Build` y repite ambas fases. Si falla una comprobación previa, el
 agente del lane `diagnostic` lee el workpad e inspecciona el workspace y la PR antes de documentar el
 motivo y la recuperación en la issue y el Project. Symphony detecta el bloqueo y coordina esa sesión,
-pero no escribe en GitHub.
+pero no escribe en GitHub. Si Finalize detecta una dependencia inválida desde `Human Review`, el
+agente de diagnóstico puede solicitar `Blocked` mediante una herramienta mediada.
 Si un checkpoint de fase no coincide con el estado actual del tracker, conserva el trabajo y
 registra el bloqueo local sin cambiar el estado visible; mover la tarea a `Ready` permite reanudarla.
 Si Review quedó en Human Review tras una respuesta perdida, conserva ese estado y espera la decisión humana.

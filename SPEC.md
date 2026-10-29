@@ -1319,7 +1319,9 @@ Adapter output MUST satisfy Section 4.1.1. In addition:
 - A GitHub Projects issue with an open blocker waits without dispatch. A dependency diagnostic is
   dispatched only through the restricted diagnostic lane; the orchestrator MUST NOT write the
   Project status. The diagnostic agent requests `Blocked` and records a correction through the
-  mediated GitHub workflow. An unconfirmed status change leaves remote status authoritative and
+  mediated GitHub workflow. A pending Finalize diagnostic MAY request `Blocked` from `Human Review`;
+  an unconfirmed Review handoff that reaches `Human Review` still waits for a human decision. An
+  unconfirmed status change leaves remote status authoritative and
   MUST NOT start implementation; Symphony keeps a local blocked checkpoint instead of retrying
   automatically. If the item remains `Ready`, Symphony resumes only after it observes the item
   leave `Ready` and later return to `Ready`.

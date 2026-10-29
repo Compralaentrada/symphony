@@ -301,7 +301,9 @@ tracker:
   Malformed, ambiguous, incomplete, or permission-limited relations stay attached to the issue as
   `dependency_error` and enter the restricted diagnostic lane. That agent requests `Blocked` with
   the reason and correction through the mediated GitHub workflow. Transient tracker read failures
-  keep the existing retry behavior.
+  keep the existing retry behavior. A pending Finalize diagnostic may request `Blocked` from
+  `Human Review`; an unconfirmed Review handoff that reaches `Human Review` still waits for a human
+  decision.
 - Project items can belong to either a user or organization Project. The optional `graphql_url`
   setting defaults to `https://api.github.com/graphql`.
 - Tool: the Linear adapter advertises `linear_graphql`, accepting either a raw query string or an
