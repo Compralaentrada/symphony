@@ -58,7 +58,9 @@ If Codex reports that operator input, approval, or MCP elicitation is required, 
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. For the durable
 Projects pipeline, phase checkpoints and external-operation records are stored in SQLite at
 `~/.symphony/pipeline.sqlite3`; GitHub agent writes are verified remotely before Symphony advances
-the checkpoint. After the independent QA review, Symphony runs every `required_checks` command from
+the checkpoint. If a nonterminal checkpoint no longer matches the tracker state, Symphony records a
+local blocker with the reason and leaves the tracker unchanged; moving the item to Ready resumes the
+preserved work. After the independent QA review, Symphony runs every `required_checks` command from
 the repository profile in the task workspace and gives the evidence to the QA agent; missing or
 failed host checks cannot pass QA.
 A merge into the configured base branch is required before Symphony sets Done. Moving a Human Review
@@ -276,6 +278,9 @@ tracker:
 - Work identity is `owner/repository#number`. Claiming moves Ready to Building, successful completion
   moves Building to Done, and intervention-required failures move to Blocked with a comment. Transient
   failures retry on the existing backoff path.
+- A rejected GitHub handoff or a phase report with no handoff attempt gets one correction turn in
+  the same session; another rejection uses the normal retry path. A successful handoff without
+  returned evidence fails normally instead of risking a duplicate remote write.
 - Native GitHub `blocked by` relations populate `issue.blocked_by` with `owner/repository#number`
   identities. Incomplete or failed blocker reads fail the Project refresh instead of dropping
   dependency data.

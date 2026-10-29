@@ -20,6 +20,48 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert MapSet.new(ids) == MapSet.new(Enum.map(issues, & &1.id))
   end
 
+  test "pipeline reconciliation blocks a Build checkpoint that conflicts with QA until the item is Ready" do
+    issue = issue("octo/app#22", 22)
+    issue = %{issue | state: "QA", native_ref: Map.put(issue.native_ref, :project_status, "QA")}
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+
+    task = %{
+      "issue_id" => issue.id,
+      "repository" => "octo/app",
+      "branch" => issue.branch_name,
+      "base_branch" => "main",
+      "required_checks" => ["true"],
+      "generation" => 1,
+      "phase" => "build",
+      "status" => "building",
+      "attempts" => %{},
+      "prior_findings" => [],
+      "current_sha" => nil,
+      "pr_number" => nil
+    }
+
+    assert :ok = Store.save_task(task)
+    assert :ignore = Pipeline.prepare(issue)
+    assert {:ok, %{"status" => "blocked", "blocked_reason" => reason}} = Store.get_task(issue.id)
+    assert reason =~ "checkpoint is Build"
+    assert :ok = Store.save_task(task)
+    assert :ok = Pipeline.reconcile()
+
+    assert {:ok, %{"status" => "blocked", "blocked_reason" => reason}} = Store.get_task(issue.id)
+    assert reason =~ "checkpoint is Build"
+    assert reason =~ "tracker state is QA"
+    assert project_state(table, issue.id) == "QA"
+
+    ready_issue = %{issue | state: "Ready", requeueable: true, native_ref: Map.put(issue.native_ref, :project_status, "Ready")}
+    :ets.insert(table, {{:issue, issue.id}, ready_issue})
+
+    assert {:ok, %{"status" => "building", "phase" => "build"} = resumed, "build"} =
+             Pipeline.prepare(ready_issue)
+
+    refute Map.has_key?(resumed, "blocked_reason")
+  end
+
   test "report locale uses Spanish only for Spanish issue descriptions" do
     for {description, locale} <- [
           {"Implementar soporte para nuevas salas", :es},
@@ -33,6 +75,47 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
         ] do
       assert Pipeline.report_locale(%{issue("octo/app#42", 42) | description: description}) == locale
     end
+  end
+
+  test "Build finish recovers the validated PR body from successful remote handoff evidence" do
+    issue = issue("octo/app#56", 56)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    sha = String.duplicate("a", 40)
+    body = build(sha, issue.id)["pull_request_body"]
+
+    task = %{
+      "issue_id" => issue.id,
+      "generation" => 1,
+      "phase" => "build",
+      "attempts" => %{"build" => 1},
+      "status" => "building",
+      "branch" => issue.branch_name,
+      "base_branch" => "main",
+      "current_sha" => sha
+    }
+
+    assert :ok = Store.save_task(task)
+    assert :ok = Store.begin_phase(issue.id, 1, "build", 1)
+    :ets.insert(table, {{:remote_sha, issue.id}, sha})
+
+    report =
+      build(sha, issue.id)
+      |> Map.delete("pull_request_body")
+      |> Map.put("_remote_evidence", [
+        %{
+          "outcome" => "ready",
+          "issue" => %{"id" => issue.id},
+          "comment" => %{"id" => "comment-56", "url" => "https://github.com/octo/app/issues/56#issuecomment-1"},
+          "project_item" => %{"id" => "item-56", "status" => "QA"},
+          "pull_request" => %{"number" => 156, "url" => "https://github.com/octo/app/pull/156", "head_sha" => sha, "draft" => true},
+          "pull_request_body" => body,
+          "sha" => sha
+        }
+      ])
+
+    assert :ok = Pipeline.finish_phase(issue, task, "build", 1, report)
+    assert {:ok, %{"phase" => "qa", "status" => "qa"}} = Store.get_task(issue.id)
   end
 
   test "system-generated QA blockers require a diagnostic agent handoff" do
@@ -1705,14 +1788,13 @@ defmodule SymphonyElixir.PipelineIntegrationTest.DiagnosticAgent do
     if Keyword.get(opts, :diagnostic, false) do
       run_diagnostic(issue, opts)
     else
-      {:phase_result,
-       {:system_blocker,
-        %{
-          "outcome" => "blocked",
-          "summary" => "The host could not verify the accepted workspace SHA.",
-          "reason" => "The host could not verify the accepted workspace SHA.",
-          "next_step" => "Inspect the saved phase evidence and current PR."
-        }}}
+      {:system_blocker,
+       %{
+         "outcome" => "blocked",
+         "summary" => "The host could not verify the accepted workspace SHA.",
+         "reason" => "The host could not verify the accepted workspace SHA.",
+         "next_step" => "Inspect the saved phase evidence and current PR."
+       }}
     end
   end
 

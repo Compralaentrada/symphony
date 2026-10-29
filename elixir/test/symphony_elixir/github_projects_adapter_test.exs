@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.GitHubProjectsAdapterTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.GitHub.{AgentTool, Projects.Adapter, Projects.Client}
+  alias SymphonyElixir.GitHub.{AgentReport, AgentTool, Projects.Adapter, Projects.Client}
   alias SymphonyElixir.GitHubProjectsAdapterTest.FakeGitHubProjectsClient
   alias SymphonyElixir.Pipeline.Store
 
@@ -219,6 +219,148 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
                tracker_settings: tracker_settings(),
                projects_request: fn _query, _variables, _settings -> flunk("invalid PR bodies must fail before GitHub writes") end
              )
+  end
+
+  test "Build handoff returns the validated PR body in its evidence" do
+    number = 57
+    issue_id = "octo/app##{number}"
+    sha = String.duplicate("a", 40)
+    branch = "symphony/octo-app-#{number}"
+    root = Path.join(System.tmp_dir!(), "symphony-project-build-evidence-#{System.unique_integer([:positive])}")
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: issue_id,
+      title: "Persist Build evidence",
+      branch_name: branch,
+      state: "Building",
+      url: "https://github.com/octo/app/issues/#{number}",
+      native_ref: %{
+        repository: "octo/app",
+        project_status: "Building",
+        base_branch: "main",
+        issue_node_id: "I_issue_#{number}"
+      }
+    }
+
+    task = %{"branch" => branch, "base_branch" => "main", "required_checks" => ["true"]}
+    assert :ok = Store.save_task(%{"issue_id" => issue.id, "generation" => 1, "phase" => "build", "attempts" => %{"build" => 1}})
+    assert :ok = Store.begin_phase(issue.id, 1, "build", 1)
+    {:ok, remote} = Agent.start_link(fn -> %{status: "Building"} end)
+
+    request_fun = fn query, variables, _settings ->
+      Agent.get_and_update(remote, fn data ->
+        cond do
+          query =~ "SymphonyProject(" ->
+            {{:ok, %{status: 200, body: project_response([issue_item("octo/app", number, data.status)])}}, data}
+
+          query =~ "SymphonyPipelineDelivery" ->
+            body = %{"data" => %{"repository" => %{"ref" => %{"name" => branch, "target" => %{"oid" => sha}}}}}
+            {{:ok, %{status: 200, body: body}}, data}
+
+          query =~ "SymphonyPipelinePullRequest" ->
+            body = %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => []}}}}
+            {{:ok, %{status: 200, body: body}}, data}
+
+          query =~ "SymphonyPipelineRepository" ->
+            {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"id" => "R_octopus"}}}}}, data}
+
+          query =~ "createPullRequest" ->
+            pr = %{
+              "id" => "PR_#{number}",
+              "number" => number,
+              "url" => "https://github.com/octo/app/pull/#{number}",
+              "state" => "OPEN",
+              "isDraft" => true,
+              "mergedAt" => nil,
+              "baseRefName" => "main",
+              "headRefName" => branch,
+              "headRefOid" => sha,
+              "body" => variables["input"]["body"]
+            }
+
+            {{:ok, %{status: 200, body: %{"data" => %{"createPullRequest" => %{"pullRequest" => pr}}}}}, data}
+
+          query =~ "SymphonyPipelineReportComments" ->
+            comments = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
+            body = %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}
+            {{:ok, %{status: 200, body: body}}, data}
+
+          query =~ "SymphonyAddIssueComment" ->
+            comment = %{"id" => "IC_build", "url" => "https://github.com/octo/app/issues/#{number}#issuecomment-1"}
+            body = %{"data" => %{"addComment" => %{"commentEdge" => %{"node" => comment}}}}
+            {{:ok, %{status: 200, body: body}}, data}
+
+          query =~ "updateProjectV2ItemFieldValue" ->
+            body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
+            {{:ok, %{status: 200, body: body}}, %{data | status: "QA"}}
+
+          true ->
+            flunk("unexpected GitHub Projects query: #{query}")
+        end
+      end)
+    end
+
+    body = """
+    Fixes ##{number}
+
+    #### Context
+
+    Implements the assigned issue.
+
+    #### TL;DR
+
+    Implements the issue.
+
+    #### Summary
+
+    - Updated the implementation.
+
+    #### Alternatives
+
+    - Kept the existing implementation pattern.
+
+    #### Test Plan
+
+    - [x] Required checks passed.
+    """
+
+    report = %{
+      "outcome" => "ready",
+      "summary" => "Build completed.",
+      "pull_request_body" => body,
+      "criteria" => [],
+      "changes" => [],
+      "checks" => [],
+      "risks" => [],
+      "next_step" => "Continue to QA.",
+      "sha" => sha
+    }
+
+    markdown = "## Build report\n\nBuild completed.\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
+
+    assert {:ok, evidence} =
+             Client.agent_operation(
+               issue,
+               %{issue: issue, lane: :build, generation: 1, attempt: 1, task: task},
+               "handoff",
+               %{"outcome" => "ready", "report" => report, "body" => markdown},
+               tracker_settings: tracker_settings(),
+               projects_request: request_fun
+             )
+
+    assert evidence["pull_request_body"] == body
   end
 
   test "Finalize recovers and verifies the merged PR before closing the issue and moving it to Done" do
@@ -743,8 +885,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       identifier: issue_id,
       url: "https://github.com/octo/app/issues/#{number}",
       branch_name: "symphony/octo-app-#{number}",
-      state: "QA",
-      native_ref: %{repository: "octo/app", base_branch: "main", project_status: "QA", issue_node_id: "I_issue_#{number}"}
+      state: "Ready",
+      native_ref: %{repository: "octo/app", base_branch: "main", project_status: "Ready", issue_node_id: "I_issue_#{number}"}
     }
 
     task = %{
@@ -761,7 +903,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert :ok = Store.save_task(task)
     assert :ok = Store.begin_phase(issue_id, 1, "qa", 1)
 
-    {:ok, remote} = Agent.start_link(fn -> %{status: "QA", report_body: nil} end)
+    {:ok, remote} = Agent.start_link(fn -> %{status: "Ready", report_body: nil} end)
 
     request_fun = fn query, variables, _settings ->
       Agent.get_and_update(remote, fn data ->
@@ -800,7 +942,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
           query =~ "SymphonySetProjectStatus" ->
             body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
-            {{:ok, %{status: 200, body: body}}, %{data | status: "Building"}}
+            status = %{"option-qa" => "QA", "option-building" => "Building"}[variables["optionId"]]
+            {{:ok, %{status: 200, body: body}}, %{data | status: status}}
 
           true ->
             flunk("unexpected GitHub Projects query: #{query}")
@@ -816,7 +959,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "findings" => [finding],
       "next_step" => "Fix the defect.",
       "sha" => sha,
-      "checks" => [%{"name" => "mix test", "status" => "passed", "evidence" => "exit status 0"}]
+      "checks" => [%{"name" => "mix test", "status" => "failed", "evidence" => "stale agent result"}]
     }
 
     markdown = "## QA report\n\nQA found a defect.\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
@@ -830,6 +973,19 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       host_checks: [%{"name" => "mix test", "status" => "passed", "evidence" => "exit status 0"}],
       tracker_kind: "github_projects"
     }
+
+    claim =
+      AgentTool.execute(
+        "github_workflow",
+        %{"operation" => "claim"},
+        agent_context: context,
+        tracker_settings: tracker_settings(),
+        projects_request: request_fun
+      )
+
+    assert claim["success"], claim["output"]
+    assert claim["evidence"]["project_item"]["status"] == "QA"
+    assert Agent.get(remote, & &1.status) == "QA"
 
     handoff =
       AgentTool.execute(
@@ -845,8 +1001,11 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     assert Agent.get(remote, & &1.status) == "Building"
 
-    assert Agent.get(remote, & &1.report_body) ==
-             "<!-- symphony:report:start:#{issue_id}:1:qa:1 -->\n#{markdown}\n<!-- symphony:report:end -->"
+    stored_comment = Agent.get(remote, & &1.report_body)
+    assert stored_comment =~ "<!-- symphony:report:start:#{issue_id}:1:qa:1 -->"
+    assert stored_comment =~ "## QA report\n\nQA found a defect.\n\n"
+    assert {:ok, stored_report} = AgentReport.decode_comment(stored_comment)
+    assert stored_report["checks"] == context.host_checks
 
     workpad_result =
       AgentTool.execute(
@@ -862,28 +1021,6 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert workpad["report_context"]["task"]["required_checks"] == ["mix test"]
     assert workpad["report_context"]["host_checks"] == context.host_checks
     assert workpad["report_context"]["qa_text"]["checks_failed"] == "One or more required host checks failed or were missing."
-
-    mismatched =
-      AgentTool.execute(
-        "github_workflow",
-        %{
-          "operation" => "handoff",
-          "outcome" => "defects_found",
-          "report" => report,
-          "body" =>
-            String.replace(
-              markdown,
-              Jason.encode!(report, pretty: true),
-              Jason.encode!(Map.put(report, "summary", "Different hidden summary."), pretty: true)
-            )
-        },
-        agent_context: context,
-        tracker_settings: tracker_settings(),
-        projects_request: fn _query, _variables, _settings -> flunk("invalid reports must fail before GitHub writes") end
-      )
-
-    refute mismatched["success"]
-    assert Jason.decode!(mismatched["output"])["error"]["reason"] == ":github_agent_report_json_mismatch"
 
     visible_json =
       AgentTool.execute(
@@ -918,15 +1055,28 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     for {body, current_report, reason} <- [
           {nil, report, :invalid_github_agent_report_body},
           {"## QA report\n\nText only.", report, :missing_github_agent_report_json},
-          {markdown <> "\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->", report, :invalid_github_agent_report_json},
-          {"## QA report\n\n<!-- symphony:report:json\nnot JSON\n-->", report, :invalid_github_agent_report_json},
-          {"## QA report\n\n<!-- symphony:report:json\n#{unsafe_json}\n-->", unsafe_report, :unsafe_github_agent_report_json}
+          {markdown <> "\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->", report, :invalid_github_agent_report_json}
         ] do
       invalid = invalid_handoff.(body, current_report)
 
       refute invalid["success"]
       assert Jason.decode!(invalid["output"])["error"]["reason"] == ":#{reason}"
     end
+
+    unsafe_body = "## QA report\n\n<!-- symphony:report:json\n#{unsafe_json}\n-->"
+    assert {:error, :unsafe_github_agent_report_json} = AgentReport.validate_body(unsafe_body, unsafe_report)
+    assert {:ok, safe_body} = AgentReport.normalize_body(unsafe_body, unsafe_report)
+    assert safe_body =~ "--\\u003e"
+    assert :ok = AgentReport.validate_body(safe_body, unsafe_report)
+    assert {:error, :invalid_github_agent_report_body} = AgentReport.validate_body(nil, report)
+    assert {:error, :invalid_github_agent_report_body} = AgentReport.normalize_body(nil, report)
+
+    duplicate_blocks = "<!-- symphony:report:json\n{}\n-->\n<!-- symphony:report:json\n{}\n-->"
+    assert {:error, :missing_github_agent_report_json} = AgentReport.validate_body("plain text", report)
+    assert {:error, :invalid_github_agent_report_json} = AgentReport.validate_body(duplicate_blocks, report)
+
+    assert {:error, :invalid_github_agent_report_json} =
+             AgentReport.normalize_body(unsafe_body, Map.put(unsafe_report, "unsupported", self()))
   end
 
   test "Review defects return the Project item to Building" do
@@ -952,11 +1102,11 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       identifier: issue_id,
       url: "https://github.com/octo/app/issues/#{number}",
       branch_name: "symphony/octo-app-#{number}",
-      state: "Review",
+      state: "Ready",
       native_ref: %{
         repository: "octo/app",
         base_branch: "main",
-        project_status: "Review",
+        project_status: "Ready",
         issue_node_id: "I_issue_#{number}"
       }
     }
@@ -973,9 +1123,9 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     assert :ok = Store.save_task(task)
     assert :ok = Store.begin_phase(issue_id, 1, "review", 1)
-    {:ok, remote} = Agent.start_link(fn -> %{status: "Review", draft: false} end)
+    {:ok, remote} = Agent.start_link(fn -> %{status: "Ready", draft: false} end)
 
-    request_fun = fn query, _variables, _settings ->
+    request_fun = fn query, variables, _settings ->
       Agent.get_and_update(remote, fn data ->
         cond do
           query =~ "SymphonyProject(" ->
@@ -1024,7 +1174,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
           query =~ "SymphonySetProjectStatus" ->
             body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
-            {{:ok, %{status: 200, body: body}}, %{data | status: "Building"}}
+            status = %{"option-review" => "Review", "option-building" => "Building"}[variables["optionId"]]
+            {{:ok, %{status: 200, body: body}}, %{data | status: status}}
 
           true ->
             flunk("unexpected GitHub Projects query: #{query}")
@@ -1047,7 +1198,20 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     markdown = "## Review report\n\nReview found a defect.\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
 
-    context = %{issue: issue, lane: :review, generation: 1, attempt: 1, task: task}
+    context = %{issue: issue, lane: :review, generation: 1, attempt: 1, task: task, tracker_kind: "github_projects"}
+
+    claim =
+      AgentTool.execute(
+        "github_workflow",
+        %{"operation" => "claim"},
+        agent_context: context,
+        tracker_settings: tracker_settings(),
+        projects_request: request_fun
+      )
+
+    assert claim["success"], claim["output"]
+    assert claim["evidence"]["project_item"]["status"] == "Review"
+    assert Agent.get(remote, & &1.status) == "Review"
 
     assert {:ok,
             %{

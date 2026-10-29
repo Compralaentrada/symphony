@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.Pipeline do
   @moduledoc false
 
+  require Logger
+
   alias SymphonyElixir.{Config, Pipeline.Findings, Pipeline.Store, PRBody, Tracker}
   alias SymphonyElixir.Tracker.Issue
 
@@ -143,13 +145,23 @@ defmodule SymphonyElixir.Pipeline do
 
     case Store.pending_operations(issue.id) do
       {:ok, []} ->
+        prepare_from_checkpoint_without_pending(issue, existing)
+
+      _ ->
+        :ignore
+    end
+  end
+
+  defp prepare_from_checkpoint_without_pending(issue, existing) do
+    case checkpoint_state_mismatch(existing, issue) do
+      {:mismatch, reason} ->
+        block_checkpoint_mismatch(existing, issue, reason)
+
+      :ok ->
         case prepare_task(existing, issue) do
           {:ok, _task, _phase} = prepared -> finish_prepare(issue, prepared)
           other -> other
         end
-
-      _ ->
-        :ignore
     end
   end
 
@@ -296,7 +308,7 @@ defmodule SymphonyElixir.Pipeline do
     do: task |> Map.put("phase", "build") |> Map.put("current_sha", nil) |> resume_blocked_task()
 
   defp resume_blocked_task(task) do
-    task = Map.put(task, "status", "building")
+    task = task |> Map.put("status", "building") |> Map.delete("blocked_reason")
     with :ok <- Store.save_task(task), do: {:ok, task, task["phase"]}
   end
 
@@ -508,7 +520,46 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp reconcile_nonterminal_task(_issue, _task), do: :ok
+  defp reconcile_nonterminal_task(issue, task) do
+    case checkpoint_state_mismatch(task, issue) do
+      {:mismatch, reason} -> block_checkpoint_mismatch(task, issue, reason)
+      :ok -> :ok
+    end
+  end
+
+  defp checkpoint_state_mismatch(%{"status" => status} = task, %Issue{state: issue_state})
+       when status in ["building", "qa", "review", "finalize"] do
+    expected_states =
+      case status do
+        "building" -> [status_value(task, :ready), status_value(task, :building)]
+        "qa" -> [status_value(task, :qa)]
+        "review" -> [status_value(task, :review)]
+        "finalize" -> [status_value(task, :human_review), status_value(task, :building), status_value(task, :done), "closed"]
+      end
+
+    if issue_state in expected_states or issue_state in [status_value(task, :done), status_value(task, :dropped), "closed"] do
+      :ok
+    else
+      phase = task["phase"] || status
+      {:mismatch, "Pipeline checkpoint is #{String.capitalize(to_string(phase))} but tracker state is #{issue_state}; review the workpad and move the item to Ready to resume safely."}
+    end
+  end
+
+  defp checkpoint_state_mismatch(_task, _issue), do: :ok
+
+  defp block_checkpoint_mismatch(task, issue, reason) do
+    blocked = task |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
+
+    case Store.save_task(blocked) do
+      :ok ->
+        Logger.warning("Pipeline checkpoint mismatch for issue_id=#{issue.id} issue_identifier=#{issue.identifier}: #{reason}; leaving tracker state unchanged")
+        :ignore
+
+      {:error, _reason} = error ->
+        Logger.error("Unable to persist pipeline checkpoint mismatch for issue_id=#{issue.id} issue_identifier=#{issue.identifier}: #{inspect(error)}")
+        error
+    end
+  end
 
   defp reconcile_unmerged_done(issue, task, status) do
     _ = {issue, task, status}
@@ -748,8 +799,14 @@ defmodule SymphonyElixir.Pipeline do
 
   defp normalize_remote_result(result, phase) when phase in ["build", "review", "finalize"] do
     case remote_handoff(result) do
-      %{"outcome" => outcome} when is_binary(outcome) -> Map.put(result, "outcome", outcome)
-      _ -> result
+      %{"outcome" => "ready", "pull_request_body" => body} when phase == "build" and is_binary(body) ->
+        Map.merge(result, %{"outcome" => "ready", "pull_request_body" => body})
+
+      %{"outcome" => outcome} when is_binary(outcome) ->
+        Map.put(result, "outcome", outcome)
+
+      _ ->
+        result
     end
   end
 
