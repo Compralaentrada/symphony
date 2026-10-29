@@ -603,7 +603,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Live"
     assert html =~ "Offline"
     assert html =~ "Copy ID"
-    assert html =~ "Codex update"
+    assert html =~ "Latest activity"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
@@ -653,6 +653,65 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     refute render(view) =~ "javascript:alert"
+  end
+
+  test "dashboard liveview orders active sessions by latest runtime activity" do
+    now = DateTime.utc_now()
+    [base_entry] = static_snapshot().running
+
+    older_entry = %{
+      base_entry
+      | identifier: "MT-OLDER",
+        issue_url: "https://example.org/issues/MT-OLDER",
+        state: "Building",
+        last_codex_message: "older update",
+        last_codex_timestamp: DateTime.add(now, -30, :second),
+        started_at: DateTime.add(now, -120, :second)
+    }
+
+    newer_entry = %{
+      base_entry
+      | identifier: "MT-NEWER",
+        issue_url: "https://example.org/issues/MT-NEWER",
+        state: "QA",
+        last_codex_message: "newest update",
+        last_codex_timestamp: DateTime.add(now, -5, :second),
+        started_at: DateTime.add(now, -60, :second)
+    }
+
+    snapshot = put_in(static_snapshot().running, [older_entry, newer_entry])
+    orchestrator_name = Module.concat(__MODULE__, :TimelineOrchestrator)
+
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot})
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ ~s(class="session-timeline")
+    assert html =~ "MT-NEWER"
+    assert html =~ "MT-OLDER"
+    assert html =~ "Latest activity"
+    assert html =~ "Duration"
+    assert html =~ "newest update"
+    assert html =~ "older update"
+    assert html =~ ~s(href="/api/v1/MT-NEWER")
+    assert html =~ ~s(href="/api/v1/MT-OLDER")
+    assert :binary.match(html, "MT-NEWER") < :binary.match(html, "MT-OLDER")
+    assert html =~ "1m"
+    assert html =~ "2m"
+  end
+
+  test "dashboard liveview keeps the empty active session state" do
+    snapshot = put_in(static_snapshot().running, [])
+    orchestrator_name = Module.concat(__MODULE__, :EmptyTimelineOrchestrator)
+
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot})
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "No active sessions."
+    refute html =~ ~s(class="session-timeline")
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do

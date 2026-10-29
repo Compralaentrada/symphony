@@ -207,88 +207,48 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <div class="section-header">
             <div>
               <h2 class="section-title">Running sessions</h2>
-              <p class="section-copy">Active issues, last known agent activity, and token usage.</p>
+              <p class="section-copy">Current runtime activity, ordered newest first.</p>
             </div>
           </div>
 
           <%= if @payload.running == [] do %>
             <p class="empty-state">No active sessions.</p>
           <% else %>
-            <div class="table-wrap">
-              <table class="data-table data-table-running">
-                <colgroup>
-                  <col style="width: 12rem;" />
-                  <col style="width: 8rem;" />
-                  <col style="width: 7.5rem;" />
-                  <col style="width: 8.5rem;" />
-                  <col />
-                  <col style="width: 10rem;" />
-                </colgroup>
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>State</th>
-                    <th>Session</th>
-                    <th>Runtime / turns</th>
-                    <th>Codex update</th>
-                    <th>Tokens</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.running}>
-                    <td>
-                      <div class="issue-stack">
-                        <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
-                      </div>
-                    </td>
-                    <td>
-                      <span class={state_badge_class(entry.state)}>
-                        <%= entry.state %>
-                      </span>
-                    </td>
-                    <td>
-                      <div class="session-stack">
-                        <%= if entry.session_id do %>
-                          <button
-                            type="button"
-                            class="subtle-button"
-                            data-label="Copy ID"
-                            data-copy={entry.session_id}
-                            onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
-                          >
-                            Copy ID
-                          </button>
-                        <% else %>
-                          <span class="muted">n/a</span>
-                        <% end %>
-                      </div>
-                    </td>
-                    <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
-                    <td>
-                      <div class="detail-stack">
-                        <span
-                          class="event-text"
-                          title={entry.last_message || to_string(entry.last_event || "n/a")}
-                        ><%= entry.last_message || to_string(entry.last_event || "n/a") %></span>
-                        <span class="muted event-meta">
-                          <%= entry.last_event || "n/a" %>
-                          <%= if entry.last_event_at do %>
-                            · <span class="mono numeric"><%= entry.last_event_at %></span>
-                          <% end %>
-                        </span>
-                      </div>
-                    </td>
-                    <td>
-                      <div class="token-stack numeric">
-                        <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
-                        <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
-                      </div>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
+            <ol class="session-timeline" aria-label="Active sessions ordered by latest activity">
+              <li :for={entry <- sort_by_recent_activity(@payload.running)} class="session-timeline-item">
+                <span class="session-timeline-marker" aria-hidden="true"></span>
+                <article class="session-timeline-entry">
+                  <header class="session-timeline-header">
+                    <div class="issue-stack">
+                      <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
+                      <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                    </div>
+                    <span class={state_badge_class(entry.state)}>
+                      <%= entry.state %>
+                    </span>
+                  </header>
+
+                  <p class="session-timeline-activity">
+                    <%= entry.last_message || to_string(entry.last_event || "No activity reported yet") %>
+                  </p>
+
+                  <div class="session-timeline-meta">
+                    <div>
+                      <span class="session-timeline-label">Duration</span>
+                      <span class="numeric"><%= format_runtime_seconds(runtime_seconds_from_started_at(entry.started_at, @now)) %></span>
+                    </div>
+                    <div>
+                      <span class="session-timeline-label">Latest activity</span>
+                      <%= if entry.last_event_at do %>
+                        <time class="mono numeric" datetime={entry.last_event_at}><%= entry.last_event_at %></time>
+                      <% else %>
+                        <span class="muted">No activity reported yet</span>
+                      <% end %>
+                    </div>
+                  </div>
+                </article>
+              </li>
+            </ol>
           <% end %>
         </section>
 
@@ -469,12 +429,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
       end)
   end
 
-  defp format_runtime_and_turns(started_at, turn_count, now) when is_integer(turn_count) and turn_count > 0 do
-    "#{format_runtime_seconds(runtime_seconds_from_started_at(started_at, now))} / #{turn_count}"
+  defp sort_by_recent_activity(entries) do
+    Enum.sort_by(entries, &(&1.last_event_at || &1.started_at || ""), :desc)
   end
-
-  defp format_runtime_and_turns(started_at, _turn_count, now),
-    do: format_runtime_seconds(runtime_seconds_from_started_at(started_at, now))
 
   defp format_runtime_seconds(seconds) when is_number(seconds) do
     whole_seconds = max(trunc(seconds), 0)
