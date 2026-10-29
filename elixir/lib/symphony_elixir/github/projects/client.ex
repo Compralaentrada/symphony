@@ -1575,6 +1575,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     end
   end
 
+  defp validate_github_checks(%{"statusCheckRollup" => nil}), do: :ok
+
   defp validate_github_checks(pr) do
     if get_in(pr, ["statusCheckRollup", "state"]) == "SUCCESS",
       do: :ok,

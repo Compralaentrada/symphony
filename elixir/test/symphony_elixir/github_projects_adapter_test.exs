@@ -496,6 +496,10 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
     assert Enum.any?(queries, &(&1 =~ "SymphonyPipelinePullRequest"))
 
+    {without_github_checks, queries} = run_merge_gate(%{github_check_rollup: nil})
+    assert {:ok, %{"outcome" => "merged", "pull_request" => %{"merged" => true}}} = without_github_checks
+    assert Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
+
     {already_merged, queries} = run_merge_gate(%{pr_state: "MERGED"})
     assert {:ok, %{"outcome" => "merged", "pull_request" => %{"merged" => true}}} = already_merged
     refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
@@ -2085,7 +2089,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
             "baseRefOid" => Map.get(options, :pr_base_sha, current_base_sha),
             "headRefName" => branch,
             "headRefOid" => Map.get(options, :pr_head_sha, sha),
-            "statusCheckRollup" => %{"state" => Map.get(options, :github_check_status, "SUCCESS")}
+            "statusCheckRollup" => Map.get(options, :github_check_rollup, %{"state" => Map.get(options, :github_check_status, "SUCCESS")})
           }
 
           current_ref = merge_gate_base_ref(current_base_sha)
