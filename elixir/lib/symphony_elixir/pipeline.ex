@@ -38,13 +38,14 @@ defmodule SymphonyElixir.Pipeline do
 
   @spec delivery_tasks() :: {:ok, [map()]} | {:error, term()}
   def delivery_tasks do
-    with {:ok, tasks} <- Store.tasks() do
+    with {:ok, tasks} <- Store.tasks(),
+         {:ok, phase_results} <- latest_phase_results(tasks) do
       issue_ids = Enum.map(tasks, & &1["issue_id"])
 
       tracker_issues =
         if issue_ids == [], do: {:ok, []}, else: Tracker.fetch_issues_by_ids(issue_ids)
 
-      {:ok, project_delivery_tasks(tasks, tracker_issues)}
+      {:ok, project_delivery_tasks(tasks, tracker_issues, phase_results)}
     end
   end
 
@@ -177,7 +178,16 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp project_delivery_tasks(tasks, {:ok, issues}) do
+  defp latest_phase_results(tasks) do
+    Enum.reduce_while(tasks, {:ok, %{}}, fn task, {:ok, results} ->
+      case Store.latest_phase_result(task["issue_id"], task["generation"]) do
+        {:ok, result} -> {:cont, {:ok, Map.put(results, task["issue_id"], result)}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp project_delivery_tasks(tasks, {:ok, issues}, phase_results) do
     issues_by_id = Map.new(issues, &{&1.id, &1})
 
     Enum.map(tasks, fn task ->
@@ -199,13 +209,21 @@ defmodule SymphonyElixir.Pipeline do
             %{"lookup" => "missing", "issue" => nil}
         end
 
-      %{"task" => task, "tracker_issue" => tracker_issue}
+      %{
+        "task" => task,
+        "latest_phase_result" => Map.get(phase_results, task["issue_id"]),
+        "tracker_issue" => tracker_issue
+      }
     end)
   end
 
-  defp project_delivery_tasks(tasks, {:error, _reason}) do
+  defp project_delivery_tasks(tasks, {:error, _reason}, phase_results) do
     Enum.map(tasks, fn task ->
-      %{"task" => task, "tracker_issue" => %{"lookup" => "error", "issue" => nil}}
+      %{
+        "task" => task,
+        "latest_phase_result" => Map.get(phase_results, task["issue_id"]),
+        "tracker_issue" => %{"lookup" => "error", "issue" => nil}
+      }
     end)
   end
 

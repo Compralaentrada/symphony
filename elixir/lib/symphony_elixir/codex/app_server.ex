@@ -14,6 +14,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   @type session :: %{
           port: port(),
           metadata: map(),
+          model: String.t() | nil,
+          reasoning_effort: String.t() | nil,
           approval_policy: String.t() | map(),
           auto_approve_requests: boolean(),
           thread_sandbox: String.t(),
@@ -47,7 +49,9 @@ defmodule SymphonyElixir.Codex.AppServer do
       end
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
+         codex_command = Config.settings!().codex.command,
+         session_settings = configured_session_settings(codex_command),
+         {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding, codex_command) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
@@ -57,6 +61,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          %{
            port: port,
            metadata: metadata,
+           model: session_settings.model,
+           reasoning_effort: session_settings.reasoning_effort,
            approval_policy: session_policies.approval_policy,
            auto_approve_requests: session_policies.approval_policy == "never",
            thread_sandbox: session_policies.thread_sandbox,
@@ -203,7 +209,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, nil, dynamic_tool_binding) do
+  defp start_port(workspace, nil, dynamic_tool_binding, codex_command) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
@@ -216,7 +222,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding))],
+            args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding, codex_command))],
             cd: String.to_charlist(workspace),
             env: tracker_secret_port_env(dynamic_tool_binding),
             line: @port_line_bytes
@@ -227,28 +233,96 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, worker_host, dynamic_tool_binding) when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace, dynamic_tool_binding)
+  defp start_port(workspace, worker_host, dynamic_tool_binding, codex_command) when is_binary(worker_host) do
+    remote_command = remote_launch_command(workspace, dynamic_tool_binding, codex_command)
     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
   end
 
-  defp local_launch_command(dynamic_tool_binding) do
+  defp local_launch_command(dynamic_tool_binding, codex_command) do
     [
       tracker_secret_unset_command(dynamic_tool_binding),
-      "exec #{Config.settings!().codex.command}"
+      "exec #{codex_command}"
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" && ")
   end
 
-  defp remote_launch_command(workspace, dynamic_tool_binding) when is_binary(workspace) do
+  defp remote_launch_command(workspace, dynamic_tool_binding, codex_command) when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
       tracker_secret_unset_command(dynamic_tool_binding),
-      "exec #{Config.settings!().codex.command}"
+      "exec #{codex_command}"
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" && ")
+  end
+
+  defp configured_session_settings(command) do
+    [executable | arguments] = OptionParser.split(command)
+
+    if Path.basename(executable) == "codex" do
+      {options, _arguments, _invalid} =
+        OptionParser.parse(arguments,
+          switches: [config: :keep, model: :keep],
+          aliases: [c: :config, m: :model]
+        )
+
+      %{
+        model: options |> configured_values("model") |> unique_session_setting(),
+        reasoning_effort: options |> configured_values("model_reasoning_effort") |> unique_session_setting()
+      }
+    else
+      %{model: nil, reasoning_effort: nil}
+    end
+  rescue
+    _ -> %{model: nil, reasoning_effort: nil}
+  end
+
+  defp configured_values(options, key) do
+    direct_values = if key == "model", do: Keyword.get_values(options, :model), else: []
+
+    config_values =
+      options
+      |> Keyword.get_values(:config)
+      |> Enum.map(&config_value(&1, key))
+      |> Enum.reject(&is_nil/1)
+
+    direct_values ++ config_values
+  end
+
+  defp config_value(config, key) when is_binary(config) do
+    case String.split(config, "=", parts: 2) do
+      [^key, value] -> value
+      _ -> nil
+    end
+  end
+
+  defp config_value(_config, _key), do: nil
+
+  defp session_setting_value(value) when is_binary(value) do
+    value = value |> String.trim() |> strip_session_setting_quotes()
+    if is_binary(value) and value != "" and not String.contains?(value, ["$", "`", "\n", "\r"]), do: value
+  end
+
+  defp session_setting_value(_value), do: nil
+
+  defp strip_session_setting_quotes(<<"\"", rest::binary>>) do
+    if String.ends_with?(rest, "\""), do: binary_part(rest, 0, byte_size(rest) - 1)
+  end
+
+  defp strip_session_setting_quotes(<<"'", rest::binary>>) do
+    if String.ends_with?(rest, "'"), do: binary_part(rest, 0, byte_size(rest) - 1)
+  end
+
+  defp strip_session_setting_quotes(value) do
+    if String.contains?(value, ["\"", "'"]), do: nil, else: value
+  end
+
+  defp unique_session_setting(values) do
+    case values |> Enum.map(&session_setting_value/1) |> Enum.uniq() do
+      [value] when is_binary(value) -> value
+      _ -> nil
+    end
   end
 
   defp tracker_secret_port_env(dynamic_tool_binding) do

@@ -106,7 +106,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     case Workspace.create_for_issue(issue, worker_host, workspace_opts) do
       {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+        send_worker_runtime_info(codex_update_recipient, issue, %{worker_host: worker_host, workspace_path: workspace})
 
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host),
@@ -400,21 +400,14 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
-       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
-    send(
-      recipient,
-      {:worker_runtime_info, issue_id,
-       %{
-         worker_host: worker_host,
-         workspace_path: workspace
-       }}
-    )
+  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, runtime_info)
+       when is_binary(issue_id) and is_pid(recipient) and is_map(runtime_info) do
+    send(recipient, {:worker_runtime_info, issue_id, runtime_info})
 
     :ok
   end
 
-  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
+  defp send_worker_runtime_info(_recipient, _issue, _runtime_info), do: :ok
 
   defp notify_continuation_required(recipient, %Issue{id: issue_id})
        when is_pid(recipient) and is_binary(issue_id) do
@@ -452,6 +445,8 @@ defmodule SymphonyElixir.AgentRunner do
              worker_host: worker_host,
              agent_context: agent_context
            ) do
+      send_worker_runtime_info(codex_update_recipient, issue, Map.take(session, [:model, :reasoning_effort]))
+
       try do
         if Keyword.has_key?(opts, :phase) do
           run_pipeline_phase(session, issue, codex_update_recipient, opts)
