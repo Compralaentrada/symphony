@@ -281,6 +281,11 @@ defmodule SymphonyElixir.Pipeline do
     if issue.state == status_value(task, :ready), do: resume_blocked_task(task, issue), else: :ignore
   end
 
+  defp prepare_task(%{"status" => status, "stale_merge_retry" => true} = task, %Issue{} = issue)
+       when status in ["review", "human_review"] do
+    if issue.state == status_value(task, :ready), do: resume_human_review_task(task), else: :ignore
+  end
+
   defp prepare_task(%{"status" => "human_review"} = task, %Issue{} = issue) do
     cond do
       issue.state != status_value(task, :ready) -> :ignore
@@ -543,6 +548,7 @@ defmodule SymphonyElixir.Pipeline do
       |> Map.put("phase", "build")
       |> Map.put("status", "building")
       |> Map.delete("direct_qa")
+      |> Map.delete("stale_merge_retry")
       |> Map.put("attempts", %{})
       |> Map.put("current_sha", nil)
 
@@ -608,7 +614,8 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp finish_valid_phase(issue, task, "review", attempt, %{"outcome" => "passed", "sha" => sha} = result) do
-    with :ok <- ensure_current_sha(task, sha) do
+    with :ok <- ensure_current_sha(task, sha),
+         {:ok, saved} <- Store.get_task(issue.id) do
       case pending_findings(task, result) do
         [] ->
           next =
@@ -616,6 +623,7 @@ defmodule SymphonyElixir.Pipeline do
             |> Map.put("phase", "review")
             |> Map.put("status", "human_review")
             |> Map.put("prior_findings", [])
+            |> Map.put("stale_merge_retry", saved["stale_merge_retry"] == true)
 
           ops =
             report_ops(next, "review", attempt, result) ++
@@ -710,8 +718,7 @@ defmodule SymphonyElixir.Pipeline do
       %Issue{} = issue ->
         _ = execute_pending(issue)
 
-        if issue_id in running_issue_ids and task["phase"] == "review" and
-             issue.state in [status_value(task, :human_review), "closed"] do
+        if issue_id in running_issue_ids and preserve_running_review?(task, issue) do
           :ok
         else
           reconcile_task_issue(issue, task)
@@ -721,6 +728,13 @@ defmodule SymphonyElixir.Pipeline do
         :ok
     end
   end
+
+  defp preserve_running_review?(%{"phase" => "review"} = task, issue) do
+    issue.state in [status_value(task, :human_review), "closed"] or
+      (task["stale_merge_retry"] == true and issue.state == status_value(task, :ready))
+  end
+
+  defp preserve_running_review?(_task, _issue), do: false
 
   defp reconcile_task_issue(%Issue{state: "closed"} = issue, %{"status" => status} = task)
        when status not in ["done", "dropped"],
@@ -778,6 +792,10 @@ defmodule SymphonyElixir.Pipeline do
       :stale -> :ok
       result -> result
     end
+  end
+
+  defp checkpoint_state_mismatch(%{"status" => "review", "stale_merge_retry" => true} = task, %Issue{state: issue_state}) do
+    if issue_state == status_value(task, :ready), do: :ok, else: checkpoint_state_mismatch(task, issue_state, "review", false)
   end
 
   defp checkpoint_state_mismatch(%{"status" => status} = task, %Issue{state: issue_state})
