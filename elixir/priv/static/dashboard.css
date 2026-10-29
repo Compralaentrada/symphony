@@ -572,3 +572,188 @@ pre,
     padding: 1rem;
   }
 }
+
+body:has(.operations-dashboard) {
+  background: #f6f8fb;
+  color: #17243d;
+}
+
+.app-shell:has(.operations-dashboard) {
+  max-width: 1440px;
+  padding: 1rem 1.5rem 2.5rem;
+}
+
+.operations-dashboard {
+  --card: #fff;
+  --card-muted: #f5f7fa;
+  --ink: #17243d;
+  --muted: #68758c;
+  --line: #e6eaf0;
+  --line-strong: #d5dce6;
+  --accent: #16834d;
+  --accent-ink: #12633b;
+  --accent-soft: #e9f7ef;
+  gap: 0.85rem;
+  color: var(--ink);
+  font-family: Inter, "SF Pro Text", "Segoe UI", sans-serif;
+}
+
+.operations-dashboard .hero-card,
+.operations-dashboard .section-card,
+.operations-dashboard .metric-card,
+.operations-dashboard .error-card {
+  border-color: var(--line);
+  background: var(--card);
+  box-shadow: 0 1px 3px rgba(16, 24, 40, 0.045);
+  backdrop-filter: none;
+}
+
+.operations-dashboard .hero-card,
+.operations-dashboard .section-card,
+.operations-dashboard .error-card {
+  border-radius: 14px;
+  padding: 1.1rem 1.2rem;
+}
+
+.operations-dashboard .hero-title {
+  font-size: clamp(1.75rem, 3vw, 2.15rem);
+  line-height: 1.1;
+}
+
+.operations-dashboard .hero-copy {
+  margin-top: 0.45rem;
+  font-size: 0.9rem;
+}
+
+.operations-dashboard .eyebrow {
+  color: var(--accent-ink);
+  font-size: 0.7rem;
+}
+
+.operations-dashboard .dashboard-nav {
+  gap: 1.35rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.operations-dashboard .dashboard-nav .subtle-button {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  padding: 0.2rem 0.15rem 0.55rem;
+  color: var(--muted);
+  box-shadow: none;
+}
+
+.operations-dashboard .dashboard-nav a[aria-current="page"] {
+  border-bottom-color: var(--ink);
+  background: transparent;
+  color: var(--ink);
+}
+
+.operations-dashboard .metric-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--card);
+  box-shadow: 0 1px 3px rgba(16, 24, 40, 0.045);
+}
+
+.operations-dashboard .metric-card {
+  min-width: 0;
+  border: 0;
+  border-right: 1px solid var(--line);
+  border-radius: 0;
+  padding: 0.9rem 1rem;
+  box-shadow: none;
+}
+
+.operations-dashboard .metric-card:last-child {
+  border-right: 0;
+}
+
+.operations-dashboard .metric-label {
+  font-size: 0.75rem;
+}
+
+.operations-dashboard .metric-value {
+  margin-top: 0.25rem;
+  font-size: clamp(1.35rem, 2vw, 1.7rem);
+  font-weight: 600;
+}
+
+.operations-dashboard .metric-detail {
+  margin-top: 0.3rem;
+  font-size: 0.8rem;
+}
+
+.operations-dashboard .section-title {
+  font-size: 1rem;
+}
+
+.operations-dashboard .section-copy {
+  margin-top: 0.25rem;
+  font-size: 0.86rem;
+}
+
+.operations-dashboard .session-timeline {
+  margin-top: 0.9rem;
+}
+
+.operations-dashboard .session-timeline-marker {
+  background: #2563eb;
+}
+
+.operations-dashboard .session-timeline-header > .issue-stack {
+  flex: 1;
+  min-width: 0;
+}
+
+.operations-dashboard .session-timeline-header > .state-badge {
+  flex-shrink: 0;
+}
+
+.operations-dashboard .status-badge-live {
+  border-color: #cdebd8;
+  background: #e9f7ef;
+  color: #18794e;
+}
+
+.operations-dashboard .session-timeline .state-badge {
+  border-color: #c9dcff;
+  background: #eaf2ff;
+  color: #1d4ed8;
+}
+
+.operations-dashboard .code-panel {
+  border-radius: 10px;
+  background: #f7f9fc;
+  font-size: 0.82rem;
+}
+
+@media (max-width: 860px) {
+  .app-shell:has(.operations-dashboard) {
+    padding: 1rem 0.85rem 2rem;
+  }
+
+  .operations-dashboard .metric-card {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .operations-dashboard .metric-card:last-child {
+    border-bottom: 0;
+  }
+}
+
+@media (max-width: 560px) {
+  .app-shell:has(.operations-dashboard) {
+    padding: 0.75rem;
+  }
+
+  .operations-dashboard .session-timeline-header {
+    flex-wrap: wrap;
+  }
+}

@@ -47,7 +47,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <section class="dashboard-shell">
+    <section class={if @live_action == :index, do: "dashboard-shell operations-dashboard", else: "dashboard-shell"}>
       <header class="hero-card">
         <div class="hero-grid">
           <div>

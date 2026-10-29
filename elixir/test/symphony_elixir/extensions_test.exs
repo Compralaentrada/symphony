@@ -597,6 +597,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "Compralaentrada Observability"
     assert html =~ "Operations Dashboard"
+    assert html =~ ~s(class="dashboard-shell operations-dashboard")
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "MT-BLOCKED"
@@ -766,13 +767,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     setup_delivery_pipeline([task], {:ok, [issue]})
     start_test_endpoint(snapshot_timeout_ms: 50)
 
-    {:ok, operations_view, _html} = live(build_conn(), "/")
+    {:ok, operations_view, operations_html} = live(build_conn(), "/")
+    assert operations_html =~ "operations-dashboard"
     assert has_element?(operations_view, "nav[aria-label='Dashboard views'] a[href='/delivery']", "Delivery")
 
     assert {:error, {:live_redirect, %{to: "/delivery"}}} =
              operations_view |> element("a[href='/delivery']") |> render_click()
 
     {:ok, delivery_view, html} = live(build_conn(), "/delivery")
+    refute html =~ "operations-dashboard"
     assert has_element?(delivery_view, "nav[aria-label='Dashboard views'] a[href='/']", "Operations")
     assert has_element?(delivery_view, "tbody tr td", "octo/app#7")
     assert html =~ "Current title"
