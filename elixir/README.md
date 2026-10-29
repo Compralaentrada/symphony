@@ -376,6 +376,7 @@ tracker:
 The observability UI now runs on a minimal Phoenix stack:
 
 - LiveView dashboard at `/` with Operations and read-only Delivery views
+- Operations shows each active session's configured model and reasoning effort captured at startup
 - Delivery lists pipeline tasks with the current title, status, and issue link from the configured tracker
 - JSON API for operational debugging under `/api/v1/*`
 - Bandit as the HTTP server
