@@ -558,7 +558,7 @@ defmodule SymphonyElixir.Workspace do
           ]
           |> Enum.join("\n")
 
-        run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms)
+        run_remote_hook_command(worker_host, script, "before_remove", Config.settings!().hooks.timeout_ms)
         |> case do
           {:ok, {output, status}} ->
             handle_hook_command_result(
@@ -586,25 +586,17 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
-    task =
-      Task.async(fn ->
-        System.cmd("sh", ["-lc", command],
-          cd: workspace,
-          env: hook_environment(issue_context),
-          stderr_to_stdout: true
-        )
-      end)
-
-    case Task.yield(task, timeout_ms) do
+    case run_local_hook_command(command, workspace, issue_context, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
-      nil ->
-        Task.shutdown(task, :brutal_kill)
-
+      :timeout ->
         Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local timeout_ms=#{timeout_ms}")
 
         {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -623,7 +615,7 @@ defmodule SymphonyElixir.Workspace do
       |> Enum.reject(&(&1 == ""))
       |> Enum.join("\n")
 
-    case run_remote_command(worker_host, script, timeout_ms) do
+    case run_remote_hook_command(worker_host, script, hook_name, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
@@ -632,6 +624,139 @@ defmodule SymphonyElixir.Workspace do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp run_local_hook_command(command, workspace, issue_context, timeout_ms) do
+    executable = System.find_executable("sh")
+
+    if is_binary(executable) do
+      run_hook_port(
+        fn ->
+          {:ok,
+           Port.open(
+             {:spawn_executable, String.to_charlist(executable)},
+             [
+               :binary,
+               :exit_status,
+               :stderr_to_stdout,
+               args: [~c"-lc", String.to_charlist(command)],
+               cd: String.to_charlist(workspace),
+               env:
+                 Enum.map(hook_environment(issue_context), fn {name, value} ->
+                   {String.to_charlist(name), String.to_charlist(value)}
+                 end)
+             ]
+           )}
+        end,
+        timeout_ms
+      )
+    else
+      {:ok, {"sh executable not found", 127}}
+    end
+  end
+
+  defp run_remote_hook_command(worker_host, script, hook_name, timeout_ms) do
+    case run_hook_port(fn -> SSH.start_port(worker_host, script) end, timeout_ms) do
+      {:ok, cmd_result} ->
+        {:ok, cmd_result}
+
+      :timeout ->
+        {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp run_hook_port(start_port, timeout_ms) do
+    owner = self()
+    reference = make_ref()
+
+    {runner, monitor} =
+      spawn_monitor(fn -> run_hook_port_worker(owner, reference, start_port, timeout_ms) end)
+
+    receive do
+      {^reference, result} ->
+        Process.demonitor(monitor, [:flush])
+        result
+
+      {:DOWN, ^monitor, :process, ^runner, reason} ->
+        {:error, {:workspace_hook_runner_failed, reason}}
+    end
+  end
+
+  defp run_hook_port_worker(owner, reference, start_port, timeout_ms) do
+    owner_monitor = Process.monitor(owner)
+
+    result =
+      case start_port.() do
+        {:ok, port} ->
+          case collect_hook_port(
+                 port,
+                 System.monotonic_time(:millisecond) + timeout_ms,
+                 [],
+                 owner,
+                 owner_monitor
+               ) do
+            {:ok, command_result} ->
+              {:ok, command_result}
+
+            :timeout ->
+              terminate_hook_port(port)
+              :timeout
+
+            :owner_down ->
+              terminate_hook_port(port)
+              :owner_down
+          end
+
+        {:error, _reason} = error ->
+          error
+      end
+
+    Process.demonitor(owner_monitor, [:flush])
+    if result != :owner_down, do: send(owner, {reference, result})
+  end
+
+  defp collect_hook_port(port, deadline, output, owner, owner_monitor) do
+    remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {^port, {:data, data}} ->
+        collect_hook_port(port, deadline, [data | output], owner, owner_monitor)
+
+      {^port, {:exit_status, status}} ->
+        {:ok, {output |> Enum.reverse() |> IO.iodata_to_binary(), status}}
+
+      {:DOWN, ^owner_monitor, :process, ^owner, _reason} ->
+        :owner_down
+    after
+      remaining_ms ->
+        :timeout
+    end
+  end
+
+  defp terminate_hook_port(port) do
+    case :erlang.port_info(port, :os_pid) do
+      {:os_pid, os_pid} ->
+        System.cmd("/bin/kill", ["-TERM", Integer.to_string(os_pid)], stderr_to_stdout: true)
+
+        receive do
+          {^port, {:exit_status, _status}} -> :ok
+        after
+          100 ->
+            System.cmd("/bin/kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
+        end
+
+      _ ->
+        :ok
+    end
+
+    try do
+      Port.close(port)
+    rescue
+      ArgumentError -> :ok
     end
   end
 

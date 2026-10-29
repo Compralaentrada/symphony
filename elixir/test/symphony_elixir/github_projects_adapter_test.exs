@@ -222,6 +222,148 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
              )
   end
 
+  test "Build handoff returns the validated PR body in its evidence" do
+    number = 57
+    issue_id = "octo/app##{number}"
+    sha = String.duplicate("a", 40)
+    branch = "symphony/octo-app-#{number}"
+    root = Path.join(System.tmp_dir!(), "symphony-project-build-evidence-#{System.unique_integer([:positive])}")
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: issue_id,
+      title: "Persist Build evidence",
+      branch_name: branch,
+      state: "Building",
+      url: "https://github.com/octo/app/issues/#{number}",
+      native_ref: %{
+        repository: "octo/app",
+        project_status: "Building",
+        base_branch: "main",
+        issue_node_id: "I_issue_#{number}"
+      }
+    }
+
+    task = %{"branch" => branch, "base_branch" => "main", "required_checks" => ["true"]}
+    assert :ok = Store.save_task(%{"issue_id" => issue.id, "generation" => 1, "phase" => "build", "attempts" => %{"build" => 1}})
+    assert :ok = Store.begin_phase(issue.id, 1, "build", 1)
+    {:ok, remote} = Agent.start_link(fn -> %{status: "Building"} end)
+
+    request_fun = fn query, variables, _settings ->
+      Agent.get_and_update(remote, fn data ->
+        cond do
+          query =~ "SymphonyProject(" ->
+            {{:ok, %{status: 200, body: project_response([issue_item("octo/app", number, data.status)])}}, data}
+
+          query =~ "SymphonyPipelineDelivery" ->
+            body = %{"data" => %{"repository" => %{"ref" => %{"name" => branch, "target" => %{"oid" => sha}}}}}
+            {{:ok, %{status: 200, body: body}}, data}
+
+          query =~ "SymphonyPipelinePullRequest" ->
+            body = %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => []}}}}
+            {{:ok, %{status: 200, body: body}}, data}
+
+          query =~ "SymphonyPipelineRepository" ->
+            {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"id" => "R_octopus"}}}}}, data}
+
+          query =~ "createPullRequest" ->
+            pr = %{
+              "id" => "PR_#{number}",
+              "number" => number,
+              "url" => "https://github.com/octo/app/pull/#{number}",
+              "state" => "OPEN",
+              "isDraft" => true,
+              "mergedAt" => nil,
+              "baseRefName" => "main",
+              "headRefName" => branch,
+              "headRefOid" => sha,
+              "body" => variables["input"]["body"]
+            }
+
+            {{:ok, %{status: 200, body: %{"data" => %{"createPullRequest" => %{"pullRequest" => pr}}}}}, data}
+
+          query =~ "SymphonyPipelineReportComments" ->
+            comments = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
+            body = %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}
+            {{:ok, %{status: 200, body: body}}, data}
+
+          query =~ "SymphonyAddIssueComment" ->
+            comment = %{"id" => "IC_build", "url" => "https://github.com/octo/app/issues/#{number}#issuecomment-1"}
+            body = %{"data" => %{"addComment" => %{"commentEdge" => %{"node" => comment}}}}
+            {{:ok, %{status: 200, body: body}}, data}
+
+          query =~ "updateProjectV2ItemFieldValue" ->
+            body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
+            {{:ok, %{status: 200, body: body}}, %{data | status: "QA"}}
+
+          true ->
+            flunk("unexpected GitHub Projects query: #{query}")
+        end
+      end)
+    end
+
+    body = """
+    Fixes ##{number}
+
+    #### Context
+
+    Implements the assigned issue.
+
+    #### TL;DR
+
+    Implements the issue.
+
+    #### Summary
+
+    - Updated the implementation.
+
+    #### Alternatives
+
+    - Kept the existing implementation pattern.
+
+    #### Test Plan
+
+    - [x] Required checks passed.
+    """
+
+    report = %{
+      "outcome" => "ready",
+      "summary" => "Build completed.",
+      "pull_request_body" => body,
+      "criteria" => [],
+      "changes" => [],
+      "checks" => [],
+      "risks" => [],
+      "next_step" => "Continue to QA.",
+      "sha" => sha
+    }
+
+    markdown = "## Build report\n\nBuild completed.\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
+
+    assert {:ok, evidence} =
+             Client.agent_operation(
+               issue,
+               %{issue: issue, lane: :build, generation: 1, attempt: 1, task: task},
+               "handoff",
+               %{"outcome" => "ready", "report" => report, "body" => markdown},
+               tracker_settings: tracker_settings(),
+               projects_request: request_fun
+             )
+
+    assert evidence["pull_request_body"] == body
+  end
+
   test "Finalize recovers and verifies the merged PR before closing the issue and moving it to Done" do
     alias SymphonyElixir.Pipeline.Store
 
