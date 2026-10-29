@@ -209,12 +209,36 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
       issue = project_workspace_issue("octo/app#12", "unused", "main", "echo partial && exit 17")
 
-      assert {:error, {:workspace_hook_failed, "after_create", 17, _output}} =
+      assert {:error, {:repository_profile_invalid, {:prepare_command_failed, 17}}} =
                Workspace.create_for_issue(issue)
 
       refute File.exists?(Path.join(workspace_root, Workspace.workspace_key(issue)))
     after
       File.rm_rf(workspace_root)
+    end
+  end
+
+  test "Projects workspace reports a missing configured base branch as profile readiness failure" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-project-workspace-base-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    source_repo = Path.join(test_root, "source")
+
+    try do
+      File.mkdir_p!(source_repo)
+      git!(source_repo, ["init", "-b", "main"])
+      git!(source_repo, ["config", "user.name", "Test User"])
+      git!(source_repo, ["config", "user.email", "test@example.com"])
+      File.write!(Path.join(source_repo, "README.md"), "base branch\n")
+      git!(source_repo, ["add", "README.md"])
+      git!(source_repo, ["commit", "-m", "main"])
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      issue = project_workspace_issue("octo/app#14", source_repo, "release")
+
+      assert {:error, {:repository_profile_invalid, {:base_branch_unavailable, "release"}}} =
+               Workspace.create_for_issue(issue)
+    after
+      File.rm_rf(test_root)
     end
   end
 
