@@ -646,6 +646,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       repository: repository,
       base_branch: profile && profile.base_branch,
       prepare_command: profile && profile.prepare_command,
+      repository_profile_error: configured_profile_error(profile),
       required_checks: profile && profile.required_checks
     }
 
@@ -2312,7 +2313,6 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          {:ok, graphql_url} <- graphql_url_setting(provider),
          {:ok, token} <- token_setting(provider),
          :ok <- validate_merge_policy(provider["merge_policy"]),
-         :ok <- validate_pipeline_profiles(profiles),
          :ok <- validate_routing_settings(tracker_settings) do
       {:ok,
        Map.merge(project, %{
@@ -2340,8 +2340,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp repository_settings(provider) do
     case repository_profiles(provider["repositories"]) do
-      nil -> invalid_settings(:invalid_repository_profiles)
-      profiles -> {:ok, profiles}
+      profiles when is_map(profiles) and map_size(profiles) > 0 -> {:ok, profiles}
+      _ -> invalid_settings(:invalid_repository_profiles)
     end
   end
 
@@ -2378,26 +2378,13 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp repository_profiles(profiles) when is_list(profiles) and profiles != [] do
-    Enum.reduce_while(profiles, %{}, fn profile, acc ->
+    Enum.reduce(profiles, %{}, fn profile, acc ->
       repository = normalize_string(profile_value(profile, "repository"))
       base_branch = normalize_string(profile_value(profile, "base_branch"))
       prepare_command = normalize_string(profile_value(profile, "prepare_command"))
       required_checks = normalize_required_checks(profile_value(profile, "required_checks"))
-      key = normalize_repository(repository)
 
-      if valid_repository?(repository) and present_string?(base_branch) and
-           present_string?(prepare_command) and not is_nil(required_checks) and not Map.has_key?(acc, key) do
-        normalized = %{
-          repository: repository,
-          base_branch: base_branch,
-          prepare_command: prepare_command,
-          required_checks: required_checks
-        }
-
-        {:cont, Map.put(acc, key, normalized)}
-      else
-        {:halt, nil}
-      end
+      put_repository_profile(acc, repository, base_branch, prepare_command, required_checks)
     end)
   end
 
@@ -2412,13 +2399,39 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp normalize_required_checks(_checks), do: nil
 
-  defp validate_pipeline_profiles(profiles) do
-    if Enum.any?(profiles, fn {_repo, profile} -> profile.required_checks == [] end) do
-      invalid_settings(:pipeline_requires_repository_required_checks)
-    else
-      :ok
+  defp repository_profile_error(base_branch, prepare_command, required_checks) do
+    cond do
+      is_nil(base_branch) -> :missing_base_branch
+      is_nil(prepare_command) -> :missing_prepare_command
+      is_nil(required_checks) -> :invalid_required_checks
+      required_checks == [] -> :missing_required_checks
+      true -> nil
     end
   end
+
+  defp put_repository_profile(acc, repository, base_branch, prepare_command, required_checks) do
+    key = normalize_repository(repository)
+
+    cond do
+      not valid_repository?(repository) ->
+        acc
+
+      Map.has_key?(acc, key) ->
+        Map.update!(acc, key, &%{&1 | readiness_error: :duplicate_repository_profile})
+
+      true ->
+        Map.put(acc, key, %{
+          repository: repository,
+          base_branch: base_branch,
+          prepare_command: prepare_command,
+          required_checks: required_checks || [],
+          readiness_error: repository_profile_error(base_branch, prepare_command, required_checks)
+        })
+    end
+  end
+
+  defp configured_profile_error(profile) when is_map(profile), do: profile.readiness_error
+  defp configured_profile_error(_profile), do: nil
 
   defp valid_active_states(states) when is_list(states) do
     normalized = MapSet.new(states, &normalize_state/1)
