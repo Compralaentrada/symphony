@@ -7,6 +7,8 @@ correspondiente y ejecuta las fases necesarias con Codex.
 ## Qué hace
 
 - Coordina varios repositorios desde un único GitHub Project v2 mediante perfiles de repositorio.
+- Aísla cada ejecución de Projects con el proyecto, el elemento, el repositorio y el número de issue;
+  cada workspace y búsqueda de PR queda vinculado al repositorio correcto.
 - Ejecuta Build, QA y Review en sesiones separadas y comprueba los comandos `required_checks` del
   repositorio durante QA.
 - Resuelve las skills del catálogo de Symphony por fase y añade las condicionales solo cuando

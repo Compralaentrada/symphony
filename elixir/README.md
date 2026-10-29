@@ -12,7 +12,9 @@ installation.
 
 1. Reads eligible issues from the configured tracker. The current pilot uses GitHub Projects v2;
    adapters are also available for GitHub Issues, Linear, Jira Cloud, Asana, and GitLab.
-2. Creates an isolated workspace for each issue and launches Codex in
+2. Creates an isolated workspace for each issue. GitHub Projects executions include the Project,
+   item, repository, and issue number in their identity, so same-number issues in different
+   repositories keep separate workspaces and pull request lookups. Then Symphony launches Codex in
    [App Server mode](https://developers.openai.com/codex/app-server/).
 3. Runs Build, QA, and autonomous Review in separate sessions for GitHub Projects work.
 4. Verifies configured QA checks, prepares a pull request for human review, and waits for the

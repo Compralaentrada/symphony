@@ -6,12 +6,15 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
   alias SymphonyElixir.Pipeline.Store
 
   test "pipeline reconciliation fetches all task issues in one tracker lookup" do
-    issues = [issue("octo/app#20", 20), issue("octo/app#21", 21)]
+    first_issue = issue("octo/app#20", 20)
+    first_issue = %{first_issue | native_ref: Map.merge(first_issue.native_ref, %{project_id: "PVT_test", project_item_id: "PVTI_20", issue_number: 20})}
+    issues = [first_issue, issue("octo/app#21", 21)]
     table = start_board(issues, %{})
     pipeline_database!(table)
 
     Enum.each(issues, fn issue ->
-      assert {:ok, _task, "build"} = Pipeline.prepare(issue)
+      assert {:ok, task, "build"} = Pipeline.prepare(issue)
+      assert task["execution_identity"] == Issue.execution_identity(issue)
     end)
 
     assert :ok = Pipeline.reconcile()
