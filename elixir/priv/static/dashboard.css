@@ -721,7 +721,7 @@ body:has(.operations-dashboard) {
   color: #18794e;
 }
 
-.operations-dashboard .session-timeline .state-badge {
+.operations-dashboard .session-timeline .state-badge-active {
   border-color: #c9dcff;
   background: #eaf2ff;
   color: #1d4ed8;
