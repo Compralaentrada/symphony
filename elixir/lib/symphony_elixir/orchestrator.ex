@@ -2090,6 +2090,7 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_event: metadata.last_codex_event,
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
+        |> Map.merge(if metadata[:pipeline_phase], do: %{pipeline_phase: metadata.pipeline_phase}, else: %{})
       end)
 
     retrying =

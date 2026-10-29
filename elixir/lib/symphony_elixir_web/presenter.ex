@@ -119,6 +119,7 @@ defmodule SymphonyElixirWeb.Presenter do
         total_tokens: entry.codex_total_tokens
       }
     }
+    |> Map.merge(if entry[:pipeline_phase], do: %{pipeline_phase: entry.pipeline_phase}, else: %{})
   end
 
   defp retry_entry_payload(entry) do
