@@ -254,6 +254,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <span class="muted">No activity reported yet</span>
                       <% end %>
                     </div>
+                    <div>
+                      <span class="session-timeline-label">Model</span>
+                      <span><%= entry.model || "No disponible" %></span>
+                    </div>
+                    <div>
+                      <span class="session-timeline-label">Reasoning</span>
+                      <span><%= entry.reasoning_effort || "No disponible" %></span>
+                    </div>
                     <%= if entry[:pipeline_phase] do %>
                       <div>
                         <span class="session-timeline-label">Pipeline phase</span>
