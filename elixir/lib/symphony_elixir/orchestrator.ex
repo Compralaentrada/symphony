@@ -624,8 +624,7 @@ defmodule SymphonyElixir.Orchestrator do
       if MapSet.member?(visible_issue_ids, issue_id) do
         state_acc
       else
-        log_missing_running_issue(state_acc, issue_id)
-        terminate_running_issue(state_acc, issue_id, false)
+        confirm_missing_running_issue(state_acc, issue_id, length(issues))
       end
     end)
   end
@@ -654,22 +653,56 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_missing_blocked_issue_ids(state, _requested_issue_ids, _issues), do: state
 
-  defp log_missing_running_issue(%State{} = state, issue_id) when is_binary(issue_id) do
+  defp confirm_missing_running_issue(%State{} = state, issue_id, normalized_issue_count)
+       when is_binary(issue_id) and is_integer(normalized_issue_count) do
     case Map.get(state.running, issue_id) do
-      %{identifier: identifier} ->
-        Logger.info("Issue no longer visible during running-state refresh: issue_id=#{issue_id} issue_identifier=#{identifier}; stopping active agent")
+      %{identifier: identifier} = running_entry ->
+        consecutive_absences = Map.get(running_entry, :consecutive_missing_refreshes, 0) + 1
+        session_id = running_entry_session_id(running_entry)
+
+        action =
+          if consecutive_absences >= 2,
+            do: "absence confirmed; stopping active agent",
+            else: "retaining active agent until confirmed"
+
+        Logger.info(
+          "Issue omitted from successful running-state refresh: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} consecutive_absences=#{consecutive_absences} normalized_issue_count=#{normalized_issue_count}; #{action}"
+        )
+
+        state = %{
+          state
+          | running:
+              Map.put(
+                state.running,
+                issue_id,
+                Map.put(running_entry, :consecutive_missing_refreshes, consecutive_absences)
+              )
+        }
+
+        if consecutive_absences >= 2,
+          do: terminate_running_issue(state, issue_id, false),
+          else: state
 
       _ ->
-        Logger.info("Issue no longer visible during running-state refresh: issue_id=#{issue_id}; stopping active agent")
+        terminate_running_issue(state, issue_id, false)
     end
   end
 
-  defp log_missing_running_issue(_state, _issue_id), do: :ok
+  defp confirm_missing_running_issue(state, _issue_id, _normalized_issue_count), do: state
 
   defp refresh_running_issue_state(%State{} = state, %Issue{} = issue) do
     case Map.get(state.running, issue.id) do
       %{issue: _} = running_entry ->
-        %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
+        consecutive_absences = Map.get(running_entry, :consecutive_missing_refreshes, 0)
+
+        if consecutive_absences > 0 do
+          session_id = running_entry_session_id(running_entry)
+
+          Logger.info("Issue recovered after successful running-state refresh: #{issue_context(issue)} session_id=#{session_id} consecutive_absences=#{consecutive_absences}; keeping active agent")
+        end
+
+        running_entry = running_entry |> Map.put(:issue, issue) |> Map.delete(:consecutive_missing_refreshes)
+        %{state | running: Map.put(state.running, issue.id, running_entry)}
 
       _ ->
         state
