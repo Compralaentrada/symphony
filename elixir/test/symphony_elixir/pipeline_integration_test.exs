@@ -552,6 +552,24 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     stop_orchestrator(orchestrator)
   end
 
+  test "direct QA blocks a ready PR before running workspace checks" do
+    issue = issue("octo/app#143", 143)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    sha = String.duplicate("a", 40)
+    :ets.insert(table, {{:pull_request, issue.id}, %{sha: sha, draft: false}})
+
+    assert {:phase_result, {:system_blocker, report}} =
+             AgentRunner.verify_pipeline_workspace_sha_for_test(
+               "unused",
+               issue,
+               [phase: :qa, pipeline_task: %{"current_sha" => sha, "direct_qa" => true}],
+               nil
+             )
+
+    assert report["next_step"] =~ "draft"
+  end
+
   test "Review blocks when the PR head advances after the Build SHA was accepted" do
     issue = issue("octo/app#43", 43)
     table = start_board([issue], %{})
