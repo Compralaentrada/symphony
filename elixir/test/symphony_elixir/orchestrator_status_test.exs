@@ -199,12 +199,20 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
        }}
     )
 
+    send(pid, {:worker_runtime_info, issue_id, %{model: "gpt-6-luna", reasoning_effort: "max"}})
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_command: "codex --config model=\"gpt-6-orion\" --config model_reasoning_effort=low app-server"
+    )
+
     snapshot = GenServer.call(pid, :snapshot)
     assert %{running: [snapshot_entry]} = snapshot
     assert snapshot_entry.issue_id == issue_id
     assert snapshot_entry.issue_url == "https://example.org/issues/MT-188"
     assert snapshot_entry.session_id == "thread-live-turn-live"
     assert snapshot_entry.turn_count == 1
+    assert snapshot_entry.model == "gpt-6-luna"
+    assert snapshot_entry.reasoning_effort == "max"
     assert snapshot_entry.last_codex_timestamp == now
     assert snapshot_entry.pipeline_phase == "qa"
 

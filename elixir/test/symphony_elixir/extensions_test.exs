@@ -282,6 +282,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "worker_host" => nil,
                  "workspace_path" => nil,
                  "session_id" => "thread-http",
+                 "model" => nil,
+                 "reasoning_effort" => nil,
                  "turn_count" => 7,
                  "last_event" => "notification",
                  "last_message" => "rendered",
@@ -576,7 +578,13 @@ defmodule SymphonyElixir.ExtensionsTest do
     pipeline_entry =
       snapshot.running
       |> hd()
-      |> Map.merge(%{issue_id: "issue-pipeline", identifier: "MT-PIPELINE", pipeline_phase: "review"})
+      |> Map.merge(%{
+        issue_id: "issue-pipeline",
+        identifier: "MT-PIPELINE",
+        pipeline_phase: "review",
+        model: "gpt-6-luna",
+        reasoning_effort: "max"
+      })
 
     snapshot = put_in(snapshot.running, snapshot.running ++ [pipeline_entry])
 
@@ -611,6 +619,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Offline"
     assert html =~ "Copy ID"
     assert html =~ "Latest activity"
+    assert html =~ "Model"
+    assert html =~ "gpt-6-luna"
+    assert html =~ "Reasoning"
+    assert html =~ "max"
+    assert html =~ "No disponible"
     assert html =~ "Pipeline phase"
     assert html =~ "review"
     assert length(Regex.scan(~r/Pipeline phase/, html)) == 1
@@ -622,6 +635,8 @@ defmodule SymphonyElixir.ExtensionsTest do
       |> Enum.filter(&(&1["issue_identifier"] == "MT-PIPELINE"))
 
     assert pipeline_payload["pipeline_phase"] == "review"
+    assert pipeline_payload["model"] == "gpt-6-luna"
+    assert pipeline_payload["reasoning_effort"] == "max"
 
     [regular_payload] =
       get(build_conn(), "/api/v1/state")

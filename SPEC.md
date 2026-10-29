@@ -1421,6 +1421,9 @@ SHOULD return:
 
 - `running` (list of running session rows)
 - each running row SHOULD include `turn_count`
+- active-session rows SHOULD include explicitly configured model and reasoning effort captured at
+  session startup; unavailable values MUST remain unavailable rather than infer defaults, and the
+  full launch command MUST NOT be exposed
 - `retrying` (list of retry queue rows)
 - session and retry rows SHOULD include the tracker-provided issue URL when available
 - `codex_totals`

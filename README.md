@@ -15,7 +15,8 @@ correspondiente y ejecuta las fases necesarias con Codex.
   aplican a la tarea.
 - Publica informes Markdown en español para issues en español y en inglés para el resto.
 - Guarda checkpoints del pipeline en SQLite para reanudar el trabajo tras un reinicio.
-- Expone el estado operativo y las tareas del pipeline en Operations, Delivery y una API JSON.
+- Expone el estado operativo y las tareas del pipeline en Operations, Delivery y una API JSON;
+  Operations muestra el modelo y el razonamiento capturados al iniciar cada sesión activa.
 - Espera una fusión humana por defecto; solo `auto` explícito solicita la fusión al gate determinista.
   El gate exige Review aprobada en el SHA vigente y checks locales correctos. Symphony nunca aprueba
   PRs y solo marca una tarea como Done tras confirmar la fusión.
