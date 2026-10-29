@@ -59,8 +59,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
       issue = project_workspace_issue("octo/app#11", source_repo, "release")
+      issue = %{issue | native_ref: Map.merge(issue.native_ref, %{project_id: "PVT_project", project_item_id: "PVTI_11", issue_number: 11})}
+
+      assert {:ok, original_workspace} = Workspace.create_for_issue(issue)
+      legacy_workspace = Path.join(workspace_root, Workspace.workspace_key(issue.identifier))
+      assert :ok = File.rename(original_workspace, legacy_workspace)
+      File.write!(Path.join(legacy_workspace, "preserved.txt"), "keep this workspace")
 
       assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert workspace == original_workspace
+      assert File.read!(Path.join(workspace, "preserved.txt")) == "keep this workspace"
+      File.rm!(Path.join(workspace, "preserved.txt"))
       assert git!(workspace, ["branch", "--show-current"]) == issue.branch_name
       assert File.read!(Path.join(workspace, "BASE")) == "release"
 
@@ -1411,6 +1420,38 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              "assignee" => nil,
              "extra" => %{"team" => "platform"}
            }
+  end
+
+  test "merge policy defaults to human and accepts only documented values" do
+    assert {:ok, default_settings} = Schema.parse(%{})
+    assert default_settings.merge_policy == "human"
+
+    for {config, expected_policy} <- [
+          {%{tracker: %{kind: "github_projects"}}, "human"},
+          {%{merge_policy: "human", tracker: %{kind: "github_projects"}}, "human"},
+          {%{merge_policy: "auto", tracker: %{kind: "github_projects"}}, "auto"},
+          {%{tracker: %{kind: "github_projects", provider: %{merge_policy: "auto"}}}, "auto"},
+          {%{merge_policy: "human", tracker: %{kind: "github_projects", provider: %{merge_policy: "auto"}}}, "human"}
+        ] do
+      assert {:ok, settings} = Schema.parse(config)
+      assert settings.tracker.provider["merge_policy"] == expected_policy
+    end
+
+    assert {:ok, human_settings} = Schema.parse(%{merge_policy: "human"})
+    assert human_settings.merge_policy == "human"
+
+    assert {:ok, auto_settings} = Schema.parse(%{merge_policy: "auto"})
+    assert auto_settings.merge_policy == "auto"
+
+    assert {:error, {:invalid_workflow_config, message}} =
+             Schema.parse(%{merge_policy: "automatic"})
+
+    assert message =~ "merge_policy"
+  end
+
+  test "blank merge policy fails validation" do
+    assert {:error, {:invalid_workflow_config, blank_message}} = Schema.parse(%{merge_policy: ""})
+    assert blank_message =~ "merge_policy"
   end
 
   test "linear adapter rejects invalid provider values without crashing config parsing" do

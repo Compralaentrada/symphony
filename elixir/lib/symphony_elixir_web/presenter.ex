@@ -195,10 +195,17 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp workspace_path(issue_identifier, running, retry, blocked) do
-    (running && Map.get(running, :workspace_path)) ||
-      (retry && Map.get(retry, :workspace_path)) ||
-      (blocked && Map.get(blocked, :workspace_path)) ||
-      Path.join(Config.settings!().workspace.root, Workspace.workspace_key(issue_identifier))
+    workspace_path = Enum.find_value([running, retry, blocked], &(&1 && Map.get(&1, :workspace_path)))
+
+    workspace_path ||
+      Path.join(
+        Config.settings!().workspace.root,
+        Workspace.workspace_key(workspace_identity(issue_identifier, running, retry, blocked))
+      )
+  end
+
+  defp workspace_identity(issue_identifier, running, retry, blocked) do
+    Enum.find_value([running, retry, blocked], &(&1 && Map.get(&1, :execution_identity))) || issue_identifier
   end
 
   defp workspace_host(running, retry, blocked) do

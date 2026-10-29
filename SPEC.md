@@ -922,6 +922,10 @@ Failure handling:
   evidence where available. When a blocked QA or Review task is requeued after the PR head changed
   or the PR is missing, it restarts at Build so the accepted SHA and subsequent QA and Review
   evidence are refreshed together.
+- If a nonterminal phase checkpoint conflicts with the current nonterminal tracker state, a GitHub
+  Projects implementation SHOULD preserve the checkpoint and workspace, record a local blocker with
+  the mismatch reason, and leave the visible tracker state unchanged. Moving the item to `Ready`
+  explicitly requeues the work from the preserved checkpoint.
 
 ### 9.4 Workspace Hooks
 
@@ -1644,6 +1648,37 @@ Minimum endpoints:
     }
     ```
 
+Optional pipeline endpoint:
+
+- `GET /api/v1/delivery`
+  - Returns persisted pipeline tasks with a current lookup in the configured tracker by each task's
+    stable issue ID.
+  - The nested `task` contains the local pipeline record. `tracker_issue.issue` contains the
+    tracker's current `id`, `identifier`, `title`, `url`, and `state` when found. Its `lookup` is
+    `found`, `missing`, or `error`; `issue` is `null` for `missing` and `error`. The tracker state
+    is never inferred from the stored task.
+  - A local journal read failure returns `503` with error code `delivery_unavailable`.
+
+  ```json
+  {
+    "tasks": [
+      {
+        "task": { "issue_id": "abc123", "phase": "qa", "status": "qa" },
+        "tracker_issue": {
+          "lookup": "found",
+          "issue": {
+            "id": "abc123",
+            "identifier": "MT-649",
+            "title": "Review pipeline delivery",
+            "url": "https://tracker.example/issues/MT-649",
+            "state": "Human Review"
+          }
+        }
+      }
+    ]
+  }
+  ```
+
 API design notes:
 
 - The JSON shapes above are the RECOMMENDED baseline for interoperability and debugging ergonomics.
@@ -2117,7 +2152,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 ### 17.2 Workspace Manager and Safety
 
-- Deterministic workspace path per issue identifier
+- Deterministic workspace path per issue identifier; GitHub Projects paths use the full Project,
+  item, repository, and issue execution identity
 - Missing workspace directory is created
 - Existing workspace directory is reused
 - Existing non-directory path at workspace location is handled safely (replace or fail per
@@ -2127,10 +2163,12 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored
-- Workspace path sanitization, stable original-identifier-hash collision resistance, and root
-  containment invariants are enforced before agent launch
+- Workspace path sanitization, stable original-key-hash collision resistance, and root containment
+  invariants are enforced before agent launch
 - Identifiers unchanged by sanitization keep their deterministic workspace key; conformance tests
   include distinct identifiers that sanitize to the same text and verify distinct keys
+- Same-number issues in different repositories have separate task identities, workspace paths,
+  branches, and repository-scoped pull request lookups
 - Agent launch uses the per-issue workspace path as cwd and rejects out-of-root paths
 
 ### 17.3 Issue Tracker Adapter

@@ -367,6 +367,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     schedule_issue_retry(state, issue_id, next_attempt, %{
       identifier: running_entry.identifier,
+      execution_identity: Issue.execution_identity(running_entry.issue),
       issue_url: running_entry.issue.url,
       error: "agent exited: #{inspect(reason)}",
       worker_host: Map.get(running_entry, :worker_host),
@@ -796,6 +797,7 @@ defmodule SymphonyElixir.Orchestrator do
         |> terminate_running_issue(issue_id, false)
         |> schedule_issue_retry(issue_id, next_attempt, %{
           identifier: identifier,
+          execution_identity: Issue.execution_identity(running_entry.issue),
           issue_url: running_entry.issue.url,
           error: "stalled for #{elapsed_ms}ms without codex activity"
         })
@@ -1274,7 +1276,7 @@ defmodule SymphonyElixir.Orchestrator do
     send(recipient, {:pipeline_phase_result, issue.id, task["generation"], phase, phase_attempt, result})
   end
 
-  defp diagnose_system_blocker(runner, issue, recipient, opts, {:phase_result, {:system_blocker, _report}} = blocker) do
+  defp diagnose_system_blocker(runner, issue, recipient, opts, {:system_blocker, _report} = blocker) do
     if Pipeline.enabled?(), do: runner.run(issue, recipient, Keyword.put(opts, :diagnostic, true)), else: blocker
   end
 
@@ -1309,6 +1311,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     schedule_issue_retry(state, issue.id, retry_attempt || 1, %{
       identifier: issue.identifier,
+      execution_identity: Issue.execution_identity(issue),
       issue_url: issue.url,
       error: inspect(reason),
       worker_host: worker_host
@@ -1446,6 +1449,7 @@ defmodule SymphonyElixir.Orchestrator do
     error = pick_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    execution_identity = Map.get(metadata, :execution_identity) || Map.get(previous_retry, :execution_identity)
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -1469,7 +1473,8 @@ defmodule SymphonyElixir.Orchestrator do
             issue_url: issue_url,
             error: error,
             worker_host: worker_host,
-            workspace_path: workspace_path
+            workspace_path: workspace_path,
+            execution_identity: execution_identity
           })
     }
   end
@@ -1482,7 +1487,8 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: Map.get(retry_entry, :issue_url),
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          execution_identity: Map.get(retry_entry, :execution_identity)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1516,7 +1522,7 @@ defmodule SymphonyElixir.Orchestrator do
     terminal_states = terminal_state_set()
 
     cond do
-      terminal_issue_state?(issue.state, terminal_states) ->
+      terminal_issue_state?(issue.state, terminal_states) and not pending_finalization_issue?(issue) ->
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
         cleanup_issue_workspace(issue, metadata)
@@ -1601,6 +1607,7 @@ defmodule SymphonyElixir.Orchestrator do
              attempt + 1,
              Map.merge(metadata, %{
                identifier: issue.identifier,
+               execution_identity: Issue.execution_identity(issue),
                error: "retry dispatch refresh failed: #{inspect(reason)}"
              })
            )}
@@ -1615,6 +1622,7 @@ defmodule SymphonyElixir.Orchestrator do
          attempt + 1,
          Map.merge(metadata, %{
            identifier: issue.identifier,
+           execution_identity: Issue.execution_identity(issue),
            error: "no available orchestrator slots"
          })
        )}
@@ -1818,6 +1826,7 @@ defmodule SymphonyElixir.Orchestrator do
         %{
           issue_id: issue_id,
           identifier: metadata.identifier,
+          execution_identity: execution_identity(Map.get(metadata, :issue)),
           issue_url: metadata.issue.url,
           state: metadata.issue.state,
           worker_host: Map.get(metadata, :worker_host),
@@ -1844,6 +1853,7 @@ defmodule SymphonyElixir.Orchestrator do
           attempt: attempt,
           due_in_ms: max(0, due_at_ms - now_ms),
           identifier: Map.get(retry, :identifier),
+          execution_identity: Map.get(retry, :execution_identity),
           issue_url: Map.get(retry, :issue_url),
           error: Map.get(retry, :error),
           worker_host: Map.get(retry, :worker_host),
@@ -1857,6 +1867,7 @@ defmodule SymphonyElixir.Orchestrator do
         %{
           issue_id: issue_id,
           identifier: Map.get(metadata, :identifier),
+          execution_identity: execution_identity(Map.get(metadata, :issue)),
           issue_url: blocked_issue_url(metadata),
           state: blocked_issue_state(metadata),
           worker_host: Map.get(metadata, :worker_host),
@@ -1899,6 +1910,9 @@ defmodule SymphonyElixir.Orchestrator do
        operations: ["poll", "reconcile"]
      }, state}
   end
+
+  defp execution_identity(%Issue{} = issue), do: Issue.execution_identity(issue)
+  defp execution_identity(_issue), do: nil
 
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state
   defp blocked_issue_state(_metadata), do: nil

@@ -290,6 +290,7 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   embedded_schema do
+    field(:merge_policy, :string, default: "human")
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
@@ -303,14 +304,12 @@ defmodule SymphonyElixir.Config.Schema do
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
   def parse(config) when is_map(config) do
-    config
-    |> normalize_keys()
-    |> drop_nil_values()
-    |> changeset()
-    |> apply_action(:validate)
-    |> case do
+    attrs = config |> normalize_keys() |> drop_nil_values()
+    merge_policy_explicit? = Map.has_key?(attrs, "merge_policy")
+
+    case attrs |> changeset() |> apply_action(:validate) do
       {:ok, settings} ->
-        {:ok, finalize_settings(settings)}
+        {:ok, finalize_settings(settings, merge_policy_explicit?)}
 
       {:error, changeset} ->
         {:error, {:invalid_workflow_config, format_errors(changeset)}}
@@ -383,7 +382,8 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp changeset(attrs) do
     %__MODULE__{}
-    |> cast(attrs, [])
+    |> cast(attrs, [:merge_policy], empty_values: [])
+    |> validate_inclusion(:merge_policy, ["human", "auto"])
     |> cast_embed(:tracker, with: &Tracker.changeset/2)
     |> cast_embed(:polling, with: &Polling.changeset/2)
     |> cast_embed(:workspace, with: &Workspace.changeset/2)
@@ -395,7 +395,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:server, with: &Server.changeset/2)
   end
 
-  defp finalize_settings(settings) do
+  defp finalize_settings(settings, merge_policy_explicit?) do
     provider = normalize_optional_map(settings.tracker.provider) || %{}
 
     {api_key, assignee, provider, secret_environment_names} =
@@ -424,6 +424,8 @@ defmodule SymphonyElixir.Config.Schema do
         _ ->
           {settings.tracker.api_key, settings.tracker.assignee, provider, []}
       end
+
+    provider = merge_policy_into_provider(provider, settings.tracker.kind, settings.merge_policy, merge_policy_explicit?)
 
     {active_states, terminal_states} =
       case settings.tracker.kind do
@@ -462,6 +464,12 @@ defmodule SymphonyElixir.Config.Schema do
 
     %{settings | tracker: tracker, workspace: workspace, codex: codex}
   end
+
+  defp merge_policy_into_provider(provider, kind, merge_policy, explicit?) when kind in ["github", "github_projects"] do
+    if explicit?, do: Map.put(provider, "merge_policy", merge_policy), else: Map.put_new(provider, "merge_policy", merge_policy)
+  end
+
+  defp merge_policy_into_provider(provider, _kind, _merge_policy, _explicit?), do: provider
 
   defp normalize_keys(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, raw_value}, normalized ->

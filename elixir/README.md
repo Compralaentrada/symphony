@@ -12,7 +12,9 @@ installation.
 
 1. Reads eligible issues from the configured tracker. The current pilot uses GitHub Projects v2;
    adapters are also available for GitHub Issues, Linear, Jira Cloud, Asana, and GitLab.
-2. Creates an isolated workspace for each issue and launches Codex in
+2. Creates an isolated workspace for each issue. GitHub Projects executions include the Project,
+   item, repository, and issue number in their identity, so same-number issues in different
+   repositories keep separate workspaces and pull request lookups. Then Symphony launches Codex in
    [App Server mode](https://developers.openai.com/codex/app-server/).
 3. Runs Build, QA, and autonomous Review in separate sessions for GitHub Projects work.
 4. Verifies configured QA checks, prepares a pull request for human review, and waits for the
@@ -31,6 +33,12 @@ host.
 Local runs discover repo-local Codex skills from `.agents/skills` in the workspace checkout.
 Symphony checks selected skills before launching Codex and reports a missing `SKILL.md` path; pinned
 sources and fingerprints are listed in [`../.agents/skills/SOURCES.md`](../.agents/skills/SOURCES.md).
+
+In the Projects pipeline, Symphony owns the Build, QA, and Review role prompts and base skill
+assignments; installation `WORKFLOW.md` front matter cannot remap them. Task-specific skills are
+selected from issue context. Unattended sessions load only selected task skills; separate workflow
+instructions can still request operational skills. Interactive skills such as Impeccable and TDD
+are not forced into unattended sessions.
 
 During single-run app-server sessions, the selected tracker adapter may advertise provider-native
 tools. Linear serves `linear_graphql`, GitHub Issues and GitHub Projects v2 serve the read-only
@@ -57,13 +65,21 @@ If Codex reports that operator input, approval, or MCP elicitation is required, 
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. For the durable
 Projects pipeline, phase checkpoints and external-operation records are stored in SQLite at
 `~/.symphony/pipeline.sqlite3`; GitHub agent writes are verified remotely before Symphony advances
-the checkpoint. After the independent QA review, Symphony runs every `required_checks` command from
+the checkpoint. If a nonterminal checkpoint no longer matches the tracker state, Symphony records a
+local blocker with the reason and leaves the tracker unchanged; moving the item to Ready resumes the
+preserved work. After the independent QA review, Symphony runs every `required_checks` command from
 the repository profile in the task workspace and gives the evidence to the QA agent; missing or
 failed host checks cannot pass QA.
 A merge into the configured base branch is required before Symphony sets Done. Moving a Human Review
 item back to Ready requests corrections on the same branch and PR. To move unmerged work to Dropped,
 add a human-authored `Drop reason: <reason>` line to the issue body; after a `no_changes` result,
 this line confirms the decision to discard the work.
+
+With `merge_policy: auto`, Review invokes the deterministic merge gate. It requires the reviewed PR
+head SHA, the current base SHA, and successful required checks. The gate stops when GitHub cannot
+confirm any of that state. When the gate passes, Symphony merges the PR and verifies that GitHub
+reports it merged before closing the issue and moving the Project item to Done. Symphony never
+approves PRs automatically; a rejected gate leaves the PR in Human Review.
 
 Pipeline phase reports use Markdown in Spanish when the issue is Spanish, and English for English,
 unsupported, or ambiguous issue languages. Reports omit empty sections and distinguish blocked
@@ -147,6 +163,9 @@ describe the supported tracker settings.
 Notes:
 
 - If a value is missing, defaults are used.
+- `merge_policy` accepts `human` (the default) or `auto`; set `auto` explicitly to opt in.
+  A top-level value takes precedence over `tracker.provider.merge_policy`; when omitted, an
+  explicit provider value remains supported. Symphony never approves pull requests automatically.
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
   `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
   `api_key`, `project_slug`, and `assignee` aliases for compatibility.
@@ -205,7 +224,10 @@ Notes:
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
-  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+  `/`, `/api/v1/state`, `/api/v1/delivery`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+- `GET /api/v1/delivery` returns persisted pipeline tasks alongside a current tracker lookup by
+  stable issue ID. `tracker_issue.lookup` is `found`, `missing`, or `error`; the tracker issue's
+  title, URL, and state are returned separately from the pipeline task.
 
 ### Linear adapter profile
 
@@ -263,6 +285,9 @@ tracker:
 - Work identity is `owner/repository#number`. Claiming moves Ready to Building, successful completion
   moves Building to Done, and intervention-required failures move to Blocked with a comment. Transient
   failures retry on the existing backoff path.
+- A rejected GitHub handoff or a phase report with no handoff attempt gets one correction turn in
+  the same session; another rejection uses the normal retry path. A successful handoff without
+  returned evidence fails normally instead of risking a duplicate remote write.
 - Native GitHub `blocked by` relations populate `issue.blocked_by` with `owner/repository#number`
   identities. Incomplete or failed blocker reads fail the Project refresh instead of dropping
   dependency data.

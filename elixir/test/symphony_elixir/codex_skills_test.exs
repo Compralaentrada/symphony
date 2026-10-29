@@ -27,7 +27,7 @@ defmodule SymphonyElixir.Codex.SkillsTest do
 
   test "reports a missing required skill before Codex starts" do
     workspace = Path.join(System.tmp_dir!(), "codex-skills-missing-#{System.unique_integer([:positive])}")
-    issue = %Issue{labels: ["ready-for-agent"]}
+    issue = %Issue{labels: ["ready-for-agent", "customer-facing"]}
     on_exit(fn -> File.rm_rf(workspace) end)
 
     for skill <- ["ponytail", "code-review"] do
@@ -36,9 +36,9 @@ defmodule SymphonyElixir.Codex.SkillsTest do
       File.write!(skill_path, "---\nname: #{skill}\n---\n")
     end
 
-    expected_path = Path.join([workspace, ".agents", "skills", "tdd", "SKILL.md"])
+    expected_path = Path.join([workspace, ".agents", "skills", "humanizer", "SKILL.md"])
 
-    assert {:error, {:required_skill_unavailable, "tdd", ^expected_path}} =
+    assert {:error, {:required_skill_unavailable, "humanizer", ^expected_path}} =
              Skills.ensure_available(workspace, issue)
   end
 
@@ -96,25 +96,18 @@ defmodule SymphonyElixir.Codex.SkillsTest do
   end
 
   test "selects skills by explicit issue work labels" do
-    assert Skills.select(%Issue{labels: nil}) == ["ponytail", "tdd", "code-review"]
-    assert Skills.select(%Issue{labels: ["ready-for-agent"]}) == ["ponytail", "tdd", "code-review"]
+    assert Skills.select(%Issue{labels: nil}) == ["ponytail", "code-review"]
+    assert Skills.select(%Issue{labels: ["ready-for-agent"]}) == ["ponytail", "code-review"]
 
     assert Skills.select(%Issue{labels: ["Frontend"]}) == [
              "ponytail",
-             "tdd",
-             "code-review",
-             "impeccable"
-           ]
-
-    assert Skills.select(%Issue{labels: ["docs"]}) == [
-             "ponytail",
-             "tdd",
              "code-review"
            ]
 
+    assert Skills.select(%Issue{labels: ["docs"]}) == ["ponytail", "code-review"]
+
     assert Skills.select(%Issue{labels: ["user-facing"]}) == [
              "ponytail",
-             "tdd",
              "code-review",
              "humanizer"
            ]
@@ -125,5 +118,21 @@ defmodule SymphonyElixir.Codex.SkillsTest do
              "code-review",
              "humanizer"
            ]
+  end
+
+  test "selects pipeline skills by fixed phase and applicable task labels" do
+    backend_issue = %Issue{labels: ["backend"]}
+
+    assert Skills.select(backend_issue, :build) == ["ponytail"]
+    assert Skills.select(backend_issue, :qa) == []
+    assert Skills.select(backend_issue, :review) == []
+    assert Skills.select(backend_issue, :diagnostic) == []
+    assert Skills.select(backend_issue, :unknown_phase) == []
+
+    frontend_copy_issue = %Issue{labels: ["frontend", "customer-facing"]}
+
+    assert Skills.select(frontend_copy_issue, :build) == ["ponytail", "humanizer"]
+    assert Skills.select(frontend_copy_issue, :qa) == ["humanizer"]
+    assert Skills.select(frontend_copy_issue, :review) == ["humanizer"]
   end
 end
