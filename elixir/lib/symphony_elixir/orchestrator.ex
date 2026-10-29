@@ -1241,7 +1241,7 @@ defmodule SymphonyElixir.Orchestrator do
     send(recipient, {:pipeline_phase_result, issue.id, task["generation"], phase, phase_attempt, result})
   end
 
-  defp diagnose_system_blocker(runner, issue, recipient, opts, {:phase_result, {:system_blocker, _report}} = blocker) do
+  defp diagnose_system_blocker(runner, issue, recipient, opts, {:system_blocker, _report} = blocker) do
     if Pipeline.enabled?(), do: runner.run(issue, recipient, Keyword.put(opts, :diagnostic, true)), else: blocker
   end
 
@@ -1483,7 +1483,7 @@ defmodule SymphonyElixir.Orchestrator do
     terminal_states = terminal_state_set()
 
     cond do
-      terminal_issue_state?(issue.state, terminal_states) ->
+      terminal_issue_state?(issue.state, terminal_states) and not pending_finalization_issue?(issue) ->
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
         cleanup_issue_workspace(issue, metadata)

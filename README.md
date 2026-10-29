@@ -9,10 +9,13 @@ correspondiente y ejecuta las fases necesarias con Codex.
 - Coordina varios repositorios desde un único GitHub Project v2 mediante perfiles de repositorio.
 - Ejecuta Build, QA y Review en sesiones separadas y comprueba los comandos `required_checks` del
   repositorio durante QA.
+- Resuelve las skills del catálogo de Symphony por fase y añade las condicionales solo cuando
+  aplican a la tarea.
 - Publica informes Markdown en español para issues en español y en inglés para el resto.
 - Guarda checkpoints del pipeline en SQLite para reanudar el trabajo tras un reinicio.
 - Expone el estado operativo en un dashboard y una API JSON.
-- Espera una fusión humana y solo marca una tarea como Done tras confirmar la fusión.
+- Espera una fusión humana por defecto; solo `auto` explícito solicita la fusión al gate determinista.
+  Symphony nunca aprueba PRs y solo marca una tarea como Done tras confirmar la fusión.
 
 En el pipeline de Projects, el estado visible del Project determina el despacho. El flujo normal es
 `Ready → Building → QA → Review → Human Review → Done`; las tareas que requieren intervención
@@ -22,7 +25,9 @@ que aceptó Build y que el workspace esté limpio en ese SHA. Si una tarea bloqu
 vuelve de `Blocked` a `Ready` con el head cambiado o sin PR, reinicia en `Build` y repite ambas
 fases. Si falla una comprobación previa, el agente del lane `diagnostic` lee el workpad e inspecciona
 el workspace y la PR antes de documentar el motivo y la recuperación en la issue y el Project.
-Symphony detecta el bloqueo y coordina esa sesión, pero no escribe en GitHub.
+Symphony detecta el bloqueo y coordina esa sesión, pero no escribe en GitHub. Si un checkpoint de fase
+no coincide con el estado actual del tracker, conserva el trabajo y registra el bloqueo local sin
+cambiar el estado visible; mover la tarea a `Ready` permite reanudarla.
 
 El tablero usa el campo `Status` y las opciones canónicas de Symphony: `Backlog`, `Ready`, `Building`,
 `QA`, `Review`, `Human Review`, `Blocked`, `Done` y `Dropped`.

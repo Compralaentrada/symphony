@@ -45,7 +45,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <div class="hero-grid">
           <div>
             <p class="eyebrow">
-              Symphony Observability
+              Compralaentrada Observability
             </p>
             <h1 class="hero-title">
               Operations Dashboard

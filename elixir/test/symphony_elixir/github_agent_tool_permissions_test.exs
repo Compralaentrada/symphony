@@ -10,10 +10,18 @@ defmodule SymphonyElixir.GitHubAgentToolPermissionsTest do
     individual = AgentTool.tool_specs(agent_context(:individual, "auto"))
 
     assert workflow_operations(build) == ["claim", "read_workpad", "workpad", "handoff", "create_follow_up_issue"]
-    assert workflow_operations(qa) == ["read_workpad", "workpad", "handoff", "create_follow_up_issue"]
-    assert workflow_operations(review) == ["read_workpad", "workpad", "handoff", "create_follow_up_issue", "request_merge"]
+    assert workflow_operations(qa) == ["claim", "read_workpad", "workpad", "handoff", "create_follow_up_issue"]
+    assert workflow_operations(review) == ["claim", "read_workpad", "workpad", "handoff", "create_follow_up_issue", "request_merge"]
     refute "request_merge" in workflow_operations(individual)
     refute "read_workpad" in workflow_operations(individual)
+
+    report_schema =
+      build
+      |> Enum.find(&(&1["name"] == "github_workflow"))
+      |> get_in(["inputSchema", "properties", "report", "properties", "pull_request_body"])
+
+    assert report_schema["type"] == "string"
+    assert report_schema["description"] =~ ".github/pull_request_template.md"
   end
 
   test "GitHub reads are bound to the task repository and raw writes are unavailable" do
@@ -66,6 +74,31 @@ defmodule SymphonyElixir.GitHubAgentToolPermissionsTest do
       )
 
     refute response["success"]
+  end
+
+  test "Review reaches the merge gate only when auto is explicit" do
+    for context <- [agent_context(:review), Map.delete(agent_context(:review), :merge_policy)] do
+      response =
+        AgentTool.execute(
+          "github_workflow",
+          %{"operation" => "request_merge", "report" => %{}},
+          agent_context: context,
+          workflow_client: fn _context, _operation, _arguments -> flunk("human policy reached the merge gate") end
+        )
+
+      refute response["success"]
+    end
+
+    response =
+      AgentTool.execute(
+        "github_workflow",
+        %{"operation" => "request_merge", "report" => %{}},
+        agent_context: agent_context(:review, "auto"),
+        workflow_client: fn _context, "request_merge", _arguments -> {:ok, %{"requested" => true}} end
+      )
+
+    assert response["success"]
+    assert response["evidence"] == %{"requested" => true}
   end
 
   test "workflow rejects malformed calls and uses the configured GitHub tracker client" do

@@ -1,4 +1,5 @@
 ---
+merge_policy: auto
 tracker:
   kind: github_projects
   active_states:
@@ -43,6 +44,8 @@ codex:
   turn_sandbox_policy:
     type: dangerFullAccess
 ---
+
+The installation-level `merge_policy` front matter key accepts `human` (the default) or `auto`. A configured top-level value takes precedence over `tracker.provider.merge_policy`; when omitted, an explicit provider value remains supported. With `auto`, Review requests the deterministic merge gate; when the reviewed head SHA, base SHA, and required checks pass, Symphony merges and verifies the PR before closing the issue and moving its Project item to Done. Symphony never approves PRs automatically.
 
 You are working on a GitHub issue dispatched from the configured GitHub Projects v2 board.
 
@@ -98,6 +101,12 @@ Before planning, inspect the relevant skills under `.agents/skills` and `.codex/
 - Use repository skills such as `commit`, `push`, or `pull` when they fit the current repo and branch.
 - Do not download skills during a run or force an irrelevant skill into the task.
 
+For Projects pipeline sessions, Symphony fixes the Build, QA, and Review role prompts and base skill
+assignments. Installation front matter cannot remap them; task-specific skills are selected from
+issue context. Only task-specific skills selected by Symphony may be loaded in an unattended session;
+separate workflow instructions can still request operational skills. Interactive skills such as
+Impeccable and TDD are not forced into unattended sessions.
+
 ## Instructions
 
 1. This is an unattended orchestration session. Do not ask a human for follow-up actions.
@@ -117,7 +126,7 @@ Before planning, inspect the relevant skills under `.agents/skills` and `.codex/
 - Follow any issue-provided Validation, Test Plan, or Testing section.
 - For user-facing changes, include an end-to-end walkthrough. For application behavior changes, record the launch path, interaction, and expected result.
 - Run checks required by the issue and use targeted validation for the changed behavior.
-- Do not approve or merge pull requests. Human approval and merge remain manual.
+- Do not approve pull requests or merge them directly. With `human` policy, leave the PR in Human Review; with `auto`, request merge only through the deterministic gate after its checks pass.
 
 ## Step 0: Confirm the work
 
@@ -143,10 +152,12 @@ Before planning, inspect the relevant skills under `.agents/skills` and `.codex/
 ## Step 2: Prepare a human handoff
 
 1. Review the diff, acceptance criteria, validation evidence, and all PR feedback.
-2. Create or update a draft PR when the task produces code that needs review. Link it to the issue and include `Fixes #<issue-number>` when merging should close that issue.
-3. Do not merge or approve the PR.
-4. Update the persistent workpad with the final summary, validation evidence, and PR link.
-5. Stop after the handoff. On successful completion, the current tracker moves Building to Done. If a reviewer requests changes, a human moves the open issue back to Ready; Symphony resumes the same workspace and branch. If the saved SHA was invalidated, Build syncs the issue branch before its next run; if the workspace cannot be reconciled automatically, follow its blocked report, resolve the branch, and move the issue back to Ready.
+2. Read `.github/pull_request_template.md` and write the complete PR description with every section in order, its length guidance followed, and every placeholder removed. Put it in `report.pull_request_body`, include `Fixes #<issue-number>` on its own line for the assigned issue, and do not add Symphony delivery markers. The separate `github_workflow` handoff `body` is the issue report comment, not the PR description; its hidden JSON must match the report, including `pull_request_body`.
+3. Set `body_file=$(mktemp)`, save the exact PR description there, and validate it with `(cd elixir && mise exec -- mix pr_body.check --file "$body_file")`.
+4. Hand off with `github_workflow` operation `handoff`; the host validates the PR description, wraps it in Symphony-owned delivery markers, and creates or updates the draft PR while preserving human text outside that block.
+5. Do not merge or approve the PR.
+6. Update the persistent workpad with the final summary, validation evidence, and PR link.
+7. Stop after the handoff. On successful completion, the current tracker moves Building to Done. If a reviewer requests changes, a human moves the open issue back to Ready; Symphony resumes the same workspace and branch. If the saved SHA was invalidated, Build syncs the issue branch before its next run; if the workspace cannot be reconciled automatically, follow its blocked report, resolve the branch, and move the issue back to Ready.
 
 ## Workpad template
 

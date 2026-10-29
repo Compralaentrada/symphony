@@ -916,6 +916,10 @@ Failure handling:
   evidence where available. When a blocked QA or Review task is requeued after the PR head changed
   or the PR is missing, it restarts at Build so the accepted SHA and subsequent QA and Review
   evidence are refreshed together.
+- If a nonterminal phase checkpoint conflicts with the current nonterminal tracker state, a GitHub
+  Projects implementation SHOULD preserve the checkpoint and workspace, record a local blocker with
+  the mismatch reason, and leave the visible tracker state unchanged. Moving the item to `Ready`
+  explicitly requeues the work from the preserved checkpoint.
 
 ### 9.4 Workspace Hooks
 
@@ -1637,6 +1641,37 @@ Minimum endpoints:
       "operations": ["poll", "reconcile"]
     }
     ```
+
+Optional pipeline endpoint:
+
+- `GET /api/v1/delivery`
+  - Returns persisted pipeline tasks with a current lookup in the configured tracker by each task's
+    stable issue ID.
+  - The nested `task` contains the local pipeline record. `tracker_issue.issue` contains the
+    tracker's current `id`, `identifier`, `title`, `url`, and `state` when found. Its `lookup` is
+    `found`, `missing`, or `error`; `issue` is `null` for `missing` and `error`. The tracker state
+    is never inferred from the stored task.
+  - A local journal read failure returns `503` with error code `delivery_unavailable`.
+
+  ```json
+  {
+    "tasks": [
+      {
+        "task": { "issue_id": "abc123", "phase": "qa", "status": "qa" },
+        "tracker_issue": {
+          "lookup": "found",
+          "issue": {
+            "id": "abc123",
+            "identifier": "MT-649",
+            "title": "Review pipeline delivery",
+            "url": "https://tracker.example/issues/MT-649",
+            "state": "Human Review"
+          }
+        }
+      }
+    ]
+  }
+  ```
 
 API design notes:
 
