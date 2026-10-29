@@ -640,6 +640,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       status_option_ids: metadata.status_option_ids,
       project_status: project_status,
       issue_node_id: content["id"],
+      issue_number: number,
       issue_state: content["state"],
       issue_state_reason: content["stateReason"],
       repository: repository,
@@ -1200,15 +1201,25 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp current_generation_phase_reports(issue, generation, comments) do
     Enum.reduce(~w(build qa review finalize), %{}, fn phase, reports ->
       marker = phase_report_marker(issue, generation, phase)
+      legacy_marker = "<!-- symphony:report:start:#{issue.id}:#{generation}:#{phase}"
 
       phase_reports =
         comments
-        |> Enum.filter(&phase_report_comment?(&1["body"] || "", marker))
-        |> Enum.map(&Map.put(task_comment(&1), "attempt", phase_report_attempt(&1["body"] || "", marker)))
+        |> Enum.map(&phase_report_entry(&1, [marker, legacy_marker]))
+        |> Enum.reject(&is_nil/1)
         |> Enum.sort_by(& &1["attempt"])
 
       if phase_reports == [], do: reports, else: Map.put(reports, phase, phase_reports)
     end)
+  end
+
+  defp phase_report_entry(comment, markers) do
+    body = comment["body"] || ""
+
+    case Enum.find(markers, &phase_report_comment?(body, &1)) do
+      nil -> nil
+      matched_marker -> Map.put(task_comment(comment), "attempt", phase_report_attempt(body, matched_marker))
+    end
   end
 
   defp validate_review_qa_report(%{lane: lane, task: task}, phase_reports)
@@ -1232,7 +1243,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp latest_phase_report(phase_reports, phase), do: phase_reports |> Map.get(phase, []) |> List.last()
 
   defp phase_report_marker(issue, generation, phase),
-    do: "<!-- symphony:report:start:#{issue.id}:#{generation}:#{phase}"
+    do: "<!-- symphony:report:start:#{Issue.execution_identity(issue)}:#{generation}:#{phase}"
 
   defp phase_report_comment?(body, marker),
     do: String.contains?(body, marker <> " -->") or String.contains?(body, marker <> ":")
