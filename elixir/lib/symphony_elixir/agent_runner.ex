@@ -684,6 +684,8 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp pipeline_phase_instructions(:review, _opts) do
+    merge_policy = Map.get(Config.settings!().tracker.provider, "merge_policy", "human")
+
     """
     Pipeline phase: autonomous code review. Before any other GitHub write, call `github_workflow` with operation `claim`; stop if the claim is rejected. This moves a requeued Ready item to Review and confirms an item already in Review. Then read the issue's workpad and all current-generation QA reports with `github_workflow` operation `read_workpad` before reviewing. Use those task records and `report_context.task` to identify the accepted commit, branch, QA findings, and findings to resolve. Include the task's branch, base branch, PR number, and current SHA in your report, plus every prior finding not explicitly resolved.
     Use the QA report's host-check evidence for its recorded SHA; do not require a separate GitHub status context for Symphony's host-run check.
@@ -691,8 +693,8 @@ defmodule SymphonyElixir.AgentRunner do
     The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
     Do not modify files. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
     Update the persistent workpad with review findings and resolutions using `github_workflow` operation `workpad`.
-    With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`, then call `request_merge`; if the host confirms the merge, hand off outcome `merged` so the host verifies it before closing the issue and moving the item to Done. If the gate rejects the request, leave the PR in Human Review.
-    Finish with exactly one JSON object containing outcome (passed, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
+    The configured merge policy is #{merge_policy}. With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`, then call `request_merge`; if the host confirms the merge, hand off outcome `merged` so the host verifies it before closing the issue and moving the item to Done. If the gate rejects the request, leave the PR in Human Review.
+    Finish with exactly one JSON object containing outcome (passed, merged, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
     """
   end
 
@@ -880,7 +882,7 @@ defmodule SymphonyElixir.AgentRunner do
     properties = %{
       "outcome" => %{
         "type" => "string",
-        "enum" => ["passed", "changes_requested", "blocked", "failed", "defects_found"]
+        "enum" => ["passed", "changes_requested", "blocked", "failed", "defects_found"] ++ if(phase == :review, do: ["merged"], else: [])
       },
       "summary" => %{"type" => "string"},
       "findings" => %{
