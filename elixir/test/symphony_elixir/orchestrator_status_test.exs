@@ -112,6 +112,18 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert MapSet.member?(updated_state.claimed, issue.id)
   end
 
+  test "a Projects item moved from Blocked to QA is released for dispatch" do
+    write_projects_workflow!()
+    issue = %{lifecycle_issue("repo/app#7") | state: "QA", requeueable: false}
+    blocked_issue = %{issue | state: "Blocked", tracker_blocked: true}
+    state = %Orchestrator.State{blocked: %{issue.id => %{issue: blocked_issue, error: "blocked"}}, claimed: MapSet.new([issue.id]), retry_attempts: %{}}
+
+    updated_state = Orchestrator.reconcile_blocked_issue_states_for_test([issue], state)
+
+    refute Map.has_key?(updated_state.blocked, issue.id)
+    refute MapSet.member?(updated_state.claimed, issue.id)
+  end
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
@@ -199,12 +211,20 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
        }}
     )
 
+    send(pid, {:worker_runtime_info, issue_id, %{model: "gpt-6-luna", reasoning_effort: "max"}})
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_command: "codex --config model=\"gpt-6-orion\" --config model_reasoning_effort=low app-server"
+    )
+
     snapshot = GenServer.call(pid, :snapshot)
     assert %{running: [snapshot_entry]} = snapshot
     assert snapshot_entry.issue_id == issue_id
     assert snapshot_entry.issue_url == "https://example.org/issues/MT-188"
     assert snapshot_entry.session_id == "thread-live-turn-live"
     assert snapshot_entry.turn_count == 1
+    assert snapshot_entry.model == "gpt-6-luna"
+    assert snapshot_entry.reasoning_effort == "max"
     assert snapshot_entry.last_codex_timestamp == now
     assert snapshot_entry.pipeline_phase == "qa"
 

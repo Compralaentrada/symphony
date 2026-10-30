@@ -41,6 +41,10 @@ selected from issue context. Unattended sessions load only selected task skills;
 instructions can still request operational skills. Interactive skills such as Impeccable and TDD
 are not forced into unattended sessions.
 
+When a Codex session ends, Symphony asks app-server to archive its thread so it no longer appears
+in the active chat list. The archived history remains available; an archive failure is logged and
+does not change the task result.
+
 During single-run app-server sessions, the selected tracker adapter may advertise provider-native
 tools. Linear serves `linear_graphql`, GitHub Issues and GitHub Projects v2 serve the read-only
 `github_api` plus the task-scoped `github_workflow`, Jira Cloud serves `jira_rest`, Asana serves
@@ -301,8 +305,13 @@ tracker:
   the same session; another rejection uses the normal retry path. A successful handoff without
   returned evidence fails normally instead of risking a duplicate remote write.
 - Native GitHub `blocked by` relations populate `issue.blocked_by` with `owner/repository#number`
-  identities. Incomplete or failed blocker reads fail the Project refresh instead of dropping
-  dependency data.
+  identities. Open blockers wait without dispatch; closed blockers clear the dependency gate.
+  Malformed, ambiguous, incomplete, or permission-limited relations stay attached to the issue as
+  `dependency_error` and enter the restricted diagnostic lane. That agent requests `Blocked` with
+  the reason and correction through the mediated GitHub workflow. Transient tracker read failures
+  keep the existing retry behavior. A pending Finalize diagnostic may request `Blocked` from
+  `Human Review`; an unconfirmed Review handoff that reaches `Human Review` still waits for a human
+  decision.
 - Project items can belong to either a user or organization Project. The optional `graphql_url`
   setting defaults to `https://api.github.com/graphql`.
 - Tool: the Linear adapter advertises `linear_graphql`, accepting either a raw query string or an
@@ -377,6 +386,7 @@ tracker:
 The observability UI now runs on a minimal Phoenix stack:
 
 - LiveView dashboard at `/` with Operations and read-only Delivery views
+- Operations shows each active session's configured model and reasoning effort captured at startup
 - Delivery lists pipeline tasks with the current title, status, and issue link from the configured tracker
 - JSON API for operational debugging under `/api/v1/*`
 - Bandit as the HTTP server

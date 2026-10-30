@@ -1,6 +1,95 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "closing a session archives its thread" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-archive-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "active")
+    codex_binary = Path.join(test_root, "fake-codex")
+    archive_log = Path.join(test_root, "archive")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    IFS= read -r line
+    printf '%s\\n' '{"id":1,"result":{}}'
+    IFS= read -r line
+    IFS= read -r line
+    printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-archive"}}}'
+    IFS= read -r line
+    printf '%s\\n' "$line" > '#{archive_log}'
+    printf '%s\\n' '{"id":4,"result":{}}'
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server"
+    )
+
+    assert {:ok, session} = AppServer.start_session(workspace)
+    assert :ok = AppServer.stop_session(session)
+
+    assert %{"method" => "thread/archive", "params" => %{"threadId" => "thread-archive"}} =
+             archive_log |> File.read!() |> Jason.decode!()
+  end
+
+  test "app server captures configured model and reasoning at session startup" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-app-server-settings-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "active")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    codex_binary = fake_codex_binary!(test_root)
+    command = ~s(#{codex_binary} --config 'model="gpt-6-luna"' --config model_reasoning_effort=max app-server)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: command
+    )
+
+    assert {:ok, session} = AppServer.start_session(workspace)
+    assert session.model == "gpt-6-luna"
+    assert session.reasoning_effort == "max"
+
+    updated_command = ~s(#{codex_binary} --config model="gpt-6-orion" --config model_reasoning_effort=low app-server)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: updated_command
+    )
+
+    assert Config.settings!().codex.command == updated_command
+    assert session.model == "gpt-6-luna"
+    assert session.reasoning_effort == "max"
+
+    AppServer.stop_session(session)
+  end
+
+  test "app server leaves model and reasoning unavailable when the command omits them" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-app-server-settings-missing-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "active")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    codex_binary = fake_codex_binary!(test_root)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server"
+    )
+
+    assert {:ok, session} = AppServer.start_session(workspace)
+    assert is_nil(session.model)
+    assert is_nil(session.reasoning_effort)
+
+    AppServer.stop_session(session)
+  end
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
@@ -1627,5 +1716,22 @@ defmodule SymphonyElixir.AppServerTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp fake_codex_binary!(test_root) do
+    codex_binary = Path.join(test_root, "codex")
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    while IFS= read -r line; do
+      case "$line" in
+        *'"id":1'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
+        *'"id":2'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-settings"}}}' ;;
+      esac
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+    codex_binary
   end
 end
