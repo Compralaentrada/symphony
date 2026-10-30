@@ -301,8 +301,13 @@ tracker:
   the same session; another rejection uses the normal retry path. A successful handoff without
   returned evidence fails normally instead of risking a duplicate remote write.
 - Native GitHub `blocked by` relations populate `issue.blocked_by` with `owner/repository#number`
-  identities. Incomplete or failed blocker reads fail the Project refresh instead of dropping
-  dependency data.
+  identities. Open blockers wait without dispatch; closed blockers clear the dependency gate.
+  Malformed, ambiguous, incomplete, or permission-limited relations stay attached to the issue as
+  `dependency_error` and enter the restricted diagnostic lane. That agent requests `Blocked` with
+  the reason and correction through the mediated GitHub workflow. Transient tracker read failures
+  keep the existing retry behavior. A pending Finalize diagnostic may request `Blocked` from
+  `Human Review`; an unconfirmed Review handoff that reaches `Human Review` still waits for a human
+  decision.
 - Project items can belong to either a user or organization Project. The optional `graphql_url`
   setting defaults to `https://api.github.com/graphql`.
 - Tool: the Linear adapter advertises `linear_graphql`, accepting either a raw query string or an

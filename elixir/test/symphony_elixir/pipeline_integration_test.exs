@@ -704,6 +704,201 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     stop_orchestrator(orchestrator)
   end
 
+  test "open blockers wait while invalid Project dependencies go straight to diagnostics" do
+    reason = "GitHub could not read complete blocker data. Correct the relationship, then move the Project item to Ready."
+    issue = %{issue("octo/app#46", 46) | dependency_error: reason}
+    open_blocker = %{issue | dependency_error: nil, blocked_by: [%{id: "octo/app#47", state: "OPEN"}]}
+    table = start_board([issue], %{})
+    pipeline_database!(table, retry_backoff_ms: 300_000)
+
+    state = %Orchestrator.State{max_concurrent_agents: 3, running: %{}, claimed: MapSet.new(), blocked: %{}}
+    refute Orchestrator.should_dispatch_issue_for_test(open_blocker, state)
+
+    assert Orchestrator.should_dispatch_issue_for_test(
+             %{open_blocker | blocked_by: [%{id: "octo/app#47", state: "CLOSED"}]},
+             state
+           )
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+
+    orchestrator = start_orchestrator(SymphonyElixir.PipelineIntegrationTest.DiagnosticAgent)
+
+    assert await(fn -> project_state(table, issue.id) == "Blocked" end)
+    assert lookup(table, {:diagnostic_runner_calls, issue.id}) == 1
+    assert agent_calls(table, issue.id) == 0
+    assert {:diagnostic_opts, opts} = :ets.lookup(table, :diagnostic_opts) |> List.last()
+    assert Keyword.get(opts, :diagnostic) == true
+    assert Keyword.get(opts, :diagnostic_reason) == reason
+
+    report = Jason.decode!(lookup(table, {:report, issue.id, "diagnostic"}))
+    assert report["reason"] == reason
+    assert report["next_step"] =~ "Ready"
+
+    stop_orchestrator(orchestrator)
+  end
+
+  test "unconfirmed Blocked transition waits for an observed requeue before Build" do
+    reason = "GitHub denied access to a blocker. Grant read access, correct the relationship, then move the item to Ready."
+    issue = %{issue("octo/app#47", 47) | dependency_error: reason}
+    table = start_board([issue], %{})
+    pipeline_database!(table, retry_backoff_ms: 300_000)
+    :ets.insert(table, {:unconfirm_status_once, true})
+
+    orchestrator = start_orchestrator(SymphonyElixir.PipelineIntegrationTest.DiagnosticAgent)
+
+    assert await(fn -> lookup(table, {:status_unconfirmed, issue.id}) end)
+    assert project_state(table, issue.id) == "Ready"
+    assert lookup(table, {:diagnostic_runner_calls, issue.id}) == 1
+    assert agent_calls(table, issue.id) == 0
+
+    assert await(fn ->
+             match?(
+               {:ok, %{"status" => "blocked", "diagnostic_handoff_unconfirmed" => true}},
+               Store.get_task(issue.id)
+             )
+           end)
+
+    assert {:ok, %{result: %{"outcome" => "blocked", "reason" => local_reason, "next_step" => next_step}}} =
+             Store.latest_phase_result(issue.id, 1)
+
+    assert local_reason =~ "No se pudo confirmar"
+    assert next_step =~ "Ready"
+
+    report = Jason.decode!(lookup(table, {:report, issue.id, "diagnostic"}))
+    assert report["reason"] == reason
+    assert report["next_step"] =~ "Ready"
+
+    stop_orchestrator(orchestrator)
+
+    corrected = %{fetch_issue(table, issue.id) | dependency_error: nil}
+    :ets.insert(table, {{:issue, issue.id}, corrected})
+    name = Module.concat(__MODULE__, "DiagnosticRequeue#{System.unique_integer([:positive])}")
+    {:ok, orchestrator} = Orchestrator.start_link(name: name, agent_runner: HoldingAgent)
+    refresh!(name, table)
+
+    assert project_state(table, issue.id) == "Ready"
+    assert agent_calls(table, issue.id, :build) == 0
+
+    set_project_state(table, issue.id, "Blocked")
+    refresh!(name, table)
+    assert {:ok, %{"status" => "blocked"} = task} = Store.get_task(issue.id)
+    refute Map.has_key?(task, "diagnostic_handoff_unconfirmed")
+
+    set_project_state(table, issue.id, "Ready")
+    refresh!(name, table)
+    assert await(fn -> lookup(table, {:held_agent_pid, issue.id}) != nil end)
+    assert agent_calls(table, issue.id, :build) == 1
+    send(lookup(table, {:held_agent_pid, issue.id}), :release)
+    stop_orchestrator(orchestrator)
+  end
+
+  test "invalid Project dependencies during Finalize use the diagnostic lane" do
+    reason = "GitHub could not read complete blocker data. Correct the relationship, then move the Project item to Ready."
+
+    issue = %{
+      issue("octo/app#48", 48)
+      | state: "Human Review",
+        dependency_error: reason,
+        native_ref: %{repository: "octo/app", base_branch: "main", project_status: "Human Review"}
+    }
+
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+
+    task = %{
+      "issue_id" => issue.id,
+      "repository" => "octo/app",
+      "branch" => issue.branch_name,
+      "base_branch" => "main",
+      "required_checks" => ["true"],
+      "generation" => 1,
+      "phase" => "finalize",
+      "status" => "finalize",
+      "attempts" => %{},
+      "prior_findings" => [],
+      "current_sha" => String.duplicate("a", 40)
+    }
+
+    assert :ok = Store.save_task(task)
+    sha = task["current_sha"]
+    :ets.insert(table, {{:remote_sha, issue.id}, sha})
+
+    :ets.insert(table, {
+      {:pull_request, issue.id},
+      %{number: 148, branch: issue.branch_name, base: "main", sha: sha, draft: false, merged: true, body: "delivery", url: "https://github.com/octo/app/pull/148"}
+    })
+
+    orchestrator = start_orchestrator(SymphonyElixir.PipelineIntegrationTest.FinalizationDiagnosticAgent)
+
+    assert await(fn ->
+             project_state(table, issue.id) == "Blocked" and
+               match?({:ok, %{"status" => "blocked", "phase" => "finalize"}}, Store.get_task(issue.id))
+           end)
+
+    assert lookup(table, {:diagnostic_runner_calls, issue.id}) == 1
+    assert agent_calls(table, issue.id) == 0
+
+    report = Jason.decode!(lookup(table, {:report, issue.id, "diagnostic"}))
+    assert report["reason"] == reason
+    assert report["next_step"] =~ "Ready"
+
+    :ets.insert(table, {
+      {:issue, issue.id},
+      %{
+        issue
+        | state: "Ready",
+          dependency_error: nil,
+          blocked_by: [%{id: "octo/app#51", state: "CLOSED"}],
+          requeueable: true,
+          native_ref: Map.put(issue.native_ref, :project_status, "Ready")
+      }
+    })
+
+    assert await(fn ->
+             project_state(table, issue.id) == "Done" and
+               match?({:ok, %{"status" => "done", "phase" => "finalize"}}, Store.get_task(issue.id))
+           end)
+
+    assert lookup(table, {:agent_calls, issue.id, :finalize}) == 1
+
+    stop_orchestrator(orchestrator)
+  end
+
+  test "open Project blockers pause pending Finalize work" do
+    issue = %{
+      issue("octo/app#49", 49)
+      | state: "Human Review",
+        blocked_by: [%{id: "octo/app#50", state: "OPEN"}],
+        native_ref: %{repository: "octo/app", base_branch: "main", project_status: "Human Review"}
+    }
+
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+
+    assert :ok =
+             Store.save_task(%{
+               "issue_id" => issue.id,
+               "generation" => 1,
+               "phase" => "finalize",
+               "status" => "finalize"
+             })
+
+    state = %Orchestrator.State{max_concurrent_agents: 3, running: %{}, claimed: MapSet.new(), blocked: %{}}
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+    refute Orchestrator.retry_candidate_issue_for_test(issue)
+    assert Orchestrator.retry_candidate_issue_for_test(%{issue | dependency_error: "Blocker data could not be read."})
+  end
+
+  test "Finalize diagnostics accept a Blocked report with a recovery step" do
+    schema = SymphonyElixir.AgentRunner.phase_report_schema_for_test(:finalize, true)
+    properties = schema["properties"]
+
+    assert properties["outcome"]["enum"] == ["blocked"]
+    assert "reason" in schema["required"]
+    assert "next_step" in schema["required"]
+    refute "reason" in SymphonyElixir.AgentRunner.phase_report_schema_for_test(:finalize, false)["required"]
+  end
+
   test "direct QA blocks a ready PR before running workspace checks" do
     issue = issue("octo/app#143", 143)
     table = start_board([issue], %{})
@@ -2285,13 +2480,19 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
   end
 
   defp save_status(issue, updated, close_issue?) do
-    updated =
-      if close_issue?,
-        do: %{updated | native_ref: Map.put(updated.native_ref || %{}, :issue_state, "closed")},
-        else: updated
+    if lookup(table(), :unconfirm_status_once) do
+      :ets.delete(table(), :unconfirm_status_once)
+      :ets.insert(table(), {{:status_unconfirmed, issue.id}, true})
+      {:error, :github_project_transition_not_verified}
+    else
+      updated =
+        if close_issue?,
+          do: %{updated | native_ref: Map.put(updated.native_ref || %{}, :issue_state, "closed")},
+          else: updated
 
-    :ets.insert(table(), {{:issue, issue.id}, updated})
-    :ok
+      :ets.insert(table(), {{:issue, issue.id}, updated})
+      :ok
+    end
   end
 
   defp update_review_stage(issue, "review", "passed", pr), do: update_stage(issue, pr, :ready)
@@ -2321,11 +2522,20 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
 
     sources =
       case lane do
-        "build" -> [status_value(:building)]
-        "qa" -> [status_value(:qa)]
-        "review" -> [status_value(:review), status_value(:human_review)]
-        "diagnostic" -> [status_value(:ready), status_value(:building), status_value(:qa), status_value(:review)]
-        "finalize" -> [status_value(:human_review)]
+        "build" ->
+          [status_value(:building)]
+
+        "qa" ->
+          [status_value(:qa)]
+
+        "review" ->
+          [status_value(:review), status_value(:human_review)]
+
+        "diagnostic" ->
+          Enum.map([:ready, :building, :qa, :review, :human_review], &status_value/1)
+
+        "finalize" ->
+          [status_value(:human_review), status_value(:ready)]
       end
 
     status in [target | sources]
@@ -2457,11 +2667,14 @@ defmodule SymphonyElixir.PipelineIntegrationTest.DiagnosticAgent do
     table = Application.fetch_env!(:symphony_elixir, :pipeline_test_board)
     :ets.insert(table, {:diagnostic_opts, opts})
 
+    reason = Keyword.get(opts, :diagnostic_reason) || "The PR head no longer matches the accepted QA SHA."
+    next_step = if Keyword.has_key?(opts, :diagnostic_reason), do: "Correct the relationship, then move the issue to Ready.", else: "Move the issue to Ready to rerun Build, QA, and Review."
+
     report = %{
       "outcome" => "blocked",
-      "summary" => "The PR head no longer matches the accepted QA SHA.",
-      "reason" => "The PR head no longer matches the accepted QA SHA.",
-      "next_step" => "Move the issue to Ready to rerun Build, QA, and Review.",
+      "summary" => reason,
+      "reason" => reason,
+      "next_step" => next_step,
       "sha" => String.duplicate("a", 40),
       "findings" => [],
       "criteria" => [],
@@ -2497,5 +2710,16 @@ defmodule SymphonyElixir.PipelineIntegrationTest.DiagnosticAgent do
       %{"success" => true, "evidence" => evidence} -> {:ok, evidence}
       _ -> {:error, :github_tool_call_failed}
     end
+  end
+end
+
+defmodule SymphonyElixir.PipelineIntegrationTest.FinalizationDiagnosticAgent do
+  alias SymphonyElixir.PipelineIntegrationTest.DiagnosticAgent
+  alias SymphonyElixir.PipelineIntegrationTest.FakeAgent
+
+  def run(issue, recipient, opts) do
+    if Keyword.get(opts, :diagnostic, false),
+      do: DiagnosticAgent.run(issue, recipient, opts),
+      else: FakeAgent.run(issue, recipient, opts)
   end
 end
