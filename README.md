@@ -11,9 +11,9 @@ correspondiente y ejecuta las fases necesarias con Codex.
   bloquea solo las tareas de ese repositorio y deja un diagnóstico.
 - Aísla cada ejecución de Projects con el proyecto, el elemento, el repositorio y el número de issue;
   cada workspace y búsqueda de PR queda vinculado al repositorio correcto.
-- Ejecuta Build, QA y Review en sesiones separadas. QA vincula cada criterio con una prueba o
-  procedimiento y evidencia reproducible, y comprueba los comandos `required_checks` del
-  repositorio.
+- Ejecuta Build, QA y Review en sesiones separadas. QA puede añadir pruebas y artefactos de
+  evidencia a la misma rama y PR, sin cambiar código de producto; informa los archivos, el comando
+  verificado y el SHA entregado. Review inspecciona el diff y repite el comando sobre ese SHA.
 - Resuelve las skills del catálogo de Symphony por fase y añade las condicionales solo cuando
   aplican a la tarea.
 - Publica informes Markdown en español para issues en español y en inglés para el resto.
@@ -26,11 +26,14 @@ correspondiente y ejecuta las fases necesarias con Codex.
 
 En el pipeline de Projects, el estado visible del Project determina el despacho. El flujo normal es
 `Ready → Building → QA → Review → Human Review → Done`; una issue con etiqueta `qa` empieza en QA y
-continúa a Review usando una PR existente asociada a su rama. Las tareas que requieren intervención
-pueden pasar a `Blocked`. Mover una tarea de `Human Review` a `Ready` solicita correcciones sobre la
-misma rama y PR. Antes de QA o Review, Symphony comprueba que el `head SHA` de la PR siga siendo el
-que aceptó Build (o el SHA registrado de la PR para la ruta directa a QA) y que el workspace esté
-limpio en ese SHA. Si una tarea bloqueada en QA o Review vuelve de `Blocked` a `Ready` con el head
+continúa a Review usando una PR existente asociada a su rama. QA vincula cada criterio con evidencia,
+prueba el hueco de alto riesgo antes de completarlo y publica solo archivos de prueba o evidencia.
+Si no cambia archivos conserva el SHA; si los cambia, publica la actualización en la misma rama y
+PR para que Review valide el nuevo SHA y repita el comando de verificación. Los defectos de producto
+vuelven a Build y los fallos operativos pasan a `Blocked`. Mover una tarea de `Human Review` a `Ready`
+solicita correcciones sobre la misma rama y PR. Antes de QA o Review, Symphony comprueba que el
+`head SHA` de la PR siga siendo el aceptado por la fase anterior (o el SHA registrado de la PR para
+la ruta directa a QA) y que el workspace esté limpio en ese SHA. Si una tarea bloqueada en QA o Review vuelve de `Blocked` a `Ready` con el head
 cambiado o sin PR, reinicia en `Build` y repite ambas fases. Si falla una comprobación previa, el
 agente del lane `diagnostic` lee el workpad e inspecciona el workspace y la PR antes de documentar el
 motivo y la recuperación en la issue y el Project. Symphony detecta el bloqueo y coordina esa sesión,
