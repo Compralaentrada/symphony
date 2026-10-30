@@ -119,7 +119,11 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
     assert {:ok, task, "build"} = Pipeline.prepare(issue)
     expected_skills = task["effective_config"]["skills"]
-    assert [%{"name" => "ponytail", "version" => "v5.3.2"}] = expected_skills["build"]
+
+    assert [
+             %{"name" => "ponytail", "version" => "v5.3.2"},
+             %{"name" => "tdd-autonomous", "version" => "v1.0.0"}
+           ] = expected_skills["build"]
 
     set_project_state(table, issue.id, "Backlog")
 
@@ -138,10 +142,15 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     table = start_board([issue], %{})
     pipeline_database!(table)
     workspace = Path.join(Config.local_workspace_root(), Workspace.workspace_key(issue))
+    skill_root = Path.expand("../../..", __DIR__) |> Path.join(".agents/skills")
+
+    for skill <- ["ponytail", "tdd-autonomous"] do
+      skill_dir = Path.join([workspace, ".agents", "skills", skill])
+      File.mkdir_p!(Path.dirname(skill_dir))
+      File.cp_r!(Path.join(skill_root, skill), skill_dir)
+    end
+
     skill_dir = Path.join([workspace, ".agents", "skills", "ponytail"])
-    source = Path.expand("../../..", __DIR__) |> Path.join(".agents/skills/ponytail")
-    File.mkdir_p!(Path.dirname(skill_dir))
-    File.cp_r!(source, skill_dir)
     skill_path = Path.join(skill_dir, "SKILL.md")
     File.write!(skill_path, File.read!(skill_path) <> "\nchanged\n")
     on_exit(fn -> File.rm_rf!(workspace) end)
@@ -152,7 +161,19 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
     assert project_state(table, issue.id) == "Ready"
     assert lookup(table, {:agent_calls, issue.id, :build}) == nil
-    assert {:ok, %{"effective_config" => %{"skills" => %{"build" => [%{"version" => "v5.3.2"}]}}}} = Store.get_task(issue.id)
+
+    assert {:ok,
+            %{
+              "effective_config" => %{
+                "skills" => %{
+                  "build" => [
+                    %{"name" => "ponytail", "version" => "v5.3.2"},
+                    %{"name" => "tdd-autonomous", "version" => "v1.0.0"}
+                  ]
+                }
+              }
+            }} = Store.get_task(issue.id)
+
     assert {:ok, %{"skill_readiness" => %{"reason" => reason, "next_step" => next_step}}} = Store.get_task(issue.id)
     assert reason =~ "ponytail"
     assert next_step =~ "v5.3.2"

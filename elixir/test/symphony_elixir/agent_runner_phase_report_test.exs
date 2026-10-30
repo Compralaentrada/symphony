@@ -231,10 +231,10 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         id: "issue-build-foreign-turn",
         identifier: "MT-BUILD-FOREIGN-TURN",
         title: "Return the Build report",
-        description: "Implement the change and return the Build phase report.",
+        description: "Implement the code change, update the docs, and return the Build phase report.",
         state: "Ready",
         url: "https://example.org/issues/MT-BUILD-FOREIGN-TURN",
-        labels: ["frontend", "customer-facing"]
+        labels: ["frontend", "customer-facing", "docs"]
       }
 
       assert %{"outcome" => "ready", "summary" => "Build completed"} =
@@ -261,11 +261,143 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert prompt =~ "symphony:report:json"
       assert prompt =~ "report_context.task"
       assert prompt =~ "- `ponytail`"
+      assert prompt =~ "- `tdd-autonomous`"
       assert prompt =~ "- `humanizer`"
       refute prompt =~ "- `tdd`"
       refute prompt =~ "- `code-review`"
       refute prompt =~ "- `impeccable`"
       refute prompt =~ "symphony/mt-build-foreign-turn"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "Build prompt includes autonomous TDD for code and docs scopes but omits it for text-only scopes" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-build-tdd-selection-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-input.trace")
+      File.mkdir_p!(test_root)
+
+      report = %{
+        "outcome" => "ready",
+        "summary" => "Build completed",
+        "criteria" => [],
+        "changes" => ["Updated the requested behavior."],
+        "checks" => ["mix test"],
+        "risks" => [],
+        "next_step" => "Continue to QA.",
+        "reason" => nil,
+        "sha" => String.duplicate("c", 40)
+      }
+
+      report_delta =
+        Jason.encode!(%{
+          "method" => "item/agentMessage/delta",
+          "params" => %{
+            "threadId" => "build-scope-thread",
+            "turnId" => "build-scope-turn",
+            "itemId" => "build-scope-output",
+            "delta" => Jason.encode!(report)
+          }
+        })
+
+      completion =
+        Jason.encode!(%{
+          "method" => "turn/completed",
+          "params" => %{
+            "threadId" => "build-scope-thread",
+            "turn" => %{"id" => "build-scope-turn", "status" => "completed", "items" => []}
+          }
+        })
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> '#{trace_file}'
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"build-scope-thread"}}}' ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"build-scope-turn"}}}'
+            printf '%s\\n' '#{report_delta}'
+            printf '%s\\n' '#{completion}'
+            exit 0
+            ;;
+          *) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: required_skill_fixture_hook(),
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      cases = [
+        {"code", ["backend"], true},
+        {"text", ["text-only"], false},
+        {"writing", ["writing-only"], false},
+        {"docs", ["docs"], true},
+        {"mixed", ["backend", "docs"], true}
+      ]
+
+      Enum.each(cases, fn {name, labels, _expects_tdd} ->
+        identifier = "MT-BUILD-TDD-#{String.upcase(name)}"
+
+        issue = %Issue{
+          id: "issue-build-tdd-#{name}",
+          identifier: identifier,
+          title: "Build task for #{name}",
+          description: "Apply the requested task and return the Build phase report.",
+          state: "Ready",
+          url: "https://example.org/issues/#{identifier}",
+          labels: labels
+        }
+
+        assert %{"outcome" => "ready"} =
+                 AgentRunner.run(issue, nil,
+                   phase: :build,
+                   branch: "symphony/build-tdd-#{name}"
+                 )
+      end)
+
+      prompts =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.filter(&(&1["method"] == "turn/start"))
+        |> Enum.map(&get_in(&1, ["params", "input", Access.at(0), "text"]))
+
+      assert length(prompts) == length(cases)
+
+      Enum.zip(cases, prompts)
+      |> Enum.each(fn {{_name, _labels, expects_tdd}, prompt} ->
+        assert prompt =~ "Pipeline phase: Build."
+        refute prompt =~ "- `tdd`"
+
+        if expects_tdd do
+          assert prompt =~ "- `ponytail`"
+          assert prompt =~ "- `tdd-autonomous`"
+        else
+          refute prompt =~ "- `ponytail`"
+          refute prompt =~ "- `tdd-autonomous`"
+        end
+      end)
     after
       File.rm_rf(test_root)
     end
@@ -475,6 +607,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert hd(prompts) =~ "Use only these task-specific repo skills selected by Symphony for this unattended session:"
       refute hd(prompts) =~ "- `ponytail`"
       refute hd(prompts) =~ "- `tdd`"
+      refute hd(prompts) =~ "- `tdd-autonomous`"
       refute hd(prompts) =~ "- `code-review`"
       assert hd(prompts) =~ "- `humanizer`"
       refute hd(prompts) =~ "- `impeccable`"
@@ -625,6 +758,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert review_prompt =~ "Use only these task-specific repo skills selected by Symphony for this unattended session:"
       refute review_prompt =~ "- `ponytail`"
       refute review_prompt =~ "- `tdd`"
+      refute review_prompt =~ "- `tdd-autonomous`"
       refute review_prompt =~ "- `code-review`"
       assert review_prompt =~ "- `humanizer`"
       refute review_prompt =~ "- `impeccable`"
