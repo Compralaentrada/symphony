@@ -189,6 +189,9 @@ Fields:
     - `id` (string or null)
     - `identifier` (string or null)
     - `state` (string or null)
+- `dependency_error` (string or null)
+  - Diagnostic for an explicit dependency relation that cannot be read or interpreted safely.
+    It must not be treated as an empty `blocked_by` list.
 - `dispatchable` (boolean)
   - REQUIRED adapter-derived eligibility for provider-specific rules that the generic scheduler
     cannot infer safely, such as assignment, board membership, or blocker semantics.
@@ -1310,6 +1313,19 @@ Adapter output MUST satisfy Section 4.1.1. In addition:
 - Preserve provider spelling in `state`, but trim and lowercase only for scheduler comparisons.
 - `blocked_by` is best-effort metadata; adapters MUST NOT invent blocker semantics they cannot
   represent reliably.
+- For GitHub Projects native dependencies, unreadable, incomplete, malformed, ambiguous, or
+  inaccessible relations MUST be preserved as `dependency_error`; they MUST NOT be dropped and
+  interpreted as no dependencies. Transport failures remain tracker read errors so normal retry
+  behavior applies.
+- A GitHub Projects issue with an open blocker waits without dispatch. A dependency diagnostic is
+  dispatched only through the restricted diagnostic lane; the orchestrator MUST NOT write the
+  Project status. The diagnostic agent requests `Blocked` and records a correction through the
+  mediated GitHub workflow. A pending Finalize diagnostic MAY request `Blocked` from `Human Review`;
+  an unconfirmed Review handoff that reaches `Human Review` still waits for a human decision. An
+  unconfirmed status change leaves remote status authoritative and
+  MUST NOT start implementation; Symphony keeps a local blocked checkpoint instead of retrying
+  automatically. If the item remains `Ready`, Symphony resumes only after it observes the item
+  leave `Ready` and later return to `Ready`.
 - `dispatchable` MUST be explicit. It is `true` only when provider-specific eligibility checks
   pass; the generic scheduler never tries to reconstruct those checks from `native_ref`.
 - `native_ref` MUST be null or a JSON-safe object containing only non-secret values safe to expose

@@ -516,7 +516,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert evidence["pull_request_body"] == body
   end
 
-  test "Finalize recovers and verifies the merged PR before closing the issue and moving it to Done" do
+  test "Finalize resumes from Ready and verifies the merged PR before moving to Done" do
     alias SymphonyElixir.Pipeline.Store
 
     previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
@@ -540,7 +540,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       id: issue_id,
       identifier: issue_id,
       branch_name: "symphony/octo-app-#{number}",
-      state: "Human Review",
+      state: "Ready",
       native_ref: %{repository: "octo/app", base_branch: "main", issue_node_id: "I_issue_#{number}"}
     }
 
@@ -567,7 +567,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     report = %{"outcome" => "merged", "summary" => "Merge verified.", "sha" => sha}
     markdown = "## Finalize report\n\nMerge verified.\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
 
-    {:ok, remote} = Agent.start_link(fn -> %{status: "Human Review", issue_state: "OPEN", events: []} end)
+    {:ok, remote} = Agent.start_link(fn -> %{status: "Ready", issue_state: "OPEN", events: []} end)
 
     request_fun = fn query, _variables, _settings ->
       Agent.get_and_update(remote, fn data ->
@@ -627,6 +627,85 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert result["pull_request"]["head_sha"] == sha
     assert result["project_item"]["status"] == "Done"
     assert Enum.take(Agent.get(remote, &Enum.reverse(&1.events)), 3) == [:pull_request_read, :pull_request_read, :issue_closed]
+  end
+
+  for initial_status <- ["Ready", "Human Review"] do
+    test "the diagnostic lane can block an invalid dependency from #{initial_status}" do
+      initial_status = unquote(initial_status)
+      previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+      root = Path.join(System.tmp_dir!(), "symphony-project-diagnostic-finalize-#{System.unique_integer([:positive])}")
+      Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+      on_exit(fn ->
+        case previous_path do
+          {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+          :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+        end
+
+        File.rm_rf!(root)
+      end)
+
+      number = System.unique_integer([:positive])
+      issue_id = "octo/app##{number}"
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: issue_id,
+        url: "https://github.com/octo/app/issues/#{number}",
+        state: initial_status,
+        native_ref: %{repository: "octo/app", base_branch: "main", issue_node_id: "I_issue_#{number}"}
+      }
+
+      task = %{"issue_id" => issue_id, "generation" => 1, "phase" => "finalize", "attempts" => %{"finalize" => 1}}
+      assert :ok = Store.save_task(task)
+      assert :ok = Store.begin_phase(issue_id, 1, "finalize", 1)
+      {:ok, remote} = Agent.start_link(fn -> %{status: initial_status} end)
+
+      request_fun = fn query, _variables, _settings ->
+        Agent.get_and_update(remote, fn data ->
+          cond do
+            query =~ "SymphonyProject" ->
+              {{:ok, %{status: 200, body: project_response([issue_item("octo/app", number, data.status)])}}, data}
+
+            query =~ "SymphonyPipelineReportComments" ->
+              comments = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
+              body = %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}
+              {{:ok, %{status: 200, body: body}}, data}
+
+            query =~ "SymphonyAddIssueComment" ->
+              comment = %{"id" => "IC_diagnostic", "url" => "https://github.com/octo/app/issues/#{number}#issuecomment-1"}
+              body = %{"data" => %{"addComment" => %{"commentEdge" => %{"node" => comment}}}}
+              {{:ok, %{status: 200, body: body}}, data}
+
+            query =~ "SymphonySetProjectStatus" ->
+              body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
+              {{:ok, %{status: 200, body: body}}, %{data | status: "Blocked"}}
+
+            true ->
+              flunk("unexpected GitHub Projects query: #{query}")
+          end
+        end)
+      end
+
+      reason = "GitHub could not read complete blocker data. Correct the relationship, then move the Project item to Ready."
+      report = %{"outcome" => "blocked", "summary" => reason, "reason" => reason, "next_step" => "Correct the relationship, then move the Project item to Ready."}
+      markdown = "## Diagnostic report\n\n#{reason}\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
+      context = %{issue: issue, lane: :diagnostic, lease_phase: :finalize, generation: 1, attempt: 1, task: task}
+
+      assert {:ok, result} =
+               Client.agent_operation(
+                 issue,
+                 context,
+                 "handoff",
+                 %{"outcome" => "blocked", "report" => report, "body" => markdown},
+                 tracker_settings: tracker_settings(),
+                 projects_request: request_fun
+               )
+
+      assert result["project_item"]["status"] == "Blocked"
+      assert result["comment"]["id"] == "IC_diagnostic"
+      assert Agent.get(remote, & &1.status) == "Blocked"
+    end
   end
 
   test "merge gate merges only with approved checks and current SHA and base evidence" do
@@ -2535,28 +2614,54 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert Enum.map(issue.blocked_by, & &1.id) == ["octo/app#8", "octo/docs#8"]
   end
 
-  test "incomplete blocker pages and blocker read errors fail the Project read" do
+  test "invalid dependency data stays attached to the affected Project issue" do
     incomplete =
       issue_item("octo/app", 7, "Ready")
       |> put_in(["content", "blockedBy"], %{"nodes" => [], "pageInfo" => %{"hasNextPage" => true}})
-
-    assert {:error, {:github_projects_api_error, _}} =
-             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn _query, _variables, _settings ->
-               {:ok, %{status: 200, body: project_response([incomplete])}}
-             end)
 
     incomplete_count =
       issue_item("octo/app", 7, "Ready")
       |> put_in(["content", "blockedBy"], dependency_connection([], false, nil, 1))
 
-    assert {:error, {:github_projects_api_error, _}} =
-             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn _query, _variables, _settings ->
-               {:ok, %{status: 200, body: project_response([incomplete_count])}}
-             end)
+    unresolved_identity =
+      issue_item("octo/app", 7, "Ready")
+      |> put_in(["content", "blockedBy"], dependency_connection([blocker("octo/app", 0)]))
 
+    ambiguous =
+      issue_item("octo/app", 7, "Ready")
+      |> put_in(["content", "blockedBy"], dependency_connection([blocker("octo/app", 8), blocker("octo/app", 8)]))
+
+    unknown_state =
+      issue_item("octo/app", 7, "Ready")
+      |> put_in(["content", "blockedBy"], dependency_connection([blocker("octo/app", 8, "MERGED")]))
+
+    for item <- [incomplete, incomplete_count, unresolved_identity, ambiguous, unknown_state] do
+      assert {:ok, [issue]} =
+               Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn _query, _variables, _settings ->
+                 {:ok, %{status: 200, body: project_response([item])}}
+               end)
+
+      assert issue.id == "octo/app#7"
+      assert issue.blocked_by == []
+      assert is_binary(issue.dependency_error)
+    end
+  end
+
+  test "blocker permission errors are diagnosed while transient page read failures retry" do
     paged =
       issue_item("octo/app", 7, "Ready")
-      |> put_in(["content", "blockedBy"], dependency_connection([], true, "blocker-cursor", 1))
+      |> put_in(["content", "blockedBy"], dependency_connection([blocker("octo/app", 8)], true, "blocker-cursor", 2))
+
+    assert {:ok, [issue]} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn query, _variables, _settings ->
+               if query =~ "SymphonyIssueBlockers" do
+                 {:ok, %{status: 403, body: %{}}}
+               else
+                 {:ok, %{status: 200, body: project_response([paged])}}
+               end
+             end)
+
+    assert issue.dependency_error =~ "access"
 
     assert {:error, {:github_projects_api_error, _}} =
              Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn query, _variables, _settings ->
@@ -2566,6 +2671,43 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
                  {:ok, %{status: 200, body: project_response([paged])}}
                end
              end)
+  end
+
+  test "partial dependency responses retain the issue and a corrected relationship can be read again" do
+    partial =
+      project_response([issue_item("octo/app", 7, "Ready")])
+      |> update_in(["data"], &Map.put(&1, "user", nil))
+      |> Map.put("errors", [
+        %{
+          "type" => "NOT_FOUND",
+          "path" => ["user"],
+          "message" => "Could not resolve to a User with the login of 'acme'."
+        },
+        %{
+          "type" => "FORBIDDEN",
+          "path" => ["organization", "projectV2", "items", "nodes", 0, "content", "blockedBy"],
+          "message" => "Resource not accessible by integration"
+        }
+      ])
+
+    assert {:ok, [invalid]} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn _query, _variables, _settings ->
+               {:ok, %{status: 200, body: partial}}
+             end)
+
+    assert invalid.dependency_error =~ "access"
+
+    corrected =
+      issue_item("octo/app", 7, "Ready")
+      |> put_in(["content", "blockedBy"], dependency_connection([blocker("octo/docs", 8, "CLOSED")]))
+
+    assert {:ok, [recovered]} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn _query, _variables, _settings ->
+               {:ok, %{status: 200, body: project_response([corrected])}}
+             end)
+
+    assert recovered.dependency_error == nil
+    assert recovered.blocked_by == [%{id: "octo/docs#8", identifier: "octo/docs#8", state: "CLOSED"}]
   end
 
   defp run_merge_gate(options) do

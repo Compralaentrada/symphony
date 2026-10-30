@@ -110,6 +110,32 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
+  @spec defer_unconfirmed_diagnostic(Issue.t(), map(), String.t(), pos_integer()) :: :ok | {:error, term()}
+  def defer_unconfirmed_diagnostic(%Issue{} = issue, task, phase, attempt) do
+    dependency_reason = issue.dependency_error || "La relación de dependencia necesita revisión."
+
+    reason =
+      "No se pudo confirmar el cambio del Project a Blocked. #{dependency_reason} " <>
+        "Corrige la relación, mueve el item fuera de Ready y vuelve a moverlo a Ready para reintentar."
+
+    next =
+      task
+      |> Map.put("phase", phase)
+      |> Map.put("status", "blocked")
+      |> Map.put("blocked_reason", reason)
+      |> Map.put("diagnostic_handoff_unconfirmed", true)
+
+    result = %{
+      "outcome" => "blocked",
+      "summary" => reason,
+      "reason" => reason,
+      "next_step" => "Corrige la relación, mueve el item fuera de Ready y vuelve a moverlo a Ready para reintentar.",
+      "sha" => task["current_sha"]
+    }
+
+    Store.commit_phase(next, phase, attempt, result, [])
+  end
+
   defp clear_qa_claim(task, "qa"), do: Map.drop(task, ["direct_qa", "qa_claim_pending", "qa_claim_reset_seen"])
   defp clear_qa_claim(task, _phase), do: task
 
@@ -413,6 +439,8 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
+  defp prepare_task(%{"status" => "blocked", "diagnostic_handoff_unconfirmed" => true}, %Issue{}), do: :ignore
+
   defp prepare_task(%{"status" => "blocked"} = task, %Issue{} = issue) do
     if issue.state == status_value(task, :ready), do: resume_blocked_task(task, issue), else: :ignore
   end
@@ -649,7 +677,7 @@ defmodule SymphonyElixir.Pipeline do
          true <- state == status_value(task, :ready) do
       updated =
         task
-        |> Map.drop(["qa_claim_pending", "qa_claim_reset_seen", "blocked_reason"])
+        |> Map.drop(["qa_claim_pending", "qa_claim_reset_seen", "blocked_reason", "diagnostic_handoff_unconfirmed"])
         |> Map.merge(%{"phase" => "qa", "status" => "qa", "direct_qa" => true})
         |> Map.merge(delivery)
         |> next_direct_qa_generation(task)
@@ -701,7 +729,7 @@ defmodule SymphonyElixir.Pipeline do
     do: task |> Map.put("phase", "build") |> Map.put("current_sha", nil) |> Map.delete("direct_qa") |> resume_blocked_task()
 
   defp resume_blocked_task(task) do
-    task = task |> Map.put("status", "building") |> Map.delete("blocked_reason")
+    task = task |> Map.put("status", "building") |> Map.drop(["blocked_reason", "diagnostic_handoff_unconfirmed"])
     with :ok <- Store.save_task(task), do: {:ok, task, task["phase"]}
   end
 
@@ -731,7 +759,7 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp finish_valid_phase(issue, task, phase, attempt, %{"outcome" => "blocked"} = result)
-       when phase in ["qa", "review"] do
+       when phase in ["qa", "review", "finalize"] do
     reason = result["reason"] || result["summary"] || "Agent requires operator intervention."
     next = task |> Map.put("phase", phase) |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
     operations = report_ops(next, phase, attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
@@ -932,6 +960,17 @@ defmodule SymphonyElixir.Pipeline do
     if issue.state == status_value(task, :blocked) and task["qa_claim_reset_seen"] != true,
       do: reconcile_claim_reset(task),
       else: :ok
+  end
+
+  defp reconcile_nonterminal_task(issue, %{"status" => "blocked", "diagnostic_handoff_unconfirmed" => true} = task) do
+    if issue.state == status_value(task, :ready) do
+      :ok
+    else
+      case Store.replace_task_if_unchanged(task, Map.delete(task, "diagnostic_handoff_unconfirmed")) do
+        :stale -> :ok
+        result -> result
+      end
+    end
   end
 
   defp reconcile_nonterminal_task(issue, task), do: reconcile_checkpoint(issue, task)
