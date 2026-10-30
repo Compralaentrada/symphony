@@ -11,6 +11,65 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
              Tracker.adapter_for_kind("github_projects")
   end
 
+  test "remote phase recovery reads every page and ignores other authors" do
+    issue = %Issue{id: "octo/app#7", identifier: "octo/app#7", native_ref: %{repository: "octo/app", issue_number: 7}}
+
+    comment = fn author, attempt ->
+      %{
+        "author" => %{"login" => author},
+        "body" =>
+          "<!-- symphony:report:start:octo/app#7:3:build:#{attempt} -->\n" <>
+            "<!-- symphony:report:json\n{\"outcome\":\"ready\",\"sha\":\"abc\"}\n-->\n<!-- symphony:report:end -->"
+      }
+    end
+
+    request = fn query, vars, _settings ->
+      data =
+        if query =~ "SymphonyPipelineViewer" do
+          %{"viewer" => %{"login" => "agent"}}
+        else
+          {nodes, next, cursor} =
+            if vars["after"] == nil,
+              do: {[comment.("agent", 2), comment.("other", 99)], true, "next"},
+              else: {[comment.("agent", 4)], false, nil}
+
+          %{"repository" => %{"issue" => %{"comments" => %{"nodes" => nodes, "pageInfo" => %{"hasNextPage" => next, "endCursor" => cursor}}}}}
+        end
+
+      {:ok, %{status: 200, body: %{"data" => data}}}
+    end
+
+    assert {:ok, reports} = Client.phase_reports_for_test(issue, tracker_settings(), request)
+    assert Enum.sort(Enum.map(reports, & &1["attempt"])) == [2, 4]
+    assert Enum.all?(reports, &(&1["generation"] == 3 and &1["report"]["sha"] == "abc"))
+  end
+
+  test "remote phase recovery rejects incomplete pages and missing continuation cursors" do
+    issue = %Issue{id: "octo/app#7", identifier: "octo/app#7", native_ref: %{repository: "octo/app", issue_number: 7}}
+
+    for connection <- [%{"pageInfo" => %{"hasNextPage" => false}}, %{"nodes" => [], "pageInfo" => %{"hasNextPage" => true, "endCursor" => nil}}] do
+      request = fn _query, _vars, _settings ->
+        {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"issue" => %{"comments" => connection}}}}}}
+      end
+
+      assert {:error, :incomplete_remote_phase_reports} =
+               Client.phase_reports_for_test(issue, tracker_settings(), request)
+    end
+  end
+
+  test "remote phase recovery rejects a pagination cursor cycle" do
+    issue = %Issue{id: "octo/app#7", identifier: "octo/app#7", native_ref: %{repository: "octo/app", issue_number: 7}}
+
+    request = fn _query, vars, _settings ->
+      cursor = if vars["after"] == "a", do: "b", else: "a"
+      comments = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => true, "endCursor" => cursor}}
+      {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}}}
+    end
+
+    assert {:error, :incomplete_remote_phase_reports} =
+             Client.phase_reports_for_test(issue, tracker_settings(), request)
+  end
+
   test "the tracker exposes scoped GitHub tools and does not write through lifecycle callbacks" do
     previous_client = Application.get_env(:symphony_elixir, :github_projects_client_module)
     previous_owner = Application.get_env(:symphony_elixir, :projects_lifecycle_test_owner)
@@ -2317,15 +2376,22 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     root = Path.join(System.tmp_dir!(), "symphony-project-identity-#{System.unique_integer([:positive])}")
     workspace_root = Path.join(root, "workspaces")
     previous_database_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    previous_client = Application.fetch_env(:symphony_elixir, :github_projects_client_module)
 
     File.mkdir_p!(root)
     Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+    Application.put_env(:symphony_elixir, :github_projects_client_module, FakeGitHubProjectsClient)
     write_projects_workflow!(workspace_root)
 
     on_exit(fn ->
       case previous_database_path do
         {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
         :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      case previous_client do
+        {:ok, client} -> Application.put_env(:symphony_elixir, :github_projects_client_module, client)
+        :error -> Application.delete_env(:symphony_elixir, :github_projects_client_module)
       end
 
       File.rm_rf!(root)
@@ -2856,6 +2922,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 end
 
 defmodule SymphonyElixir.GitHubProjectsAdapterTest.FakeGitHubProjectsClient do
+  def phase_reports(_issue), do: {:ok, []}
   def fetch_issues_by_states(states), do: notify({:projects_fetch_states, states}, {:ok, []})
   def fetch_issues_by_ids(ids), do: notify({:projects_fetch_ids, ids}, {:ok, []})
   def claim_issue(issue), do: notify({:projects_claim, issue})

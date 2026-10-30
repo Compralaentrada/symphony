@@ -648,6 +648,9 @@ defmodule SymphonyElixir.Orchestrator do
       issue.tracker_blocked ->
         refresh_blocked_issue_state(state, issue)
 
+      projects_block_released?(issue, state, active_states) ->
+        release_issue_claim(state, issue.id)
+
       !issue_routable?(issue) ->
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
         release_issue_claim(state, issue.id)
@@ -662,6 +665,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_blocked_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  defp projects_block_released?(issue, state, active_states) do
+    Pipeline.enabled?() and active_issue_state?(issue.state, active_states) and
+      get_in(state.blocked, [issue.id, :issue, Access.key(:tracker_blocked)]) == true
+  end
 
   defp reconcile_missing_running_issue_ids(%State{} = state, requested_issue_ids, issues)
        when is_list(requested_issue_ids) and is_list(issues) do

@@ -41,6 +41,10 @@ selected from issue context. Unattended sessions load only selected task skills;
 instructions can still request operational skills. Interactive skills such as Impeccable and TDD
 are not forced into unattended sessions.
 
+When a Codex session ends, Symphony asks app-server to archive its thread so it no longer appears
+in the active chat list. The archived history remains available; an archive failure is logged and
+does not change the task result.
+
 During single-run app-server sessions, the selected tracker adapter may advertise provider-native
 tools. Linear serves `linear_graphql`, GitHub Issues and GitHub Projects v2 serve the read-only
 `github_api` plus the task-scoped `github_workflow`, Jira Cloud serves `jira_rest`, Asana serves
