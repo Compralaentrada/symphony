@@ -385,7 +385,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert :ok = Store.save_task(Map.delete(task, "direct_qa"))
     set_project_state(table, issue.id, "Building")
     assert :ok = Pipeline.reconcile()
-    assert {:ok, %{"status" => "blocked"}} = Store.get_task(issue.id)
+    assert {:ok, %{"status" => "building", "phase" => "build"}} = Store.get_task(issue.id)
   end
 
   test "an uncertain direct QA claim waits for an explicit Blocked to Ready transition" do
@@ -406,7 +406,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert {:ok, %{"status" => "qa"}, "qa"} = Pipeline.prepare(issue)
   end
 
-  test "pipeline reconciliation blocks a Build checkpoint that conflicts with QA until the item is Ready" do
+  test "the Project's QA state overrides a Build checkpoint" do
     issue = issue("octo/app#22", 22)
     issue = %{issue | state: "QA", native_ref: Map.put(issue.native_ref, :project_status, "QA")}
     table = start_board([issue], %{})
@@ -428,24 +428,145 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     }
 
     assert :ok = Store.save_task(task)
-    assert :ignore = Pipeline.prepare(issue)
-    assert {:ok, %{"status" => "blocked", "blocked_reason" => reason}} = Store.get_task(issue.id)
-    assert reason =~ "checkpoint is Build"
+    assert {:ok, %{"status" => "qa", "phase" => "qa"}, "qa"} = Pipeline.prepare(issue)
     assert :ok = Store.save_task(task)
     assert :ok = Pipeline.reconcile()
 
-    assert {:ok, %{"status" => "blocked", "blocked_reason" => reason}} = Store.get_task(issue.id)
-    assert reason =~ "checkpoint is Build"
-    assert reason =~ "tracker state is QA"
+    assert {:ok, %{"status" => "qa", "phase" => "qa"}} = Store.get_task(issue.id)
     assert project_state(table, issue.id) == "QA"
+  end
 
-    ready_issue = %{issue | state: "Ready", requeueable: true, native_ref: Map.put(issue.native_ref, :project_status, "Ready")}
-    :ets.insert(table, {{:issue, issue.id}, ready_issue})
+  test "QA on the board resumes a locally blocked Build checkpoint using the current PR" do
+    issue = issue("octo/app#23", 23)
+    issue = %{issue | state: "QA", native_ref: Map.put(issue.native_ref, :project_status, "QA")}
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    :ets.insert(table, {{:pull_request, issue.id}, %{number: 123, branch: issue.branch_name, base: "main", sha: "current-sha", draft: true, merged: false}})
 
-    assert {:ok, %{"status" => "building", "phase" => "build"} = resumed, "build"} =
-             Pipeline.prepare(ready_issue)
+    :ets.insert(
+      table,
+      {{:remote_reports, issue.id},
+       [%{"generation" => 1, "phase" => "build", "attempt" => 1, "report" => %{"outcome" => "ready", "sha" => "current-sha", "branch" => issue.branch_name, "base_branch" => "main"}}]}
+    )
 
-    refute Map.has_key?(resumed, "blocked_reason")
+    assert :ok =
+             Store.save_task(%{
+               "issue_id" => issue.id,
+               "repository" => "octo/app",
+               "branch" => issue.branch_name,
+               "base_branch" => "main",
+               "required_checks" => ["true"],
+               "generation" => 1,
+               "phase" => "build",
+               "status" => "blocked",
+               "blocked_reason" => "checkpoint mismatch",
+               "attempts" => %{},
+               "prior_findings" => [],
+               "current_sha" => nil,
+               "pr_number" => nil
+             })
+
+    assert :ok = Pipeline.reconcile()
+    assert {:ok, %{"status" => "qa", "phase" => "qa", "current_sha" => "current-sha", "pr_number" => 123}, "qa"} = Pipeline.prepare(issue)
+    assert project_state(table, issue.id) == "QA"
+  end
+
+  test "a QA item can resume without a local checkpoint" do
+    issue = issue("octo/app#24", 24)
+    issue = %{issue | state: "QA", native_ref: Map.put(issue.native_ref, :project_status, "QA")}
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    :ets.insert(table, {{:pull_request, issue.id}, %{number: 124, branch: issue.branch_name, base: "main", sha: "current-sha", draft: true, merged: false}})
+
+    :ets.insert(
+      table,
+      {{:remote_reports, issue.id},
+       [
+         %{"generation" => 3, "phase" => "build", "attempt" => 4, "report" => %{"outcome" => "ready", "sha" => "current-sha", "branch" => issue.branch_name, "base_branch" => "main"}},
+         %{"generation" => 3, "phase" => "qa", "attempt" => 7, "report" => %{"outcome" => "changes_requested", "sha" => "current-sha"}}
+       ]}
+    )
+
+    assert {:ok, %{"phase" => "qa", "current_sha" => "current-sha", "generation" => 3, "attempts" => %{"qa" => 7, "build" => 4}}, "qa"} = Pipeline.prepare(issue)
+  end
+
+  test "reconciliation leaves a running phase alone during its handoff" do
+    issue = issue("octo/app#25", 25)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    assert {:ok, task, "build"} = Pipeline.prepare(issue)
+    set_project_state(table, issue.id, "QA")
+
+    assert :ok = Pipeline.reconcile([issue.id])
+    assert {:ok, ^task} = Store.get_task(issue.id)
+  end
+
+  test "a changed PR invalidates saved host checks when the board moves to QA" do
+    issue = issue("octo/app#26", 26)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    assert {:ok, task, "build"} = Pipeline.prepare(issue)
+    assert :ok = Store.save_task(Map.merge(task, %{"current_sha" => "old", "host_checks" => [%{"status" => "passed"}]}))
+    :ets.insert(table, {{:pull_request, issue.id}, %{number: 126, branch: issue.branch_name, base: "main", sha: "new", draft: true, merged: false}})
+    qa_issue = %{issue | state: "QA", native_ref: Map.put(issue.native_ref, :project_status, "QA")}
+
+    assert {:ok, task, "qa"} = Pipeline.prepare(qa_issue)
+    assert task["current_sha"] == nil
+    assert task["host_checks"] == []
+  end
+
+  test "moving from QA to Building clears the accepted SHA before Build resumes" do
+    issue = issue("octo/app#27", 27)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    assert {:ok, task, "build"} = Pipeline.prepare(issue)
+    assert :ok = Store.save_task(Map.merge(task, %{"phase" => "qa", "status" => "qa", "current_sha" => "old", "host_checks" => [%{"status" => "passed"}]}))
+    building = %{issue | state: "Building", native_ref: Map.put(issue.native_ref, :project_status, "Building")}
+
+    assert {:ok, task, "build"} = Pipeline.prepare(building)
+    assert task["current_sha"] == nil
+    refute Map.has_key?(task, "host_checks")
+  end
+
+  test "Review without a QA report does not invent check evidence" do
+    issue = issue("octo/app#28", 28)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    assert {:ok, task, "build"} = Pipeline.prepare(issue)
+    :ets.insert(table, {{:pull_request, issue.id}, %{number: 128, branch: issue.branch_name, base: "main", sha: "sha", draft: true, merged: false}})
+
+    :ets.insert(
+      table,
+      {{:remote_reports, issue.id},
+       [%{"generation" => 1, "phase" => "build", "attempt" => 1, "report" => %{"outcome" => "ready", "sha" => "sha", "branch" => issue.branch_name, "base_branch" => "main"}}]}
+    )
+
+    review = %{issue | state: "Review", native_ref: Map.put(issue.native_ref, :project_status, "Review")}
+
+    assert {:ok, recovered, "review"} = Pipeline.prepare(review)
+    assert recovered["host_checks"] == []
+    assert task["generation"] == recovered["generation"]
+  end
+
+  test "recovery processes findings in the order they were published" do
+    issue = issue("octo/app#29", 29)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    assert {:ok, _, "build"} = Pipeline.prepare(issue)
+    :ets.insert(table, {{:pull_request, issue.id}, %{number: 129, branch: issue.branch_name, base: "main", sha: "sha", draft: true, merged: false}})
+    finding = %{"id" => "x", "criterion" => "criterion", "reproduction" => "steps"}
+
+    reports = [
+      %{"generation" => 1, "phase" => "qa", "attempt" => 1, "report" => %{"findings" => [finding]}},
+      %{"generation" => 1, "phase" => "review", "attempt" => 1, "report" => %{"resolutions" => ["x"]}},
+      %{"generation" => 1, "phase" => "qa", "attempt" => 2, "report" => %{"findings" => [finding]}}
+    ]
+
+    :ets.insert(table, {{:remote_reports, issue.id}, reports})
+    qa = %{issue | state: "QA", native_ref: Map.put(issue.native_ref, :project_status, "QA")}
+
+    assert {:ok, recovered, "qa"} = Pipeline.prepare(qa)
+    assert recovered["prior_findings"] == [finding]
   end
 
   test "report locale uses Spanish only for Spanish issue descriptions" do
@@ -2035,6 +2156,8 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
       {:ok, lookup(table, {:pull_request, issue.id})}
     end
   end
+
+  def phase_reports(issue), do: {:ok, lookup(table(), {:remote_reports, issue.id}) || []}
 
   def publish_phase_report(issue, marker, body, phase) do
     table = table()

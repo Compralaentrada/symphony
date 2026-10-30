@@ -159,6 +159,12 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp prepare_from_checkpoint_without_pending(issue, existing) do
+    with {:ok, existing} <- align_active_checkpoint(existing, issue) do
+      prepare_checked_checkpoint(issue, existing)
+    end
+  end
+
+  defp prepare_checked_checkpoint(issue, existing) do
     case checkpoint_state_mismatch(existing, issue) do
       {:mismatch, reason} ->
         block_checkpoint_mismatch(existing, issue, reason)
@@ -168,6 +174,117 @@ defmodule SymphonyElixir.Pipeline do
 
       {:error, _reason} = error ->
         error
+    end
+  end
+
+  defp align_active_checkpoint(%{"status" => status} = task, issue)
+       when status in ["building", "qa", "review", "blocked", "human_review"] do
+    cond do
+      issue.state == status_value(task, :qa) ->
+        align_qa_state(task, issue)
+
+      issue.state == status_value(task, :building) and status != "building" ->
+        align_checkpoint(task, "building", "build")
+
+      issue.state == status_value(task, :review) ->
+        align_review_state(task, issue)
+
+      true ->
+        {:ok, task}
+    end
+  end
+
+  defp align_active_checkpoint(task, _issue), do: {:ok, task}
+
+  defp align_qa_state(%{"status" => "qa", "phase" => "qa", "qa_claim_pending" => true} = task, _issue), do: {:ok, task}
+  defp align_qa_state(%{"status" => "qa", "phase" => "qa"} = task, issue), do: refresh_checkpoint_if_head_changed(task, issue, "qa")
+  defp align_qa_state(task, issue), do: align_qa_checkpoint(task, issue)
+  defp align_review_state(%{"status" => "review"} = task, issue), do: refresh_checkpoint_if_head_changed(task, issue, "review")
+  defp align_review_state(task, issue), do: align_review_checkpoint(task, issue)
+
+  defp align_qa_checkpoint(task, issue) do
+    with {:ok, updated} <- recover_remote_delivery(task, issue, "qa") do
+      updated = Map.drop(updated, ["blocked_reason", "qa_claim_pending", "qa_claim_reset_seen", "direct_qa", "stale_merge_retry"])
+      save_aligned_checkpoint(task, Map.merge(updated, %{"status" => "qa", "phase" => "qa", "direct_qa" => Issue.routable?(issue, ["qa"])}))
+    end
+  end
+
+  defp align_review_checkpoint(task, issue) do
+    with {:ok, recovered} <- recover_remote_delivery(task, issue, "review") do
+      updated = recovered |> Map.drop(["blocked_reason", "qa_claim_pending", "qa_claim_reset_seen", "direct_qa", "stale_merge_retry"]) |> Map.merge(%{"status" => "review", "phase" => "review"})
+      save_aligned_checkpoint(task, updated)
+    end
+  end
+
+  defp refresh_checkpoint_if_head_changed(task, issue, phase) do
+    with {:ok, delivery} <- direct_qa_delivery(Tracker.pull_request(issue), task["branch"], task["base_branch"]) do
+      if delivery["current_sha"] == task["current_sha"], do: {:ok, task}, else: align_checkpoint_for_phase(task, issue, phase)
+    end
+  end
+
+  defp align_checkpoint_for_phase(task, issue, "qa"), do: align_qa_checkpoint(task, issue)
+  defp align_checkpoint_for_phase(task, issue, "review"), do: align_review_checkpoint(task, issue)
+
+  defp align_checkpoint(task, status, phase) do
+    updated = task |> Map.drop(["blocked_reason", "qa_claim_pending", "qa_claim_reset_seen", "direct_qa", "stale_merge_retry"]) |> Map.merge(%{"status" => status, "phase" => phase})
+    updated = if phase == "build", do: updated |> Map.put("current_sha", nil) |> Map.delete("host_checks"), else: updated
+    save_aligned_checkpoint(task, updated)
+  end
+
+  defp recover_remote_delivery(task, issue, phase) do
+    with {:ok, reports} <- Tracker.phase_reports(issue),
+         {:ok, delivery} <- direct_qa_delivery(Tracker.pull_request(issue), task["branch"], task["base_branch"]) do
+      history = reports
+      {task, reports} = recover_remote_attempts(task, history)
+      sha = if Enum.all?(history, &is_map(&1["report"])), do: accepted_remote_sha(task, issue, reports, delivery["current_sha"]), else: nil
+      qa = latest_remote_report(reports, "qa")
+      checks = if phase == "review" and is_map(qa) and qa["outcome"] == "passed" and qa["sha"] == sha, do: qa["checks"] || [], else: []
+      findings = history |> Enum.filter(&is_map(&1["report"])) |> Enum.reduce([], fn entry, acc -> pending_findings(%{"prior_findings" => acc}, entry["report"]) end)
+      {:ok, task |> Map.merge(delivery) |> Map.merge(%{"current_sha" => sha, "host_checks" => checks, "prior_findings" => findings})}
+    else
+      :ignore -> {:error, :remote_phase_reports_unavailable}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp recover_remote_attempts(task, reports) do
+    generation = Enum.max([task["generation"] | Enum.map(reports, & &1["generation"])])
+    reports = Enum.filter(reports, &(&1["generation"] == generation))
+    attempts = if task["generation"] == generation, do: task["attempts"] || %{}, else: %{}
+    attempts = Enum.reduce(reports, attempts, fn report, acc -> Map.update(acc, report["phase"], report["attempt"], &max(&1, report["attempt"])) end)
+    diagnostic_attempt = Map.get(attempts, "diagnostic", 0)
+    attempts = Enum.reduce(~w(build qa review finalize), attempts, fn phase, acc -> Map.update(acc, phase, diagnostic_attempt, &max(&1, diagnostic_attempt)) end)
+    {Map.merge(task, %{"generation" => generation, "attempts" => attempts}), reports}
+  end
+
+  defp latest_remote_report(reports, phase) do
+    reports
+    |> Enum.filter(&(&1["phase"] == phase))
+    |> Enum.max_by(& &1["attempt"], fn -> nil end)
+    |> case do
+      nil -> nil
+      entry -> entry["report"]
+    end
+  end
+
+  defp accepted_remote_sha(task, issue, reports, sha) do
+    build = latest_remote_report(reports, "build")
+
+    valid_build = is_map(build) and build["outcome"] == "ready" and build["sha"] == sha
+    valid_branch = is_map(build) and build["branch"] == task["branch"] and build["base_branch"] == task["base_branch"]
+
+    valid_reports = Enum.all?(reports, &is_map(&1["report"]))
+
+    if valid_reports and (Issue.routable?(issue, ["qa"]) or (valid_build and valid_branch)),
+      do: sha,
+      else: nil
+  end
+
+  defp save_aligned_checkpoint(task, updated) do
+    case Store.replace_task_if_unchanged(task, updated) do
+      :ok -> {:ok, updated}
+      :stale -> :ignore
+      {:error, _reason} = error -> error
     end
   end
 
@@ -250,9 +367,10 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp prepare_task(nil, %Issue{} = issue) do
-    if issue.state in [issue_status_value(issue, :ready), issue_status_value(issue, :building)] do
+    if issue.state in [issue_status_value(issue, :ready), issue_status_value(issue, :building), issue_status_value(issue, :qa), issue_status_value(issue, :review)] do
       profile = issue.native_ref || %{}
-      phase = if Issue.routable?(issue, ["qa"]), do: "qa", else: "build"
+
+      phase = initial_phase(issue)
 
       task = %{
         "issue_id" => issue.id,
@@ -263,8 +381,8 @@ defmodule SymphonyElixir.Pipeline do
         "required_checks" => profile_value(profile, :required_checks) || [],
         "generation" => 1,
         "phase" => phase,
-        "status" => if(phase == "qa", do: "qa", else: "building"),
-        "direct_qa" => phase == "qa",
+        "status" => if(phase == "build", do: "building", else: phase),
+        "direct_qa" => phase == "qa" and Issue.routable?(issue, ["qa"]),
         "attempts" => %{},
         "effective_config" => Skills.effective_config(issue),
         "prior_findings" => [],
@@ -272,7 +390,7 @@ defmodule SymphonyElixir.Pipeline do
         "pr_number" => nil
       }
 
-      with {:ok, task} <- seed_qa_pull_request(task, issue),
+      with {:ok, task} <- seed_initial_delivery(task, issue),
            :ok <- Store.save_task(task),
            do: {:ok, task, phase}
     else
@@ -318,28 +436,56 @@ defmodule SymphonyElixir.Pipeline do
       else: :ignore
   end
 
+  defp prepare_task(%{"status" => status} = task, %Issue{} = issue) when status in ["qa", "review"] do
+    if issue.state == status_value(task, :ready) and task["qa_claim_pending"] != true and task["direct_qa"] != true do
+      if Issue.routable?(issue, ["qa"]), do: resume_direct_qa(task, issue), else: resume_human_review_task(task)
+    else
+      prepare_phase_task(task, issue)
+    end
+  end
+
   defp prepare_task(%{"status" => "building"} = task, %Issue{} = issue) do
     if issue.state in [status_value(task, :ready), status_value(task, :building)],
       do: {:ok, task, task["phase"]},
       else: :ignore
   end
 
-  defp prepare_task(%{"status" => "qa", "direct_qa" => true} = task, %Issue{state: issue_state}) do
+  defp prepare_task(_task, _issue), do: :ignore
+
+  defp seed_initial_delivery(task, issue) do
+    if issue.state in [issue_status_value(issue, :qa), issue_status_value(issue, :review)] do
+      recover_remote_delivery(task, issue, task["phase"])
+    else
+      with {:ok, reports} <- Tracker.phase_reports(issue),
+           {task, _} = recover_remote_attempts(task, reports),
+           {:ok, task} <- seed_qa_pull_request(task, issue) do
+        {:ok, task}
+      else
+        :ignore -> {:error, :remote_phase_reports_unavailable}
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  defp initial_phase(issue) do
+    cond do
+      issue.state == issue_status_value(issue, :review) -> "review"
+      issue.state == issue_status_value(issue, :qa) or Issue.routable?(issue, ["qa"]) -> "qa"
+      true -> "build"
+    end
+  end
+
+  defp prepare_phase_task(%{"status" => "qa", "direct_qa" => true} = task, %Issue{state: issue_state}) do
     if issue_state in [status_value(task, :ready), status_value(task, :building), status_value(task, :qa)],
       do: {:ok, task, "qa"},
       else: :ignore
   end
 
-  defp prepare_task(%{"status" => status} = task, %Issue{state: issue_state})
-       when status in ["building", "qa", "review"] do
-    phase = task["phase"]
-
-    if issue_state == status_value(task, status_phase(status)) and phase in @phases,
-      do: {:ok, task, phase},
+  defp prepare_phase_task(%{"status" => status} = task, %Issue{state: issue_state}) do
+    if issue_state == status_value(task, status_phase(status)) and task["phase"] in @phases,
+      do: {:ok, task, task["phase"]},
       else: :ignore
   end
-
-  defp prepare_task(_task, _issue), do: :ignore
 
   @spec record_skill_readiness(Issue.t(), map(), :ok | {:error, term()}) :: {:ok, map()} | {:error, term()}
   def record_skill_readiness(%Issue{} = _issue, task, :ok) do
@@ -464,7 +610,7 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp seed_qa_pull_request(%{"phase" => "qa"} = task, issue) do
+  defp seed_qa_pull_request(%{"phase" => phase} = task, issue) when phase in ["qa", "review"] do
     expected_branch = task["branch"]
     expected_base = task["base_branch"]
 
@@ -736,7 +882,7 @@ defmodule SymphonyElixir.Pipeline do
       %Issue{} = issue ->
         _ = execute_pending(issue)
 
-        if issue_id in running_issue_ids and preserve_running_review?(task, issue) do
+        if issue_id in running_issue_ids do
           :ok
         else
           reconcile_task_issue(issue, task)
@@ -746,13 +892,6 @@ defmodule SymphonyElixir.Pipeline do
         :ok
     end
   end
-
-  defp preserve_running_review?(%{"phase" => "review"} = task, issue) do
-    issue.state in [status_value(task, :human_review), "closed"] or
-      (task["stale_merge_retry"] == true and issue.state == status_value(task, :ready))
-  end
-
-  defp preserve_running_review?(_task, _issue), do: false
 
   defp reconcile_task_issue(%Issue{state: "closed"} = issue, %{"status" => status} = task)
        when status not in ["done", "dropped"],
@@ -798,6 +937,12 @@ defmodule SymphonyElixir.Pipeline do
   defp reconcile_nonterminal_task(issue, task), do: reconcile_checkpoint(issue, task)
 
   defp reconcile_checkpoint(issue, task) do
+    with {:ok, aligned} <- align_active_checkpoint(task, issue) do
+      reconcile_aligned_checkpoint(issue, aligned)
+    end
+  end
+
+  defp reconcile_aligned_checkpoint(issue, task) do
     case checkpoint_state_mismatch(task, issue) do
       {:mismatch, reason} -> block_checkpoint_mismatch(task, issue, reason)
       :ok -> :ok
@@ -844,7 +989,7 @@ defmodule SymphonyElixir.Pipeline do
           qa_expected_states(task, claim_active)
 
         "review" ->
-          [status_value(task, :review)]
+          [status_value(task, :review), status_value(task, :ready)]
 
         "finalize" ->
           [status_value(task, :human_review), status_value(task, :building), status_value(task, :done), "closed"]
@@ -862,9 +1007,16 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp qa_expected_states(task, claim_active) do
-    if task["direct_qa"] == true and (task["qa_claim_pending"] != true or claim_active),
-      do: [status_value(task, :ready), status_value(task, :building), status_value(task, :qa)],
-      else: [status_value(task, :qa)]
+    cond do
+      task["direct_qa"] == true and (task["qa_claim_pending"] != true or claim_active) ->
+        [status_value(task, :ready), status_value(task, :building), status_value(task, :qa)]
+
+      task["qa_claim_pending"] == true ->
+        [status_value(task, :qa)]
+
+      true ->
+        [status_value(task, :qa), status_value(task, :ready)]
+    end
   end
 
   defp block_checkpoint_mismatch(task, issue, reason) do

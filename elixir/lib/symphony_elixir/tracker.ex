@@ -34,6 +34,7 @@ defmodule SymphonyElixir.Tracker do
   @callback upsert_pull_request(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
   @callback set_pull_request_stage(Issue.t(), integer(), atom()) :: {:ok, map()} | {:error, term()}
   @callback pull_request(Issue.t()) :: {:ok, map() | nil} | {:error, term()}
+  @callback phase_reports(Issue.t()) :: {:ok, [map()]} | {:error, term()}
   @callback publish_phase_report(Issue.t(), String.t(), String.t(), String.t()) :: :ok | {:error, term()}
 
   @optional_callbacks agent_tool_specs: 0,
@@ -47,6 +48,7 @@ defmodule SymphonyElixir.Tracker do
                       upsert_pull_request: 2,
                       set_pull_request_stage: 3,
                       pull_request: 1,
+                      phase_reports: 1,
                       publish_phase_report: 4
 
   @agent_owned_callbacks [
@@ -100,6 +102,9 @@ defmodule SymphonyElixir.Tracker do
 
   @spec pull_request(Issue.t()) :: {:ok, map() | nil} | :ignore | {:error, term()}
   def pull_request(%Issue{} = issue), do: issue_lifecycle_callback(:pull_request, [issue])
+
+  @spec phase_reports(Issue.t()) :: {:ok, [map()]} | :ignore | {:error, term()}
+  def phase_reports(%Issue{} = issue), do: issue_lifecycle_callback(:phase_reports, [issue])
 
   @spec publish_phase_report(Issue.t(), String.t(), String.t(), String.t()) :: :ok | :ignore | {:error, term()}
   def publish_phase_report(%Issue{} = issue, marker, body, phase),
