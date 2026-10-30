@@ -378,6 +378,68 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     end
   end
 
+  @spec phase_reports(Issue.t()) :: {:ok, [map()]} | {:error, term()}
+  def phase_reports(issue) do
+    phase_reports(issue, Config.settings!().tracker, &perform_request/3)
+  end
+
+  @doc false
+  @spec phase_reports_for_test(Issue.t(), map(), function()) :: {:ok, [map()]} | {:error, term()}
+  def phase_reports_for_test(issue, tracker_settings, request_fun), do: phase_reports(issue, tracker_settings, request_fun)
+
+  defp phase_reports(issue, tracker_settings, request_fun) do
+    with {:ok, settings} <- settings(tracker_settings),
+         {:ok, issue_ref} <- issue_repository_and_number(issue),
+         {:ok, comments} <- list_issue_comments(issue_ref, settings, request_fun, nil, []),
+         {:ok, viewer_data} <- graphql(request_fun, @viewer_query, %{}, settings),
+         viewer when is_binary(viewer) <- get_in(viewer_data, ["viewer", "login"]) do
+      markers = [Issue.execution_identity(issue), issue.id] |> Enum.uniq() |> Enum.map_join("|", &Regex.escape/1)
+      pattern = Regex.compile!("<!-- symphony:report:start:(?:#{markers}):(\\d+):(build|qa|review|finalize|diagnostic):(\\d+) -->")
+
+      case comments |> Enum.filter(&(get_in(&1, ["author", "login"]) == viewer)) |> Enum.reduce_while({:ok, []}, &collect_phase_report(&1, &2, pattern)) do
+        {:ok, reports} -> {:ok, Enum.reverse(reports)}
+        error -> error
+      end
+    else
+      nil -> {:error, :github_agent_identity_missing}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp collect_phase_report(comment, {:ok, reports}, pattern) do
+    body = comment["body"] || ""
+
+    case Regex.run(pattern, body) do
+      [_, generation, phase, attempt] ->
+        report = decode_recovered_report(body, phase)
+        entry = %{"generation" => String.to_integer(generation), "phase" => phase, "attempt" => String.to_integer(attempt), "report" => report}
+        {:cont, {:ok, [entry | reports]}}
+
+      nil ->
+        {:cont, {:ok, reports}}
+    end
+  end
+
+  defp decode_recovered_report(body, phase) do
+    case AgentReport.decode_comment(body) do
+      {:ok, report} when is_map(report) -> if valid_recovered_report?(report, phase), do: report, else: nil
+      _ -> nil
+    end
+  end
+
+  defp valid_recovered_report?(report, phase) do
+    findings = report["findings"] || []
+    resolutions = report["resolutions"] || []
+    checks = report["checks"] || []
+
+    valid_findings?(findings) and valid_resolutions?(resolutions) and valid_checks?(phase, checks)
+  end
+
+  defp valid_findings?(findings), do: is_list(findings) and Enum.all?(findings, &(is_map(&1) and is_binary(&1["id"])))
+  defp valid_resolutions?(resolutions), do: is_list(resolutions) and Enum.all?(resolutions, &is_binary/1)
+  defp valid_checks?("qa", checks), do: is_list(checks) and Enum.all?(checks, &is_map/1)
+  defp valid_checks?(_phase, _checks), do: true
+
   @doc false
   @spec pull_request_for_test(Issue.t(), map(), function()) :: {:ok, map() | nil} | {:error, term()}
   def pull_request_for_test(issue, tracker_settings, request_fun)
@@ -1465,17 +1527,32 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp list_issue_comments(issue_ref, settings, request_fun, cursor, comments) do
-    with {:ok, data} <- graphql(request_fun, @comments_query, Map.put(issue_ref, "after", cursor), settings) do
-      connection = get_in(data, ["repository", "issue", "comments"]) || %{}
-      nodes = connection["nodes"] || []
-      page_info = connection["pageInfo"] || %{}
+    list_issue_comments(issue_ref, settings, request_fun, cursor, comments, [])
+  end
+
+  defp list_issue_comments(issue_ref, settings, request_fun, cursor, comments, seen) do
+    with {:ok, data} <- graphql(request_fun, @comments_query, Map.put(issue_ref, "after", cursor), settings),
+         %{"nodes" => nodes, "pageInfo" => %{"hasNextPage" => has_next} = page_info} <- get_in(data, ["repository", "issue", "comments"]),
+         true <- is_list(nodes) and is_boolean(has_next),
+         true <- Enum.all?(nodes, &valid_comment?/1),
+         end_cursor = page_info["endCursor"],
+         true <- not has_next or valid_next_cursor?(end_cursor, cursor, seen) do
       comments = comments ++ nodes
 
-      if page_info["hasNextPage"],
-        do: list_issue_comments(issue_ref, settings, request_fun, page_info["endCursor"], comments),
+      if has_next,
+        do: list_issue_comments(issue_ref, settings, request_fun, end_cursor, comments, [end_cursor | seen]),
         else: {:ok, comments}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :incomplete_remote_phase_reports}
     end
   end
+
+  defp valid_next_cursor?(next, current, seen), do: is_binary(next) and next != "" and next != current and next not in seen
+
+  defp valid_comment?(%{"body" => body, "author" => nil}), do: is_binary(body)
+  defp valid_comment?(%{"body" => body, "author" => %{"login" => login}}), do: is_binary(body) and is_binary(login)
+  defp valid_comment?(_), do: false
 
   defp task_comment(comment), do: %{"id" => comment["id"], "url" => comment["url"], "body" => comment["body"]}
 
