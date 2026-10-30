@@ -94,9 +94,13 @@ Pipeline phase reports use Markdown in Spanish when the issue is Spanish, and En
 unsupported, or ambiguous issue languages. Reports omit empty sections and distinguish blocked
 phases from checks that did not run. QA reports map each issue acceptance criterion to a status,
 test or procedure, and evidence reference. Agent checks include their test layer, exact command,
-result, and status; Symphony records its required checks separately as host evidence. QA also records
-coverage gaps by scenario, impact, missing coverage, and risk priority. Review checks the latest QA
-report against the issue criteria, accepted SHA, and required host checks before advancing.
+result, and status; Symphony records its required checks separately as host evidence. QA may add or
+modify test and evidence files in the current delivery, records each path and its change, and reports
+the exact verification command. For high-risk gaps it writes the reproducing test first. QA pushes
+test-only changes to the existing branch and reports the resulting PR SHA; with no file changes, it
+keeps the incoming SHA. Product defects return to Build, while environment or permission failures
+are blocked with a diagnosis. Review inspects the PR diff against the QA file list and repeats the
+verification command on the accepted SHA before advancing.
 
 ## Prerequisites
 

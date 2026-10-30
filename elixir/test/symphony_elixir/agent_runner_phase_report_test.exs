@@ -295,7 +295,9 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
             "evidence" => ["qa-evidence"]
           }
         ],
+        "files" => [],
         "changes" => [],
+        "verification_command" => "mix test test/symphony_elixir/example_test.exs",
         "checks" => [
           %{
             "id" => "qa-evidence",
@@ -468,6 +470,11 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert hd(prompts) =~ "claim"
       assert hd(prompts) =~ "read_workpad"
       assert hd(prompts) =~ "report_context.host_checks"
+      assert hd(prompts) =~ "test and test-evidence files"
+      assert hd(prompts) =~ "high-risk gaps"
+      assert hd(prompts) =~ "commit and push them"
+      assert hd(prompts) =~ "verification_command"
+      refute hd(prompts) =~ "Do not modify files"
       assert hd(prompts) =~ "complete human-readable Markdown comment in `body`"
       refute hd(prompts) =~ "echo required-check-secret"
       refute hd(prompts) =~ "host-evidence-secret"

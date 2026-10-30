@@ -1185,7 +1185,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
           report
       end
 
-    block_qa_task_rework(normalized, context)
+    normalized
   end
 
   defp normalize_agent_report(report, "review", context) do
@@ -1210,7 +1210,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
         do: Map.put(report, "outcome", "changes_requested"),
         else: report
 
-    block_qa_task_rework(normalized, context)
+    normalized
   end
 
   defp normalize_agent_report(report, _lane, _context), do: report
@@ -1220,14 +1220,28 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     required = task["required_checks"] || []
 
     cond do
-      report["sha"] != task["current_sha"] -> {:error, :qa_report_sha_mismatch}
-      not valid_agent_report?(report) -> {:error, :invalid_qa_report}
-      not QAReport.valid?(report, required, context[:issue] && context[:issue].description) -> {:error, :invalid_qa_report}
-      true -> :ok
+      not qa_sha_transition_valid?(report, task) ->
+        {:error, :qa_report_sha_mismatch}
+
+      not valid_agent_report?(report) ->
+        {:error, :invalid_qa_report}
+
+      not QAReport.valid?(report, required, context[:issue] && context[:issue].description) ->
+        {:error, :invalid_qa_report}
+
+      true ->
+        :ok
     end
   end
 
   defp validate_agent_handoff_report(_lane, _report, _context), do: :ok
+
+  defp qa_sha_transition_valid?(%{"outcome" => "blocked"}, _task), do: true
+
+  defp qa_sha_transition_valid?(report, task) do
+    same_sha? = report["sha"] == task["current_sha"]
+    if report["files"] == [], do: same_sha?, else: not same_sha?
+  end
 
   defp valid_agent_report?(report) do
     report["outcome"] in ["passed", "changes_requested", "blocked", "failed", "defects_found"] and
@@ -1243,20 +1257,6 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp present_report_value?(value), do: is_binary(value) and String.trim(value) != ""
-
-  defp block_qa_task_rework(%{"outcome" => outcome} = report, %{issue: %Issue{} = issue})
-       when outcome in ["changes_requested", "failed", "defects_found"] do
-    if Issue.routable?(issue, ["qa"]) do
-      report
-      |> Map.put("outcome", "blocked")
-      |> Map.put("reason", "QA found work requiring an external correction.")
-      |> Map.put("next_step", "Correct the existing delivery, then move the issue to Ready to rerun QA.")
-    else
-      report
-    end
-  end
-
-  defp block_qa_task_rework(report, _context), do: report
 
   defp qa_text(%{report_locale: :es}, :checks_unavailable), do: "Symphony no pudo ejecutar todas las comprobaciones requeridas."
   defp qa_text(%{report_locale: :es}, :checks_failed), do: "Falló alguna comprobación requerida o falta evidencia para confirmarla."
@@ -1303,9 +1303,9 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       else: Enum.map([:building, :qa, :review, :human_review], &Map.fetch!(settings.statuses, &1))
   end
 
-  defp handoff_pull_request(issue, context, _report, _tracker_settings, settings, request_fun)
+  defp handoff_pull_request(issue, context, report, _tracker_settings, settings, request_fun)
        when context.lane in [:qa, :review, :finalize, "qa", "review", "finalize"] do
-    return_existing_pull_request(issue, context, settings, request_fun)
+    return_existing_pull_request(issue, context, report, settings, request_fun)
   end
 
   defp handoff_pull_request(issue, context, %{"outcome" => "ready", "sha" => sha} = report, tracker_settings, settings, request_fun)
@@ -1351,17 +1351,27 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     end
   end
 
-  defp return_existing_pull_request(issue, context, settings, request_fun) do
+  defp return_existing_pull_request(issue, context, report, settings, request_fun) do
     case pull_request(issue, settings, request_fun) do
       {:ok, nil} ->
         {:error, :pull_request_not_found}
 
       {:ok, pr} ->
-        expected_sha = get_in(context, [:task, "current_sha"])
-        if is_binary(expected_sha) and pr.sha != expected_sha, do: {:error, :pull_request_head_sha_mismatch}, else: {:ok, pr_evidence(pr)}
+        task = context[:task] || %{}
+        expected_sha = if to_string(context.lane) == "qa", do: report["sha"], else: task["current_sha"]
+        validate_existing_pull_request(pr, task, expected_sha)
 
       {:error, _reason} = error ->
         error
+    end
+  end
+
+  defp validate_existing_pull_request(pr, task, expected_sha) do
+    cond do
+      is_binary(expected_sha) and pr.sha != expected_sha -> {:error, :pull_request_head_sha_mismatch}
+      is_binary(task["branch"]) and pr.branch != task["branch"] -> {:error, :pull_request_branch_mismatch}
+      is_binary(task["base_branch"]) and pr.base != task["base_branch"] -> {:error, :pull_request_base_mismatch}
+      true -> {:ok, pr_evidence(pr)}
     end
   end
 
@@ -1548,7 +1558,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     fields =
       case lane do
         "build" -> ["branch", "base_branch", "required_checks"]
-        "qa" -> ["current_sha", "required_checks"]
+        "qa" -> ["branch", "base_branch", "pr_number", "current_sha", "required_checks"]
         "review" -> ["branch", "base_branch", "pr_number", "current_sha", "prior_findings"]
         "finalize" -> ["branch", "base_branch", "pr_number", "current_sha"]
         _ -> []
