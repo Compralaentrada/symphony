@@ -37,9 +37,14 @@ sources and fingerprints are listed in [`../.agents/skills/SOURCES.md`](../.agen
 
 In the Projects pipeline, Symphony owns the Build, QA, and Review role prompts and base skill
 assignments; installation `WORKFLOW.md` front matter cannot remap them. Task-specific skills are
-selected from issue context. Unattended sessions load only selected task skills; separate workflow
-instructions can still request operational skills. Interactive skills such as Impeccable and TDD
-are not forced into unattended sessions.
+selected from issue context. Build receives the autonomous `tdd-autonomous` skill for tasks that
+may change code, including mixed code and documentation work. The `writing-only` and `text-only`
+labels identify prose-only scope; `docs` alone does not exclude TDD. When scope is unclear, the
+Build agent decides from the issue and repository, records its public test interfaces, and follows
+the failing-test, implementation, passing-test loop without waiting for approval. QA and Review
+retain their own skill assignments and do not receive TDD by default. The interactive `tdd` skill
+keeps its approval contract for attended runs. Unattended sessions load only selected task skills;
+separate workflow instructions can still request operational skills.
 
 When a Codex session ends, Symphony asks app-server to archive its thread so it no longer appears
 in the active chat list. The archived history remains available; an archive failure is logged and

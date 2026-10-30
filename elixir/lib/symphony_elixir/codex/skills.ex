@@ -10,7 +10,7 @@ defmodule SymphonyElixir.Codex.Skills do
   @catalog @catalog_path |> File.read!() |> Jason.decode!()
 
   @code_skills ["ponytail"]
-  @phase_skills %{build: ["ponytail"], qa: [], review: []}
+  @phase_skills %{build: ["ponytail", "tdd-autonomous"], qa: [], review: []}
   @skill_free_phases [:diagnostic, :finalize]
   @snapshot_phases [:build, :qa, :review, :diagnostic, :finalize]
   @writing_only_labels ["writing-only", "text-only"]

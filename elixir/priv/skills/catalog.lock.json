@@ -9,6 +9,11 @@
     "revision": "24fe0ef7737efae15c87225755e9f6f5965e4888",
     "fingerprint": "667334c17fc95b5baa2de148b7350b869b6ca638d28a4f169a20097a96ff760a"
   },
+  "tdd-autonomous": {
+    "version": "v1.0.0",
+    "revision": "repository",
+    "fingerprint": "35f53a76898dc0bc6507f58f70611f14caf842da1be7bfae389c4fbe275c5b15"
+  },
   "code-review": {
     "version": "v1.3.1",
     "revision": "24fe0ef7737efae15c87225755e9f6f5965e4888",
