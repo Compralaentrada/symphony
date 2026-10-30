@@ -797,6 +797,32 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
              )
   end
 
+  test "Review hands off only unresolved findings when its report repeats resolved findings" do
+    resolved = %{"id" => "QA-1", "reproduction" => "Old failure", "criterion" => "Works"}
+    pending = %{"id" => "QA-2", "reproduction" => "Still fails", "criterion" => "Works"}
+    context = %{task: %{"prior_findings" => [resolved, pending]}}
+    report = %{"outcome" => "passed", "findings" => [resolved], "resolutions" => ["QA-1: Resuelto; comprobado en QA."]}
+
+    assert %{"outcome" => "changes_requested", "findings" => [^pending]} =
+             Client.normalize_agent_report_for_test(report, "review", context)
+
+    assert %{"outcome" => "passed", "findings" => []} =
+             Client.normalize_agent_report_for_test(report, "review", %{task: %{"prior_findings" => [resolved]}})
+  end
+
+  test "a normalized report visibly identifies the authoritative outcome and pending findings" do
+    submitted = %{"outcome" => "passed", "findings" => []}
+    finding = %{"id" => "QA-2", "reproduction" => "Still fails", "criterion" => "Works"}
+    normalized = %{"outcome" => "changes_requested", "findings" => [finding]}
+    body = "Review passed.\n\n<!-- symphony:report:json\n#{Jason.encode!(submitted)}\n-->"
+
+    assert {:ok, published} = AgentReport.normalize_body(body, normalized, submitted)
+    visible = published |> String.split("<!-- symphony:report:json") |> hd()
+    assert visible =~ "changes_requested"
+    assert visible =~ "QA-2"
+    assert {:ok, ^normalized} = AgentReport.decode_comment(published)
+  end
+
   test "automatic Review does not overwrite a human move to Human Review" do
     previous = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
     root = Path.join(System.tmp_dir!(), "symphony-human-review-#{System.unique_integer([:positive])}")
@@ -905,8 +931,30 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     qa_report = %{
       "outcome" => "passed",
+      "summary" => "Every acceptance criterion is covered by passing evidence.",
       "sha" => sha,
-      "checks" => [%{"name" => "make -C elixir all", "status" => "passed", "evidence" => "Host exit status 0 on #{sha}."}]
+      "criteria" => [
+        %{
+          "criterion" => "The implementation passes its required checks.",
+          "status" => "passed",
+          "procedure" => "Run the configured host check on the accepted SHA.",
+          "evidence" => ["host:make -C elixir all"]
+        }
+      ],
+      "changes" => [],
+      "checks" => [],
+      "host_checks" => [
+        %{
+          "name" => "make -C elixir all",
+          "status" => "passed",
+          "evidence" => "Host exit status 0 on #{sha}.",
+          "source" => "host"
+        }
+      ],
+      "gaps" => [],
+      "findings" => [],
+      "next_step" => "Continue to Review.",
+      "reason" => nil
     }
 
     prior_qa_report = %{
@@ -961,6 +1009,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     issue = %Issue{
       id: issue_id,
       identifier: issue_id,
+      description: "## Acceptance Criteria\n- The implementation passes its required checks.",
       url: "https://github.com/octo/app/issues/#{number}",
       native_ref: %{repository: "octo/app", issue_node_id: "I_issue_#{number}"}
     }
@@ -1088,10 +1137,16 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       end
     end
 
+    omitted_criteria_report =
+      Map.put(qa_report, "criteria", [])
+      |> Jason.encode!(pretty: true)
+      |> then(&"<!-- symphony:report:json\n#{&1}\n-->")
+
     for report_body <- [
           "not a JSON report",
           "<!-- symphony:report:json\nnot JSON\n-->",
-          "<!-- symphony:report:json\n{}\n-->\n<!-- symphony:report:json\n{}\n-->"
+          "<!-- symphony:report:json\n{}\n-->\n<!-- symphony:report:json\n{}\n-->",
+          omitted_criteria_report
         ] do
       malformed =
         AgentTool.execute(
@@ -1165,6 +1220,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     assert %{
              "outcome" => "blocked",
+             "summary" => "Symphony no pudo ejecutar todas las comprobaciones requeridas.",
              "reason" => "Symphony no pudo ejecutar todas las comprobaciones requeridas."
            } = Client.normalize_agent_report_for_test(%{"outcome" => "passed"}, "qa", unavailable)
 
@@ -1291,7 +1347,22 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "findings" => [finding],
       "next_step" => "Fix the defect.",
       "sha" => sha,
-      "checks" => [%{"name" => "mix test", "status" => "failed", "evidence" => "stale agent result"}]
+      "criteria" => [],
+      "changes" => [],
+      "checks" => [
+        %{
+          "id" => "failed-unit-test",
+          "layer" => "unit",
+          "command" => "mix test",
+          "status" => "failed",
+          "result" => "1 test failed.",
+          "evidence" => "stale agent result",
+          "required" => true,
+          "reason" => nil
+        }
+      ],
+      "gaps" => [],
+      "reason" => nil
     }
 
     markdown = "## QA report\n\nQA found a defect.\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
@@ -1340,7 +1411,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert stored_comment =~ "<!-- symphony:report:start:#{issue_id}:1:qa:1 -->"
     assert stored_comment =~ "## QA report\n\nQA found a defect.\n\n"
     assert {:ok, stored_report} = AgentReport.decode_comment(stored_comment)
-    assert stored_report["checks"] == context.host_checks
+    assert stored_report["checks"] == report["checks"]
+    assert stored_report["host_checks"] == Enum.map(context.host_checks, &Map.put(&1, "source", "host"))
   end
 
   test "QA defects return the Project item to Building" do
@@ -1364,6 +1436,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     issue = %Issue{
       id: issue_id,
       identifier: issue_id,
+      description: "## Acceptance Criteria\n- The failing scenario must return a valid result.",
       url: "https://github.com/octo/app/issues/#{number}",
       branch_name: "symphony/octo-app-#{number}",
       state: "Ready",
@@ -1441,10 +1514,61 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "findings" => [finding],
       "next_step" => "Fix the defect.",
       "sha" => sha,
-      "checks" => [%{"name" => "mix test", "status" => "failed", "evidence" => "stale agent result"}]
+      "criteria" => [
+        %{
+          "criterion" => "The failing scenario must return a valid result.",
+          "status" => "failed",
+          "procedure" => "Run the focused unit test and inspect the returned value.",
+          "evidence" => ["focused-unit-test"]
+        }
+      ],
+      "changes" => [],
+      "checks" => [
+        %{
+          "id" => "focused-unit-test",
+          "layer" => "unit",
+          "command" => "mix test test/symphony_elixir/example_test.exs",
+          "status" => "failed",
+          "result" => "1 test, 1 failure.",
+          "evidence" => "test-output: QA-1",
+          "required" => true,
+          "reason" => nil
+        }
+      ],
+      "host_checks" => [
+        %{"name" => "mix test", "status" => "passed", "evidence" => "exit status 0", "source" => "host"}
+      ],
+      "gaps" => [],
+      "reason" => nil
     }
 
     markdown = "## QA report\n\nQA found a defect.\n\n<!-- symphony:report:json\n#{Jason.encode!(report, pretty: true)}\n-->"
+
+    omitted_criteria = Map.put(report, "criteria", [])
+
+    omitted_handoff =
+      AgentTool.execute(
+        "github_workflow",
+        %{
+          "operation" => "handoff",
+          "outcome" => "defects_found",
+          "report" => omitted_criteria,
+          "body" => "## QA report\n\n<!-- symphony:report:json\n#{Jason.encode!(omitted_criteria, pretty: true)}\n-->"
+        },
+        agent_context: %{
+          issue: issue,
+          lane: :qa,
+          generation: 1,
+          attempt: 1,
+          task: task,
+          host_checks: [%{"name" => "mix test", "status" => "passed", "evidence" => "exit status 0"}]
+        },
+        tracker_settings: tracker_settings(),
+        projects_request: fn _query, _variables, _settings -> flunk("an omitted acceptance criterion must fail before GitHub writes") end
+      )
+
+    refute omitted_handoff["success"]
+    assert Jason.decode!(omitted_handoff["output"])["error"]["reason"] == ":invalid_qa_report"
 
     context = %{
       issue: issue,
@@ -1455,6 +1579,25 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       host_checks: [%{"name" => "mix test", "status" => "passed", "evidence" => "exit status 0"}],
       tracker_kind: "github_projects"
     }
+
+    stale_report = Map.put(report, "sha", String.duplicate("b", 40))
+
+    stale_handoff =
+      AgentTool.execute(
+        "github_workflow",
+        %{
+          "operation" => "handoff",
+          "outcome" => "defects_found",
+          "report" => stale_report,
+          "body" => "## QA report\n\nQA found a defect.\n\n<!-- symphony:report:json\n#{Jason.encode!(stale_report, pretty: true)}\n-->"
+        },
+        agent_context: context,
+        tracker_settings: tracker_settings(),
+        projects_request: fn _query, _variables, _settings -> flunk("a SHA mismatch must fail before GitHub writes") end
+      )
+
+    refute stale_handoff["success"]
+    assert Jason.decode!(stale_handoff["output"])["error"]["reason"] == ":qa_report_sha_mismatch"
 
     claim =
       AgentTool.execute(
@@ -1487,7 +1630,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert stored_comment =~ "<!-- symphony:report:start:#{issue_id}:1:qa:1 -->"
     assert stored_comment =~ "## QA report\n\nQA found a defect.\n\n"
     assert {:ok, stored_report} = AgentReport.decode_comment(stored_comment)
-    assert stored_report["checks"] == context.host_checks
+    assert stored_report["checks"] == report["checks"]
+    assert stored_report["host_checks"] == Enum.map(context.host_checks, &Map.put(&1, "source", "host"))
 
     workpad_result =
       AgentTool.execute(
@@ -2725,7 +2869,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
         %{
           "name" => "make -C elixir all",
           "status" => Map.get(options, :host_check_status, "passed"),
-          "evidence" => "exit status 0"
+          "evidence" => "exit status 0",
+          "source" => "host"
         }
       ]
     }

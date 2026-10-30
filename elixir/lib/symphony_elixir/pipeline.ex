@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Pipeline do
   require Logger
 
   alias SymphonyElixir.Codex.Skills
-  alias SymphonyElixir.{Config, Pipeline.Findings, Pipeline.Store, PRBody, Tracker}
+  alias SymphonyElixir.{Config, Pipeline.Findings, Pipeline.Store, PRBody, QAReport, Tracker}
   alias SymphonyElixir.Tracker.Issue
 
   @phases ~w(build qa review finalize)
@@ -77,6 +77,20 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   @spec finish_phase(Issue.t(), map(), String.t(), pos_integer(), term()) :: :ok | {:error, term()}
+  def finish_phase(%Issue{} = issue, task, "qa", attempt, {:system_blocker, result}) when is_map(result) do
+    if non_empty?(result["reason"]) and non_empty?(result["next_step"]) do
+      if Tracker.agent_owned_writes?() do
+        _ = Store.interrupt_phase(issue.id, task["generation"], "qa", attempt)
+        {:error, :diagnostic_handoff_required}
+      else
+        persist_blocked_phase(issue, task, "qa", attempt, result)
+      end
+    else
+      _ = Store.interrupt_phase(issue.id, task["generation"], "qa", attempt)
+      {:error, :invalid_system_blocker_report}
+    end
+  end
+
   def finish_phase(%Issue{} = issue, task, phase, attempt, {:system_blocker, result})
       when phase in ["build", "qa", "review"] and is_map(result) do
     case normalize_phase_result(result, phase, report_locale(issue)) do
@@ -98,7 +112,7 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   def finish_phase(%Issue{} = issue, task, phase, attempt, result) do
-    case normalize_phase_result(result, phase, report_locale(issue)) do
+    case normalize_phase_result(result, phase, report_locale(issue), issue.description) do
       {:ok, result} ->
         with :ok <- validate_remote_handoff(phase, result) do
           finish_valid_phase(issue, clear_qa_claim(task, phase), phase, attempt, result)
@@ -761,9 +775,14 @@ defmodule SymphonyElixir.Pipeline do
   defp finish_valid_phase(issue, task, phase, attempt, %{"outcome" => "blocked"} = result)
        when phase in ["qa", "review", "finalize"] do
     reason = result["reason"] || result["summary"] || "Agent requires operator intervention."
-    next = task |> Map.put("phase", phase) |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
-    operations = report_ops(next, phase, attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
-    commit(issue, next, phase, attempt, result, operations)
+
+    if phase == "qa" do
+      block_qa_phase(issue, task, attempt, result, reason, result["next_step"] || reason)
+    else
+      next = task |> Map.put("phase", phase) |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
+      operations = report_ops(next, phase, attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
+      commit(issue, next, phase, attempt, result, operations)
+    end
   end
 
   defp finish_valid_phase(issue, task, "build", attempt, %{"outcome" => "ready", "sha" => sha} = result)
@@ -792,11 +811,19 @@ defmodule SymphonyElixir.Pipeline do
   defp finish_valid_phase(issue, task, "qa", attempt, %{"outcome" => "passed", "sha" => sha} = result)
        when is_binary(sha) do
     with :ok <- ensure_current_sha(task, sha),
-         :ok <- validate_required_checks(task["required_checks"], result["checks"] || []) do
-      next = task |> Map.merge(%{"phase" => "review", "status" => "review", "host_checks" => result["_host_checks"] || result["checks"] || []})
+         :ok <- validate_required_checks(task["required_checks"], result["host_checks"] || []) do
+      next = task |> Map.merge(%{"phase" => "review", "status" => "review", "host_checks" => result["host_checks"] || []})
       operations = report_ops(next, "qa", attempt, result) ++ [status_op(next, :review, nil, attempt)]
       commit(issue, next, "qa", attempt, result, operations)
     else
+      {:error, :phase_sha_mismatch} ->
+        {reason, next_step} = qa_block_text(report_locale(issue), :sha_mismatch)
+        block_qa_phase(issue, task, attempt, result, reason, next_step)
+
+      {:error, :required_checks_unavailable} ->
+        {reason, next_step} = qa_block_text(report_locale(issue), :checks_unavailable)
+        block_qa_phase(issue, task, attempt, result, reason, next_step)
+
       {:error, reason} ->
         result = Map.merge(result, %{"outcome" => "changes_requested", "validation_error" => inspect(reason)})
         next = %{task | "phase" => "build", "status" => "building"}
@@ -804,6 +831,26 @@ defmodule SymphonyElixir.Pipeline do
         commit(issue, next, "qa", attempt, result, operations)
     end
   end
+
+  defp block_qa_phase(issue, task, attempt, result, reason, next_step) do
+    result = Map.merge(result, %{"outcome" => "blocked", "reason" => reason, "next_step" => next_step})
+    next = task |> Map.put("phase", "qa") |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
+    operations = report_ops(next, "qa", attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
+    commit(issue, next, "qa", attempt, result, operations)
+  end
+
+  defp qa_block_text(:es, :sha_mismatch),
+    do: {"El SHA del informe QA no coincide con el SHA aceptado.", "Verifica la rama y vuelve a ejecutar QA sobre el SHA aceptado; no hace falta un cambio de Builder."}
+
+  defp qa_block_text(:es, :checks_unavailable),
+    do:
+      {"Symphony no tiene resultados utilizables de todas las comprobaciones requeridas.", "Repara el entorno o la herramienta que impidió la comprobación y vuelve a ejecutar QA sobre el mismo SHA."}
+
+  defp qa_block_text(_locale, :sha_mismatch),
+    do: {"The QA report SHA does not match the accepted SHA.", "Verify the task branch and rerun QA on the accepted SHA; Builder code changes are not required."}
+
+  defp qa_block_text(_locale, :checks_unavailable),
+    do: {"Symphony does not have usable results for every required check.", "Repair the environment or tool that prevented the check and rerun QA on the same SHA."}
 
   defp finish_valid_phase(issue, task, "review", attempt, %{"outcome" => "passed", "sha" => sha} = result) do
     with :ok <- ensure_current_sha(task, sha),
@@ -1227,9 +1274,14 @@ defmodule SymphonyElixir.Pipeline do
   def normalize_phase_result(result, phase), do: normalize_phase_result(result, phase, :en)
 
   @spec normalize_phase_result(term(), String.t(), :en | :es) :: {:ok, map()} | {:error, term()}
-  def normalize_phase_result(result, phase, locale) when is_map(result) do
+  def normalize_phase_result(result, phase, locale), do: normalize_phase_result(result, phase, locale, nil)
+
+  @spec normalize_phase_result(term(), String.t(), :en | :es, String.t() | nil) :: {:ok, map()} | {:error, term()}
+  def normalize_phase_result(result, phase, locale, issue_description) when is_map(result) do
     result = Map.new(result, fn {key, value} -> {to_string(key), value} end)
     result = normalize_remote_result(result, phase)
+
+    result = discard_resolved_findings(result, phase)
 
     result =
       if phase in ["qa", "review"] and result["outcome"] == "passed" and result["findings"] not in [nil, []],
@@ -1241,13 +1293,19 @@ defmodule SymphonyElixir.Pipeline do
           }),
         else: result
 
-    if is_binary(result["outcome"]) and is_binary(result["summary"]) and valid_report?(phase, result),
+    if is_binary(result["outcome"]) and is_binary(result["summary"]) and valid_report?(phase, result, issue_description),
       do: {:ok, result},
       else: {:error, {:invalid_phase_report, invalid_report_details(phase, result)}}
   end
 
-  def normalize_phase_result(_result, phase, _locale),
+  def normalize_phase_result(_result, phase, _locale, _issue_description),
     do: {:error, {:invalid_phase_report, %{phase: phase, report_type: :not_an_object}}}
+
+  defp discard_resolved_findings(%{"findings" => findings} = result, "review") when is_list(findings) do
+    Map.put(result, "findings", Enum.reject(findings, fn finding -> is_map(finding) and Findings.resolved?(finding["id"], result["resolutions"]) end))
+  end
+
+  defp discard_resolved_findings(result, _phase), do: result
 
   defp findings_summary(:es, "qa"), do: "QA encontró hallazgos que requieren corrección."
   defp findings_summary(:es, _phase), do: "La revisión encontró hallazgos que requieren corrección."
@@ -1273,37 +1331,44 @@ defmodule SymphonyElixir.Pipeline do
     %{phase: phase, report_keys: Map.keys(result), finding_keys: finding_keys}
   end
 
-  defp valid_report?("build", %{"outcome" => "ready"} = result) do
+  defp valid_report?("build", %{"outcome" => "ready"} = result, _issue_description) do
     is_binary(result["sha"]) and is_binary(result["next_step"]) and
       Enum.all?(["criteria", "changes", "checks", "risks"], &is_list(result[&1]))
   end
 
-  defp valid_report?("build", %{"outcome" => outcome} = result) when outcome in ["no_changes", "blocked"],
+  defp valid_report?("build", %{"outcome" => outcome} = result, _issue_description) when outcome in ["no_changes", "blocked"],
     do: is_binary(result["reason"])
 
-  defp valid_report?("qa", %{"outcome" => outcome} = result) when outcome in ["passed", "changes_requested", "failed", "defects_found"] do
+  defp valid_report?("qa", %{"outcome" => outcome} = result, issue_description)
+       when outcome in ["passed", "changes_requested", "failed", "defects_found"] do
     is_binary(result["sha"]) and is_list(result["criteria"]) and is_list(result["changes"]) and
-      is_list(result["checks"]) and valid_findings?(result["findings"]) and is_binary(result["next_step"])
+      is_list(result["checks"]) and valid_findings?(result["findings"]) and is_binary(result["next_step"]) and
+      QAReport.valid?(result, [], issue_description)
   end
 
-  defp valid_report?("qa", %{"outcome" => "blocked"} = result), do: is_binary(result["reason"])
+  defp valid_report?("qa", %{"outcome" => "blocked"} = result, issue_description),
+    do:
+      is_binary(result["sha"]) and is_list(result["criteria"]) and is_list(result["changes"]) and
+        is_list(result["checks"]) and valid_findings?(result["findings"]) and is_binary(result["next_step"]) and
+        is_binary(result["reason"]) and QAReport.valid?(result, [], issue_description)
 
-  defp valid_report?("review", %{"outcome" => outcome} = result) when outcome in ["passed", "changes_requested", "failed", "defects_found"] do
+  defp valid_report?("review", %{"outcome" => outcome} = result, _issue_description)
+       when outcome in ["passed", "changes_requested", "failed", "defects_found"] do
     is_binary(result["sha"]) and valid_findings?(result["findings"]) and is_list(result["resolutions"]) and
       is_binary(result["next_step"])
   end
 
-  defp valid_report?("review", %{"outcome" => "blocked"} = result), do: is_binary(result["reason"])
+  defp valid_report?("review", %{"outcome" => "blocked"} = result, _issue_description), do: is_binary(result["reason"])
 
-  defp valid_report?(phase, %{"outcome" => "merged"} = result) when phase in ["review", "finalize"],
+  defp valid_report?(phase, %{"outcome" => "merged"} = result, _issue_description) when phase in ["review", "finalize"],
     do: is_binary(result["sha"]) and is_binary(result["summary"])
 
-  defp valid_report?("finalize", %{"outcome" => "blocked"} = result), do: is_binary(result["reason"])
-  defp valid_report?(_phase, _result), do: false
+  defp valid_report?("finalize", %{"outcome" => "blocked"} = result, _issue_description), do: is_binary(result["reason"])
+  defp valid_report?(_phase, _result, _issue_description), do: false
 
   defp normalize_remote_result(result, "qa") do
-    checks = result["_host_checks"] || result["checks"] || []
-    result = Map.put(result, "checks", checks)
+    host_checks = result["_host_checks"] || result["host_checks"] || []
+    result = Map.put(result, "host_checks", host_checks)
 
     case remote_handoff(result) do
       %{"outcome" => "blocked", "reason" => reason} = handoff when is_binary(reason) ->
@@ -1453,20 +1518,31 @@ defmodule SymphonyElixir.Pipeline do
   defp valid_findings?(_findings), do: false
 
   defp validate_required_checks(required, checks) when is_list(required) and is_list(checks) do
-    passed =
-      Enum.reduce(checks, MapSet.new(), fn
-        %{"name" => name, "status" => "passed", "evidence" => evidence}, acc
-        when is_binary(name) and is_binary(evidence) ->
-          if String.trim(evidence) == "", do: acc, else: MapSet.put(acc, name)
+    statuses = Enum.map(required, &required_check_status(&1, checks))
 
-        _, acc ->
-          acc
-      end)
-
-    if Enum.all?(required, &MapSet.member?(passed, &1)), do: :ok, else: {:error, :required_checks_missing_or_unavailable}
+    cond do
+      Enum.all?(statuses, &(&1 == :passed)) -> :ok
+      Enum.any?(statuses, &(&1 == :unavailable)) -> {:error, :required_checks_unavailable}
+      true -> {:error, :required_checks_failed}
+    end
   end
 
   defp validate_required_checks(_required, _checks), do: {:error, :required_checks_missing_or_unavailable}
+
+  defp required_check_status(command, checks) do
+    case Enum.find(checks, &(&1["name"] == command and &1["source"] == "host")) do
+      %{"status" => "passed", "evidence" => evidence} when is_binary(evidence) and evidence != "" ->
+        if(String.trim(evidence) == "", do: :unavailable, else: :passed)
+
+      %{"status" => "failed"} ->
+        :failed
+
+      _ ->
+        :unavailable
+    end
+  end
+
+  defp non_empty?(value), do: is_binary(value) and String.trim(value) != ""
 
   defp ensure_current_sha(%{"current_sha" => sha}, sha) when is_binary(sha), do: :ok
   defp ensure_current_sha(_task, _sha), do: {:error, :phase_sha_mismatch}

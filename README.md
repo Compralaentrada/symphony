@@ -11,8 +11,9 @@ correspondiente y ejecuta las fases necesarias con Codex.
   bloquea solo las tareas de ese repositorio y deja un diagnóstico.
 - Aísla cada ejecución de Projects con el proyecto, el elemento, el repositorio y el número de issue;
   cada workspace y búsqueda de PR queda vinculado al repositorio correcto.
-- Ejecuta Build, QA y Review en sesiones separadas y comprueba los comandos `required_checks` del
-  repositorio durante QA.
+- Ejecuta Build, QA y Review en sesiones separadas. QA vincula cada criterio con una prueba o
+  procedimiento y evidencia reproducible, y comprueba los comandos `required_checks` del
+  repositorio.
 - Resuelve las skills del catálogo de Symphony por fase y añade las condicionales solo cuando
   aplican a la tarea.
 - Publica informes Markdown en español para issues en español y en inglés para el resto.

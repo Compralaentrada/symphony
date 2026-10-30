@@ -584,6 +584,13 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     end
   end
 
+  test "QA normalization rejects reports that omit issue acceptance criteria" do
+    description = "## Acceptance Criteria\n- First criterion.\n- Second criterion."
+
+    assert {:error, {:invalid_phase_report, %{phase: "qa"}}} =
+             Pipeline.normalize_phase_result(qa(String.duplicate("a", 40)), "qa", :en, description)
+  end
+
   test "Build finish recovers the validated PR body from successful remote handoff evidence" do
     issue = issue("octo/app#56", 56)
     table = start_board([issue], %{})
@@ -997,6 +1004,10 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     spanish_issue = %{issue("octo/app#40", 40) | description: "Implementar soporte para nuevas salas"}
     finding = %{"id" => "QA-40", "reproduction" => "Ejecuta la ruta afectada.", "criterion" => "Se cumple el criterio."}
 
+    report =
+      qa(String.duplicate("a", 40))
+      |> Map.merge(%{"summary" => "QA pasó.", "findings" => [finding], "next_step" => "Continúa con Review."})
+
     assert {:ok,
             %{
               "outcome" => "changes_requested",
@@ -1004,16 +1015,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
               "next_step" => "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
             }} =
              Pipeline.normalize_phase_result(
-               %{
-                 "outcome" => "passed",
-                 "summary" => "QA pasó.",
-                 "sha" => String.duplicate("a", 40),
-                 "criteria" => [],
-                 "changes" => [],
-                 "checks" => [],
-                 "findings" => [finding],
-                 "next_step" => "Continúa con Review."
-               },
+               report,
                "qa",
                Pipeline.report_locale(spanish_issue)
              )
@@ -1154,7 +1156,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
       start_board([issue], %{
         issue.id => %{
           build: [build("sha-forty-three-old", issue.id), build("sha-forty-three-new", issue.id)],
-          qa: [blocked(), qa("sha-forty-three-new")],
+          qa: [qa_blocked("sha-forty-three-old"), qa("sha-forty-three-new")],
           review: [review("sha-forty-three-new")]
         }
       })
@@ -1255,9 +1257,9 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert await(fn -> project_state(table, missing_check.id) == "Human Review" end)
     assert agent_calls(table, missing_check.id) == 5
     assert report_phases(table, missing_check.id) == [:build, :qa, :build, :qa, :review]
-    qa_report = lookup(table, {:report, missing_check.id, "qa"})
-    assert qa_report =~ "host exit status 0"
-    refute qa_report =~ "agent claimed success"
+    latest_qa_report = lookup(table, {:report, missing_check.id, "qa"}) |> Jason.decode!()
+    assert [%{"id" => "qa-unit-test"}] = latest_qa_report["checks"]
+    assert Enum.any?(latest_qa_report["host_checks"], &(&1["source"] == "host" and &1["status"] == "passed" and &1["evidence"] =~ "host exit status 0"))
 
     assert await(fn -> project_state(table, unavailable_check.id) == "Blocked" end)
     assert agent_calls(table, unavailable_check.id) == 2
@@ -1756,17 +1758,93 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     %{
       "outcome" => "passed",
       "summary" => "All required checks passed.",
-      "criteria" => ["Acceptance criterion verified."],
+      "criteria" => [
+        %{
+          "criterion" => "Acceptance criterion verified.",
+          "status" => "passed",
+          "procedure" => "Run the focused unit test and compare its result with the expected behavior.",
+          "evidence" => ["qa-unit-test"]
+        }
+      ],
       "changes" => [],
-      "checks" => [%{"name" => "true", "status" => "passed", "evidence" => "agent report"}],
+      "checks" => [
+        %{
+          "id" => "qa-unit-test",
+          "layer" => "unit",
+          "command" => "mix test test/symphony_elixir/qa_report_test.exs",
+          "status" => "passed",
+          "result" => "1 test, 0 failures.",
+          "evidence" => "test-output: qa-unit-test",
+          "required" => true,
+          "reason" => nil
+        }
+      ],
+      "gaps" => [],
       "findings" => [],
       "next_step" => "Run autonomous review.",
+      "reason" => nil,
       "sha" => sha
     }
   end
 
   defp qa_missing_check(sha) do
-    %{qa(sha) | "checks" => [%{"name" => "sh ./check.sh", "status" => "passed", "evidence" => "agent claimed success"}]}
+    report = qa(sha)
+
+    report
+    |> Map.put("checks", [
+      %{
+        "id" => "agent-claimed-check",
+        "layer" => "unit",
+        "command" => "sh ./check.sh",
+        "status" => "passed",
+        "result" => "The command exited successfully.",
+        "evidence" => "agent claimed success",
+        "required" => true,
+        "reason" => nil
+      }
+    ])
+    |> put_in(["criteria", Access.at(0), "evidence"], ["agent-claimed-check"])
+  end
+
+  defp qa_blocked(sha) do
+    %{
+      "outcome" => "blocked",
+      "summary" => "QA cannot access the required test environment.",
+      "sha" => sha,
+      "criteria" => [
+        %{
+          "criterion" => "Acceptance criterion verified.",
+          "status" => "unavailable",
+          "procedure" => "Run the focused unit test in the required environment.",
+          "evidence" => ["qa-environment"]
+        }
+      ],
+      "changes" => [],
+      "checks" => [
+        %{
+          "id" => "qa-environment",
+          "layer" => "manual",
+          "command" => nil,
+          "status" => "unavailable",
+          "result" => "The test environment could not be reached.",
+          "evidence" => "test-environment access error",
+          "required" => true,
+          "reason" => "The test environment is inaccessible."
+        }
+      ],
+      "host_checks" => [],
+      "gaps" => [
+        %{
+          "scenario" => "The test environment is inaccessible.",
+          "impact" => "The acceptance criterion cannot be verified.",
+          "missing_coverage" => "A passing run of the focused unit test.",
+          "priority" => "high"
+        }
+      ],
+      "findings" => [],
+      "reason" => "QA cannot access the required test environment.",
+      "next_step" => "Restore test environment access and rerun QA on the same SHA."
+    }
   end
 
   defp review(sha) do
@@ -2040,8 +2118,20 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
     report =
       report
       |> Map.put("sha", task["current_sha"])
-      |> Map.put("checks", host_checks)
+      |> Map.put("host_checks", host_checks)
       |> Map.update("findings", check_findings, &(&1 ++ check_findings))
+
+    report =
+      if Enum.any?(host_checks, &(&1["status"] == "unavailable")) do
+        Map.merge(report, %{
+          "outcome" => "blocked",
+          "summary" => "Symphony could not execute every configured required check.",
+          "reason" => "The configured check is unavailable in the task host.",
+          "next_step" => "Repair the task environment and rerun QA on the same SHA."
+        })
+      else
+        report
+      end
 
     with {:ok, claim} <- workflow(issue, :qa, opts, host_checks, %{"operation" => "claim"}) do
       {:ok, report, host_checks, [claim]}
@@ -2074,24 +2164,37 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
            Keyword.get(opts, :worker_host)
          ) do
       {:ok, evidence} ->
-        %{"name" => command, "status" => "passed", "evidence" => evidence}
+        %{"name" => command, "status" => "passed", "evidence" => evidence, "source" => "host"}
 
       {:error, {:check_failed, status}} ->
-        %{"name" => command, "status" => "failed", "evidence" => "Symphony ran the configured check at SHA #{task["current_sha"]}; host exit status #{status}."}
+        %{"name" => command, "status" => "failed", "evidence" => "Symphony ran the configured check at SHA #{task["current_sha"]}; host exit status #{status}.", "source" => "host"}
 
       {:error, {:workspace_sha_mismatch, expected_sha, observed_sha}} ->
-        %{"name" => command, "status" => "failed", "finding_id" => "workspace-sha-mismatch", "evidence" => "Workspace HEAD was #{observed_sha || "unavailable"}, not accepted SHA #{expected_sha}."}
+        %{
+          "name" => command,
+          "status" => "failed",
+          "finding_id" => "workspace-sha-mismatch",
+          "evidence" => "Workspace HEAD was #{observed_sha || "unavailable"}, not accepted SHA #{expected_sha}.",
+          "source" => "host"
+        }
 
       {:error, {:workspace_dirty, expected_sha, observed_sha}} ->
         %{
           "name" => command,
           "status" => "failed",
           "finding_id" => "workspace-dirty",
-          "evidence" => "Workspace had local changes at SHA #{observed_sha || "unavailable"}; accepted SHA was #{expected_sha}."
+          "evidence" => "Workspace had local changes at SHA #{observed_sha || "unavailable"}; accepted SHA was #{expected_sha}.",
+          "source" => "host"
         }
 
       {:error, :check_unavailable} ->
-        %{"name" => command, "status" => "unavailable", "evidence" => "Symphony could not execute the required check."}
+        %{
+          "name" => command,
+          "status" => "unavailable",
+          "evidence" => "Symphony could not execute the required check.",
+          "reason" => "The configured command is unavailable in the task host.",
+          "source" => "host"
+        }
     end
   end
 
@@ -2119,6 +2222,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
                  "outcome" => workflow_report["outcome"],
                  "report" => workflow_report
                }) do
+          workflow_report = Map.put(workflow_report, "outcome", handoff["outcome"] || workflow_report["outcome"])
           evidence = Enum.reject(prior_evidence ++ [workpad_evidence, handoff], &is_nil/1)
           Map.merge(workflow_report, %{"_host_checks" => host_checks, "_remote_evidence" => evidence})
         end
@@ -2376,20 +2480,35 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
   end
 
   defp normalize_agent_report(report, %{lane: :qa, task: task, host_checks: checks, issue: issue}) do
-    report = Map.put(report, "checks", checks)
+    checks = Enum.map(checks, &Map.put(&1, "source", "host"))
+    report = Map.put(report, "host_checks", checks)
     required = task["required_checks"] || []
+    statuses = Enum.map(required, &required_check_status(&1, checks))
 
-    report =
-      if required_checks_passed?(required, checks) do
-        report
-      else
-        outcome = if Enum.any?(checks, &(&1["status"] == "unavailable")), do: "blocked", else: "changes_requested"
-        Map.put(report, "outcome", outcome)
+    normalized =
+      cond do
+        Enum.all?(statuses, &(&1 == :passed)) ->
+          report
+
+        Enum.any?(statuses, &(&1 == :unavailable)) ->
+          Map.merge(report, %{
+            "outcome" => "blocked",
+            "summary" => "Symphony could not execute every configured required check.",
+            "reason" => "The configured check is unavailable in the task host.",
+            "next_step" => "Repair the task environment and rerun QA on the same SHA."
+          })
+
+        true ->
+          Map.merge(report, %{
+            "outcome" => "changes_requested",
+            "summary" => "One or more required host checks failed or were missing.",
+            "next_step" => "Fix the failed check and submit a new Build delivery."
+          })
       end
 
-    if "qa" in issue.labels and report["outcome"] in ["changes_requested", "failed", "defects_found"],
-      do: report |> Map.put("outcome", "blocked") |> Map.put("reason", "QA requires correction."),
-      else: report
+    if "qa" in issue.labels and normalized["outcome"] in ["changes_requested", "failed", "defects_found"],
+      do: normalized |> Map.put("outcome", "blocked") |> Map.put("reason", "QA requires correction."),
+      else: normalized
   end
 
   defp normalize_agent_report(report, %{lane: :review, task: task}) do
@@ -2403,9 +2522,12 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
 
   defp normalize_agent_report(report, _context), do: report
 
-  defp required_checks_passed?(required, checks) do
-    passed = MapSet.new(checks, &if(&1["status"] == "passed" and is_binary(&1["evidence"]), do: &1["name"]))
-    Enum.all?(required, &MapSet.member?(passed, &1))
+  defp required_check_status(command, checks) do
+    case Enum.find(checks, &(&1["name"] == command and &1["source"] == "host")) do
+      %{"status" => "passed", "evidence" => evidence} when is_binary(evidence) and evidence != "" -> :passed
+      %{"status" => "failed"} -> :failed
+      _ -> :unavailable
+    end
   end
 
   defp handoff_pull_request(issue, context, %{"outcome" => "ready", "sha" => sha} = report)
@@ -2679,7 +2801,9 @@ defmodule SymphonyElixir.PipelineIntegrationTest.DiagnosticAgent do
       "findings" => [],
       "criteria" => [],
       "changes" => [],
-      "checks" => []
+      "checks" => [],
+      "host_checks" => [],
+      "gaps" => []
     }
 
     with {:ok, workpad} <- workflow(issue, opts, %{"operation" => "workpad", "body" => "### Diagnosis\nThe PR head changed."}),

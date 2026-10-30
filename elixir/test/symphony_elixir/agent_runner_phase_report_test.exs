@@ -271,7 +271,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
     end
   end
 
-  test "QA phase corrects schema-invalid findings before returning a report" do
+  test "QA phase corrects schema-invalid coverage before returning a report" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -287,20 +287,48 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       report = %{
         "outcome" => "passed",
         "summary" => "QA passed",
-        "criteria" => ["The implementation meets the acceptance criterion."],
+        "criteria" => [
+          %{
+            "criterion" => "The implementation meets the acceptance criterion.",
+            "status" => "passed",
+            "procedure" => "Run the focused unit test and compare the result with the expected value.",
+            "evidence" => ["qa-evidence"]
+          }
+        ],
         "changes" => [],
-        "checks" => [],
+        "checks" => [
+          %{
+            "id" => "qa-evidence",
+            "layer" => "unit",
+            "command" => "mix test test/symphony_elixir/example_test.exs",
+            "status" => "passed",
+            "result" => "1 test, 0 failures.",
+            "evidence" => "test-output: qa-evidence",
+            "required" => true,
+            "reason" => nil
+          }
+        ],
+        "gaps" => [],
         "findings" => [],
         "next_step" => "Continue to Review.",
+        "reason" => nil,
         "sha" => String.duplicate("a", 40)
       }
 
       invalid_report = %{
         "outcome" => "changes_requested",
         "summary" => "QA found a defect",
-        "criteria" => ["The implementation meets the acceptance criterion."],
+        "criteria" => [
+          %{
+            "criterion" => "The implementation meets the acceptance criterion.",
+            "status" => "passed",
+            "procedure" => "Run the focused unit test and compare the result with the expected value.",
+            "evidence" => ["missing-evidence"]
+          }
+        ],
         "changes" => [],
         "checks" => [],
+        "gaps" => [],
         "findings" => [
           %{
             "id" => "QA-1",
@@ -311,6 +339,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
           }
         ],
         "next_step" => "Fix QA-1 and submit a new Build delivery.",
+        "reason" => nil,
         "sha" => report["sha"]
       }
 
@@ -407,7 +436,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       }
 
       host_checks = [
-        %{"name" => "echo required-check-secret", "status" => "passed", "evidence" => "host-evidence-secret"}
+        %{"name" => "echo required-check-secret", "status" => "passed", "evidence" => "host-evidence-secret", "source" => "host"}
       ]
 
       result =
@@ -420,7 +449,8 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         )
 
       assert %{"outcome" => "passed", "findings" => []} = result
-      assert result["checks"] == host_checks
+      assert result["checks"] == report["checks"]
+      assert result["host_checks"] == host_checks
 
       turn_starts =
         trace_file
@@ -451,6 +481,9 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert Enum.at(prompts, 1) =~ "The previous response did not match the pipeline's required phase report."
       assert Enum.all?(turn_starts, &is_map(get_in(&1, ["params", "outputSchema"])))
       assert get_in(hd(turn_starts), ["params", "outputSchema", "properties", "findings", "items", "required"]) == ["id", "reproduction", "criterion"]
+      assert get_in(hd(turn_starts), ["params", "outputSchema", "properties", "criteria", "items", "required"]) == ["criterion", "status", "procedure", "evidence"]
+      assert get_in(hd(turn_starts), ["params", "outputSchema", "properties", "checks", "items", "properties", "layer", "enum"]) == ["unit", "component", "e2e", "manual"]
+      assert get_in(hd(turn_starts), ["params", "outputSchema", "properties", "checks", "items", "properties", "status", "enum"]) == ["passed", "failed", "unstable", "skipped", "unavailable"]
     after
       File.rm_rf(test_root)
     end
