@@ -232,7 +232,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
                       <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
                     </div>
-                    <span class={state_badge_class(entry.state)}>
+                    <span class={state_badge_class(entry.state, true)}>
                       <%= entry.state %>
                     </span>
                   </header>
@@ -486,12 +486,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp format_int(_value), do: "n/a"
 
-  defp state_badge_class(state) do
+  defp state_badge_class(state, operations \\ false) do
     base = "state-badge"
     normalized = state |> to_string() |> String.downcase()
 
     cond do
-      String.contains?(normalized, ["progress", "running", "active", "building"]) -> "#{base} state-badge-active"
+      String.contains?(normalized, ["progress", "running", "active"]) or (operations and String.contains?(normalized, "building")) -> "#{base} state-badge-active"
       String.contains?(normalized, ["blocked", "error", "failed"]) -> "#{base} state-badge-danger"
       String.contains?(normalized, ["todo", "queued", "pending", "retry"]) -> "#{base} state-badge-warning"
       true -> base

@@ -806,6 +806,25 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ ~s(href="https://example.org/octo/app/issues/7")
   end
 
+  test "delivery keeps its original Building status styling" do
+    task = %{"issue_id" => "octo/app#7", "generation" => 1, "phase" => "build", "status" => "building"}
+
+    issue = %SymphonyElixir.Tracker.Issue{
+      id: "octo/app#7",
+      identifier: "octo/app#7",
+      title: "Current title",
+      url: "https://example.org/octo/app/issues/7",
+      state: "Building"
+    }
+
+    setup_delivery_pipeline([task], {:ok, [issue]})
+    start_test_endpoint(snapshot_timeout_ms: 50)
+
+    {:ok, view, _html} = live(build_conn(), "/delivery")
+    assert has_element?(view, ".state-badge:not(.state-badge-active)", "Building")
+    refute has_element?(view, ".state-badge-active", "Building")
+  end
+
   test "delivery dashboard distinguishes empty, missing, and unavailable tracker states" do
     task = %{"issue_id" => "octo/app#7", "generation" => 1, "phase" => "qa", "status" => "qa"}
     setup_delivery_pipeline([], {:ok, []})
