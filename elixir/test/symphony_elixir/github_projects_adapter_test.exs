@@ -718,6 +718,19 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
              )
   end
 
+  test "Review hands off only unresolved findings when its report repeats resolved findings" do
+    resolved = %{"id" => "QA-1", "reproduction" => "Old failure", "criterion" => "Works"}
+    pending = %{"id" => "QA-2", "reproduction" => "Still fails", "criterion" => "Works"}
+    context = %{task: %{"prior_findings" => [resolved, pending]}}
+    report = %{"outcome" => "passed", "findings" => [resolved], "resolutions" => ["QA-1: Resuelto; comprobado en QA."]}
+
+    assert %{"outcome" => "changes_requested", "findings" => [^pending]} =
+             Client.normalize_agent_report_for_test(report, "review", context)
+
+    assert %{"outcome" => "passed", "findings" => []} =
+             Client.normalize_agent_report_for_test(report, "review", %{task: %{"prior_findings" => [resolved]}})
+  end
+
   test "automatic Review does not overwrite a human move to Human Review" do
     previous = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
     root = Path.join(System.tmp_dir!(), "symphony-human-review-#{System.unique_integer([:positive])}")

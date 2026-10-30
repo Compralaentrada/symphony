@@ -1108,8 +1108,11 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     resolutions = report["resolutions"] || []
     task = context[:task] || %{}
     prior_findings = task["prior_findings"] || []
-    pending_findings = Enum.reject(prior_findings, &Findings.resolved?(&1["id"], resolutions))
-    findings = Enum.uniq_by((report["findings"] || []) ++ pending_findings, & &1["id"])
+
+    findings =
+      ((report["findings"] || []) ++ prior_findings)
+      |> Enum.uniq_by(& &1["id"])
+      |> Enum.reject(&Findings.resolved?(&1["id"], resolutions))
 
     metadata =
       task

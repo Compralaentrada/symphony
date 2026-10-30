@@ -832,7 +832,7 @@ defmodule SymphonyElixir.AgentRunner do
     Do not invoke the repository's `code-review` skill or its Markdown report format; perform this review directly under the pipeline's JSON contract.
     The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
     Do not modify files. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
-    Update the persistent workpad with review findings and resolutions using `github_workflow` operation `workpad`.
+    Update the persistent workpad with review findings and resolutions using `github_workflow` operation `workpad`. In the report, include only unresolved findings in `findings`; list each resolved finding's exact ID as a separate string in `resolutions`. Keep the Markdown and JSON conclusions consistent.
     The configured merge policy is #{merge_policy}. With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`, then call `request_merge`; if the host confirms the merge, hand off outcome `merged` so the host verifies it before closing the issue and moving the item to Done. If the gate reports `pull_request_base_not_in_head` or `pull_request_base_sha_mismatch`, finish with the existing `passed` report; the host requeues the task for Build. For other gate failures, leave the PR in Human Review.
     Finish with exactly one JSON object containing outcome (passed, merged, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
     """

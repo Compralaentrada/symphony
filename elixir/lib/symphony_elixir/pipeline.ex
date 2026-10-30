@@ -1193,6 +1193,13 @@ defmodule SymphonyElixir.Pipeline do
     result = normalize_remote_result(result, phase)
 
     result =
+      if phase == "review" and is_list(result["findings"]) do
+        Map.update!(result, "findings", &Enum.reject(&1, fn finding -> is_map(finding) and Findings.resolved?(finding["id"], result["resolutions"]) end))
+      else
+        result
+      end
+
+    result =
       if phase in ["qa", "review"] and result["outcome"] == "passed" and result["findings"] not in [nil, []],
         do:
           Map.merge(result, %{
