@@ -41,6 +41,9 @@ defmodule SymphonyElixir.GitHub.Projects.Adapter do
   @spec pull_request(Issue.t()) :: {:ok, map() | nil} | {:error, term()}
   def pull_request(issue), do: client_module().pull_request(issue)
 
+  @spec phase_reports(Issue.t()) :: {:ok, [map()]} | {:error, term()}
+  def phase_reports(issue), do: client_module().phase_reports(issue)
+
   @spec publish_phase_report(Issue.t(), String.t(), String.t(), String.t()) :: :ok | {:error, term()}
   def publish_phase_report(issue, marker, body, phase), do: client_module().publish_phase_report(issue, marker, body, phase)
 

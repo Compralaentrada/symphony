@@ -112,6 +112,18 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert MapSet.member?(updated_state.claimed, issue.id)
   end
 
+  test "a Projects item moved from Blocked to QA is released for dispatch" do
+    write_projects_workflow!()
+    issue = %{lifecycle_issue("repo/app#7") | state: "QA", requeueable: false}
+    blocked_issue = %{issue | state: "Blocked", tracker_blocked: true}
+    state = %Orchestrator.State{blocked: %{issue.id => %{issue: blocked_issue, error: "blocked"}}, claimed: MapSet.new([issue.id]), retry_attempts: %{}}
+
+    updated_state = Orchestrator.reconcile_blocked_issue_states_for_test([issue], state)
+
+    refute Map.has_key?(updated_state.blocked, issue.id)
+    refute MapSet.member?(updated_state.claimed, issue.id)
+  end
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
