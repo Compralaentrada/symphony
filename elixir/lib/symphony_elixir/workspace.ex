@@ -374,6 +374,12 @@ defmodule SymphonyElixir.Workspace do
       :ok ->
         :ok
 
+      {:error, {:workspace_hook_failed, "required_check", 126, output}} when is_binary(output) ->
+        # shortcut: localized permission errors may be missed, use structured launch errors when available.
+        if Regex.match?(~r/(?:^|\n)(?:\S*\/)?(?:sh|bash|dash): (?:\d+: )?[^\n]+: Permission denied(?:\n|$)/, output),
+          do: {:error, :check_unavailable},
+          else: {:error, {:check_failed, 126}}
+
       {:error, {:workspace_hook_failed, "required_check", 127, _output}} ->
         {:error, :check_unavailable}
 

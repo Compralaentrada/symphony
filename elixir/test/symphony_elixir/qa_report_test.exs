@@ -63,6 +63,22 @@ defmodule SymphonyElixir.QAReportTest do
              QAReport.criteria_from_description("## Acceptance Criteria\nThe result is clearly reported.")
   end
 
+  test "Spanish acceptance headings require each criterion to be covered" do
+    description = "## Aceptación\n- The search returns matching results.\n- The search respects the configured limit."
+
+    assert ["The search returns matching results.", "The search respects the configured limit."] =
+             QAReport.criteria_from_description(description)
+
+    refute QAReport.valid?(report(), [], description)
+  end
+
+  test "wrapped list items remain one acceptance criterion" do
+    description = "## Acceptance Criteria\n- The search returns\n  matching results.\n- The search respects the limit."
+
+    assert ["The search returns matching results.", "The search respects the limit."] =
+             QAReport.criteria_from_description(description)
+  end
+
   test "separate prose paragraphs require separate coverage" do
     description = "## Acceptance Criteria\nFirst paragraph criterion.\n\nSecond paragraph criterion."
     first_criterion = hd(report()["criteria"])

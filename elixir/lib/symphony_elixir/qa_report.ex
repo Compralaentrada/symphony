@@ -39,9 +39,21 @@ defmodule SymphonyElixir.QAReport do
 
   defp criteria_from_lines(lines) do
     lines
+    |> Enum.reduce([], &append_criterion_line/2)
+    |> Enum.reverse()
     |> Enum.chunk_by(&(parse_criterion(&1) != []))
     |> Enum.flat_map(&criteria_from_chunk/1)
   end
+
+  defp append_criterion_line(line, [previous | rest] = acc) do
+    if Regex.match?(~r/^[ \t]+\S/u, line) and parse_criterion(line) == [] and parse_criterion(previous) != [] do
+      [previous <> " " <> String.trim(line) | rest]
+    else
+      [line | acc]
+    end
+  end
+
+  defp append_criterion_line(line, []), do: [line]
 
   defp criteria_from_chunk(chunk) do
     case Enum.flat_map(chunk, &parse_criterion/1) do
@@ -76,7 +88,7 @@ defmodule SymphonyElixir.QAReport do
       |> String.downcase()
       |> String.replace("ó", "o")
 
-    heading in ["acceptance criteria", "criterios de aceptacion"]
+    heading in ["acceptance criteria", "criterios de aceptacion", "aceptacion"]
   end
 
   defp markdown_heading?(line), do: String.starts_with?(String.trim(line), "#")
