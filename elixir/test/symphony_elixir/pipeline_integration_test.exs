@@ -134,7 +134,9 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert Map.has_key?(state.running, issue.id)
     assert MapSet.equal?(state.claimed, MapSet.new([issue.id]))
     assert lookup(table, {:agent_calls, issue.id, :build}) == 1
-    assert {:ok, %{"generation" => 1, "attempts" => %{"build" => 1}}} = Store.get_task(issue.id)
+    assert {:ok, %{"generation" => 1, "attempts" => %{"build" => attempt}}} = Store.get_task(issue.id)
+    assert state.running[issue.id].pipeline_attempt == attempt
+    assert Store.agent_lease_active?(issue.id, 1, "build", attempt)
 
     send(held_agent, :release)
     assert await(fn -> not Process.alive?(held_agent) end)
