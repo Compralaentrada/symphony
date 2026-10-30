@@ -810,6 +810,19 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
              Client.normalize_agent_report_for_test(report, "review", %{task: %{"prior_findings" => [resolved]}})
   end
 
+  test "a normalized report visibly identifies the authoritative outcome and pending findings" do
+    submitted = %{"outcome" => "passed", "findings" => []}
+    finding = %{"id" => "QA-2", "reproduction" => "Still fails", "criterion" => "Works"}
+    normalized = %{"outcome" => "changes_requested", "findings" => [finding]}
+    body = "Review passed.\n\n<!-- symphony:report:json\n#{Jason.encode!(submitted)}\n-->"
+
+    assert {:ok, published} = AgentReport.normalize_body(body, normalized, submitted)
+    visible = published |> String.split("<!-- symphony:report:json") |> hd()
+    assert visible =~ "changes_requested"
+    assert visible =~ "QA-2"
+    assert {:ok, ^normalized} = AgentReport.decode_comment(published)
+  end
+
   test "automatic Review does not overwrite a human move to Human Review" do
     previous = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
     root = Path.join(System.tmp_dir!(), "symphony-human-review-#{System.unique_integer([:positive])}")

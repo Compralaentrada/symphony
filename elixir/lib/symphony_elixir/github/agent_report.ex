@@ -46,7 +46,19 @@ defmodule SymphonyElixir.GitHub.AgentReport do
     if visible_report_json?(body, report) or visible_report_json?(body, submitted_report) do
       {:error, :visible_github_agent_report_json}
     else
-      normalize_report_json(body, report)
+      with {:ok, body} <- normalize_report_json(body, report) do
+        {:ok, clarify_normalized_result(body, report, submitted_report)}
+      end
+    end
+  end
+
+  defp clarify_normalized_result(body, report, submitted_report) do
+    if Map.take(report, ["outcome", "findings"]) != Map.take(submitted_report, ["outcome", "findings"]) do
+      ids = for %{"id" => id} <- report["findings"] || [], is_binary(id), do: id
+      notice = "**Symphony corrected this report. Authoritative outcome:** #{report["outcome"]}; **pending findings:** #{Jason.encode!(ids)}. The text below may describe the submitted result."
+      notice <> "\n\n" <> body
+    else
+      body
     end
   end
 

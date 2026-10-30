@@ -1231,12 +1231,7 @@ defmodule SymphonyElixir.Pipeline do
     result = Map.new(result, fn {key, value} -> {to_string(key), value} end)
     result = normalize_remote_result(result, phase)
 
-    result =
-      if phase == "review" and is_list(result["findings"]) do
-        Map.update!(result, "findings", &Enum.reject(&1, fn finding -> is_map(finding) and Findings.resolved?(finding["id"], result["resolutions"]) end))
-      else
-        result
-      end
+    result = discard_resolved_findings(result, phase)
 
     result =
       if phase in ["qa", "review"] and result["outcome"] == "passed" and result["findings"] not in [nil, []],
@@ -1255,6 +1250,12 @@ defmodule SymphonyElixir.Pipeline do
 
   def normalize_phase_result(_result, phase, _locale),
     do: {:error, {:invalid_phase_report, %{phase: phase, report_type: :not_an_object}}}
+
+  defp discard_resolved_findings(%{"findings" => findings} = result, "review") when is_list(findings) do
+    Map.put(result, "findings", Enum.reject(findings, fn finding -> is_map(finding) and Findings.resolved?(finding["id"], result["resolutions"]) end))
+  end
+
+  defp discard_resolved_findings(result, _phase), do: result
 
   defp findings_summary(:es, "qa"), do: "QA encontró hallazgos que requieren corrección."
   defp findings_summary(:es, _phase), do: "La revisión encontró hallazgos que requieren corrección."
