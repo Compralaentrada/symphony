@@ -5,6 +5,26 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.Client
 
+  test "a required check without execute permission is unavailable" do
+    workspace = Path.join(System.tmp_dir!(), "symphony-unavailable-check-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf(workspace) end)
+    git!(workspace, ["init", "-b", "main"])
+    git!(workspace, ["config", "user.name", "Test User"])
+    git!(workspace, ["config", "user.email", "test@example.com"])
+    File.write!(Path.join(workspace, "check.sh"), "#!/bin/sh\nexit 0\n")
+    File.chmod!(Path.join(workspace, "check.sh"), 0o644)
+    git!(workspace, ["add", "check.sh"])
+    git!(workspace, ["commit", "-m", "add check"])
+    sha = git!(workspace, ["rev-parse", "HEAD"])
+
+    assert {:error, :check_unavailable} = Workspace.run_required_check(workspace, "./check.sh", sha, nil, nil)
+    assert {:error, {:check_failed, 126}} = Workspace.run_required_check(workspace, "sh -c 'exit 126'", sha, nil, nil)
+
+    assert {:error, {:check_failed, 126}} =
+             Workspace.run_required_check(workspace, "echo Permission denied; exit 126", sha, nil, nil)
+  end
+
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
       Path.join(
