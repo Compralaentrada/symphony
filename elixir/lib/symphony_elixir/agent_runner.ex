@@ -719,6 +719,15 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp diagnostic_phase_instructions(phase, opts) do
+    dependency_finding =
+      case Keyword.get(opts, :diagnostic_reason) do
+        reason when is_binary(reason) ->
+          "Symphony could not verify this issue's blocker relationships: #{reason}"
+
+        _ ->
+          ""
+      end
+
     host_finding =
       case Keyword.get(opts, :system_blocker_report) do
         %{"summary" => summary} when is_binary(summary) ->
@@ -731,6 +740,7 @@ defmodule SymphonyElixir.AgentRunner do
     """
     Pipeline lane: Diagnostic for #{phase}.
     Read the issue workpad and current-generation phase reports with `github_workflow` operation `read_workpad`. Independently inspect the task workspace and the repository's current pull request using read-only commands and GitHub reads. Diagnose why the normal phase cannot safely continue, using only saved task records and observed facts.
+    #{dependency_finding}
     #{host_finding}
     Record the diagnosis and recovery step in the persistent workpad with `github_workflow` operation `workpad`, then use `github_workflow` operation `handoff`, outcome `blocked`, with the complete report matching the #{phase} JSON schema. The host verifies and checkpoints your report.
     Do not edit files, push, merge, or change the pull request. Do not guess at missing evidence.
@@ -738,7 +748,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp run_phase_turn(session, prompt, issue, on_message, message_key, phase, report_locale, opts) do
-    output_schema = phase_report_schema(phase)
+    output_schema = phase_report_schema(phase, Keyword.get(opts, :diagnostic, false))
 
     app_server_opts =
       [on_message: on_message, output_schema: output_schema]
@@ -1065,6 +1075,16 @@ defmodule SymphonyElixir.AgentRunner do
     report_schema(Map.merge(properties, phase_properties))
   end
 
+  defp phase_report_schema(:diagnostic) do
+    report_schema(%{
+      "outcome" => %{"type" => "string", "enum" => ["blocked"]},
+      "summary" => %{"type" => "string"},
+      "reason" => %{"type" => "string"},
+      "sha" => %{"type" => ["string", "null"]},
+      "next_step" => %{"type" => "string"}
+    })
+  end
+
   defp report_schema(properties) do
     %{
       "type" => "object",
@@ -1073,6 +1093,13 @@ defmodule SymphonyElixir.AgentRunner do
       "additionalProperties" => false
     }
   end
+
+  @doc false
+  @spec phase_report_schema_for_test(atom(), boolean()) :: map()
+  def phase_report_schema_for_test(phase, diagnostic?), do: phase_report_schema(phase, diagnostic?)
+
+  defp phase_report_schema(:finalize, true), do: phase_report_schema(:diagnostic)
+  defp phase_report_schema(phase, _diagnostic?), do: phase_report_schema(phase)
 
   defp string_array_schema, do: %{"type" => "array", "items" => %{"type" => "string"}}
 
