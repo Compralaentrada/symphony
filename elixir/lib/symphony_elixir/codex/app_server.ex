@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
+  @thread_archive_id 4
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @type session :: %{
@@ -163,8 +164,23 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @spec stop_session(session()) :: :ok
-  def stop_session(%{port: port}) when is_port(port) do
-    stop_port(port)
+  def stop_session(%{port: port, thread_id: thread_id}) when is_port(port) do
+    Process.unlink(port)
+
+    try do
+      send_message(port, %{"method" => "thread/archive", "id" => @thread_archive_id, "params" => %{"threadId" => thread_id}})
+
+      case with_timeout_response(port, @thread_archive_id, 1_000, "") do
+        {:ok, _} -> :ok
+        {:error, reason} -> Logger.warning("Could not archive Codex thread_id=#{thread_id}: #{inspect(reason)}")
+      end
+    rescue
+      ArgumentError -> Logger.warning("Could not archive Codex thread_id=#{thread_id}: app-server port closed")
+    after
+      stop_port(port)
+    end
+
+    :ok
   end
 
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
