@@ -1,6 +1,41 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "closing a session archives its thread" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-archive-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "active")
+    codex_binary = Path.join(test_root, "fake-codex")
+    archive_log = Path.join(test_root, "archive")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    IFS= read -r line
+    printf '%s\\n' '{"id":1,"result":{}}'
+    IFS= read -r line
+    IFS= read -r line
+    printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-archive"}}}'
+    IFS= read -r line
+    printf '%s\\n' "$line" > '#{archive_log}'
+    printf '%s\\n' '{"id":4,"result":{}}'
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server"
+    )
+
+    assert {:ok, session} = AppServer.start_session(workspace)
+    assert :ok = AppServer.stop_session(session)
+
+    assert %{"method" => "thread/archive", "params" => %{"threadId" => "thread-archive"}} =
+             archive_log |> File.read!() |> Jason.decode!()
+  end
+
   test "app server captures configured model and reasoning at session startup" do
     test_root = Path.join(System.tmp_dir!(), "symphony-elixir-app-server-settings-#{System.unique_integer([:positive])}")
     workspace_root = Path.join(test_root, "workspaces")
