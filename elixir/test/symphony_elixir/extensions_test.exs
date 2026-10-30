@@ -606,6 +606,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "Compralaentrada Observability"
     assert html =~ "Operations Dashboard"
+    assert html =~ ~s(class="dashboard-shell operations-dashboard")
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "MT-BLOCKED"
@@ -728,9 +729,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot})
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
-    {:ok, _view, html} = live(build_conn(), "/")
+    {:ok, view, html} = live(build_conn(), "/")
 
     assert html =~ ~s(class="session-timeline")
+    assert has_element?(view, ".session-timeline .state-badge-active", "Building")
     assert html =~ "MT-NEWER"
     assert html =~ "MT-OLDER"
     assert html =~ "Latest activity"
@@ -786,13 +788,15 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     start_test_endpoint(snapshot_timeout_ms: 50)
 
-    {:ok, operations_view, _html} = live(build_conn(), "/")
+    {:ok, operations_view, operations_html} = live(build_conn(), "/")
+    assert operations_html =~ "operations-dashboard"
     assert has_element?(operations_view, "nav[aria-label='Dashboard views'] a[href='/delivery']", "Delivery")
 
     assert {:error, {:live_redirect, %{to: "/delivery"}}} =
              operations_view |> element("a[href='/delivery']") |> render_click()
 
     {:ok, delivery_view, html} = live(build_conn(), "/delivery")
+    refute html =~ "operations-dashboard"
     assert has_element?(delivery_view, "nav[aria-label='Dashboard views'] a[href='/']", "Operations")
     assert has_element?(delivery_view, "tbody tr td", "octo/app#7")
     assert html =~ "Current title"
@@ -800,6 +804,25 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert has_element?(delivery_view, "tbody tr td", "review · passed")
     refute html =~ "Done"
     assert html =~ ~s(href="https://example.org/octo/app/issues/7")
+  end
+
+  test "delivery keeps its original Building status styling" do
+    task = %{"issue_id" => "octo/app#7", "generation" => 1, "phase" => "build", "status" => "building"}
+
+    issue = %SymphonyElixir.Tracker.Issue{
+      id: "octo/app#7",
+      identifier: "octo/app#7",
+      title: "Current title",
+      url: "https://example.org/octo/app/issues/7",
+      state: "Building"
+    }
+
+    setup_delivery_pipeline([task], {:ok, [issue]})
+    start_test_endpoint(snapshot_timeout_ms: 50)
+
+    {:ok, view, _html} = live(build_conn(), "/delivery")
+    assert has_element?(view, ".state-badge:not(.state-badge-active)", "Building")
+    refute has_element?(view, ".state-badge-active", "Building")
   end
 
   test "delivery dashboard distinguishes empty, missing, and unavailable tracker states" do
