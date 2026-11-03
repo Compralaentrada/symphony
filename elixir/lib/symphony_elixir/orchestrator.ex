@@ -1077,7 +1077,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
     Enum.sort_by(issues, fn
       %Issue{} = issue ->
-        {priority_rank(issue.priority), issue_created_at_sort_key(issue), issue.identifier || issue.id || ""}
+        if Pipeline.enabled?() and normalize_issue_state(issue.state) == "ready" do
+          {priority_rank(nil), issue_ready_at_sort_key(issue), issue.identifier || issue.id || ""}
+        else
+          {priority_rank(issue.priority), issue_created_at_sort_key(issue), issue.identifier || issue.id || ""}
+        end
 
       _ ->
         {priority_rank(nil), issue_created_at_sort_key(nil), ""}
@@ -1093,6 +1097,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp issue_created_at_sort_key(%Issue{}), do: 9_223_372_036_854_775_807
   defp issue_created_at_sort_key(_issue), do: 9_223_372_036_854_775_807
+
+  defp issue_ready_at_sort_key(%Issue{ready_at: %DateTime{} = ready_at}) do
+    DateTime.to_unix(ready_at, :microsecond)
+  end
+
+  defp issue_ready_at_sort_key(%Issue{}), do: 9_223_372_036_854_775_807
 
   defp should_dispatch_issue?(
          %Issue{} = issue,

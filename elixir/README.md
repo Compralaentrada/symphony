@@ -303,6 +303,9 @@ tracker:
 - Only Ready Project items linked to native GitHub Issues with an exact repository profile are
   dispatched. Pull requests, draft issues, and unsupported item types are ignored. An unconfigured
   repository is moved to Blocked and receives a comment explaining the missing profile.
+- Ready items are ordered by the update time of their current Project Status value, oldest first;
+  issue creation time and priority do not change that order. Items without a usable Status timestamp
+  sort after items with one.
 - Work identity is `owner/repository#number`. Claiming moves Ready to Building, successful completion
   moves Building to Done, and intervention-required failures move to Blocked with a comment. Transient
   failures retry on the existing backoff path.
