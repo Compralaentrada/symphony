@@ -73,7 +73,7 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   def required_skill_fixture_hook do
-    Enum.map_join(["ponytail", "tdd", "code-review", "impeccable", "humanizer"], " && ", fn skill ->
+    Enum.map_join(["ponytail", "tdd", "tdd-autonomous", "code-review", "impeccable", "humanizer"], " && ", fn skill ->
       source = Path.join([@skill_source_root, ".agents", "skills", skill])
 
       "mkdir -p .agents/skills && rm -rf .agents/skills/#{skill} && cp -R #{shell_quote(source)} .agents/skills/#{skill}"
