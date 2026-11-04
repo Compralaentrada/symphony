@@ -159,6 +159,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     repository(owner: $owner, name: $name) {
       pullRequests(first: 100, states: [OPEN, CLOSED, MERGED], headRefName: $branch, baseRefName: $base) {
         nodes { id number url state isDraft mergedAt baseRefName baseRefOid headRefName headRefOid reviewDecision body }
+        pageInfo { hasNextPage }
       }
     }
   }
@@ -333,8 +334,9 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          {:ok, repository} <- repository_for_issue(issue),
          {:ok, existing} <- find_pull_request(issue, attrs.branch, attrs.base, settings, request_fun) do
       case existing do
-        %{} = pr -> update_pull_request_body(pr, Map.get(attrs, :body), settings, request_fun)
+        %{sha: sha} = pr when sha == attrs.sha -> update_pull_request_body(pr, Map.get(attrs, :body), settings, request_fun)
         nil -> create_pull_request(issue, repository, attrs, settings, request_fun)
+        _ -> {:error, :pull_request_head_sha_mismatch}
       end
     end
   end
@@ -2392,14 +2394,58 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
     with {:ok, repository} <- variables,
          {:ok, data} <-
-           graphql(request_fun, @pull_request_query, pull_request_variables(repository, branch, base), settings) do
-      nodes = get_in(data, ["repository", "pullRequests", "nodes"]) || []
-
-      {:ok,
-       nodes
-       |> Enum.map(&normalize_pull_request/1)
-       |> Enum.find(&(&1.branch == branch and &1.base == base and &1.state == "OPEN" and not &1.merged))}
+           graphql(request_fun, @pull_request_query, pull_request_variables(repository, branch, base), settings),
+         {:ok, nodes} <- pipeline_pull_request_nodes(data),
+         :ok <- validate_pipeline_pull_request_nodes(nodes, branch, base) do
+      pipeline_pull_request_from_nodes(nodes, branch, base)
     end
+  end
+
+  defp pipeline_pull_request_from_nodes(nodes, branch, base) do
+    case Enum.filter(nodes, &(&1["state"] == "OPEN")) do
+      [] ->
+        {:ok, nil}
+
+      [node] ->
+        pr = normalize_pull_request(node)
+
+        if valid_pipeline_pull_request?(pr, branch, base),
+          do: {:ok, pr},
+          else: ambiguous_pipeline_pull_request_lookup()
+
+      _multiple ->
+        ambiguous_pipeline_pull_request_lookup()
+    end
+  end
+
+  defp pipeline_pull_request_nodes(data) do
+    case get_in(data, ["repository", "pullRequests"]) do
+      %{"nodes" => nodes, "pageInfo" => %{"hasNextPage" => false}} when is_list(nodes) -> {:ok, nodes}
+      _ -> ambiguous_pipeline_pull_request_lookup()
+    end
+  end
+
+  defp validate_pipeline_pull_request_nodes(nodes, branch, base) do
+    if Enum.all?(nodes, fn
+         %{"headRefName" => ^branch, "baseRefName" => ^base, "state" => state} when state in ["OPEN", "CLOSED", "MERGED"] ->
+           true
+
+         _ ->
+           false
+       end) do
+      :ok
+    else
+      ambiguous_pipeline_pull_request_lookup()
+    end
+  end
+
+  defp valid_pipeline_pull_request?(pr, branch, base) do
+    is_binary(pr.id) and is_integer(pr.number) and is_binary(pr.url) and is_binary(pr.sha) and
+      is_boolean(pr.draft) and pr.branch == branch and pr.base == base and not pr.merged
+  end
+
+  defp ambiguous_pipeline_pull_request_lookup do
+    {:error, {:github_projects_api_error, "GitHub returned an ambiguous pipeline pull request lookup."}}
   end
 
   defp pull_request(issue, settings, request_fun) do
@@ -2408,8 +2454,9 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
     with {:ok, repository} <- repository_for_issue(issue),
          {:ok, data} <-
-           graphql(request_fun, @pull_request_query, pull_request_variables(repository, branch, base), settings) do
-      nodes = get_in(data, ["repository", "pullRequests", "nodes"]) || []
+           graphql(request_fun, @pull_request_query, pull_request_variables(repository, branch, base), settings),
+         {:ok, nodes} <- pipeline_pull_request_nodes(data),
+         :ok <- validate_pipeline_pull_request_nodes(nodes, branch, base) do
       pr = nodes |> Enum.map(&normalize_pull_request/1) |> Enum.find(&(&1.branch == branch and &1.base == base))
       {:ok, pr}
     end
