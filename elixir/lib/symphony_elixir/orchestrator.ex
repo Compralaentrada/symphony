@@ -610,20 +610,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
-    finalizing? = running_finalization?(issue, state, terminal_states)
+    keep_merge_worker? = preserve_running_merge_worker?(issue, state, terminal_states)
 
     cond do
-      terminal_issue_state?(issue.state, terminal_states) and not finalizing? ->
+      terminal_issue_state?(issue.state, terminal_states) and not keep_merge_worker? ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
         terminate_running_issue(state, issue.id, true)
 
-      !issue_routable?(issue) and not finalizing? ->
+      !issue_routable?(issue) and not keep_merge_worker? ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
         terminate_running_issue(state, issue.id, false)
 
-      finalizing? ->
+      keep_merge_worker? ->
         refresh_running_issue_state(state, issue)
 
       active_issue_state?(issue.state, active_states) ->
@@ -638,14 +638,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_issue_state(_issue, state, _active_states, _terminal_states), do: state
 
-  defp running_finalization?(issue, state, terminal_states) do
+  defp preserve_running_merge_worker?(issue, state, terminal_states) do
     pending_finalization_issue?(issue) or
-      (terminal_issue_state?(issue.state, terminal_states) and confirmed_running_review_merge?(issue, state))
+      (completed_merge_issue_state?(issue, terminal_states) and confirmed_running_merge?(issue, state))
   end
 
-  defp confirmed_running_review_merge?(issue, state) do
+  defp completed_merge_issue_state?(issue, terminal_states) do
+    terminal_issue_state?(issue.state, terminal_states) or
+      (Pipeline.enabled?() and normalize_issue_state(issue.state) == "done")
+  end
+
+  defp confirmed_running_merge?(issue, state) do
     case Map.get(state.running, issue.id) do
-      %{pipeline_phase: "review", pipeline_task: task} ->
+      %{pipeline_phase: phase, pipeline_task: task} when phase in ["review", "finalize"] ->
         case Tracker.pull_request(issue) do
           {:ok, %{merged: true, base: base, sha: sha}} -> base == task["base_branch"] and sha == task["current_sha"]
           {:error, _reason} -> true

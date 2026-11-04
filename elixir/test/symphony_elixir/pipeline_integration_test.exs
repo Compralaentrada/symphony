@@ -25,6 +25,105 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert MapSet.new(ids) == MapSet.new(Enum.map(issues, & &1.id))
   end
 
+  test "a confirmed merge keeps Review and Finalize workers alive through Done reconciliation" do
+    issue = issue("octo/app#62", 62)
+    issue = %{issue | state: "Done", dispatchable: false, native_ref: Map.put(issue.native_ref, :project_status, "Done")}
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    refute Enum.any?(Config.settings!().tracker.terminal_states, &(String.downcase(&1) == "done"))
+    sha = String.duplicate("b", 40)
+
+    pull_request = %{
+      number: 162,
+      branch: issue.branch_name,
+      base: "main",
+      sha: sha,
+      draft: false,
+      merged: true,
+      body: "delivery",
+      url: "https://github.com/octo/app/pull/162"
+    }
+
+    :ets.insert(table, {{:pull_request, issue.id}, pull_request})
+
+    for phase <- ["review", "finalize"] do
+      worker =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      ref = Process.monitor(worker)
+
+      running = %{
+        issue.id => %{
+          pid: worker,
+          ref: ref,
+          identifier: issue.id,
+          started_at: DateTime.utc_now(),
+          issue: issue,
+          pipeline_phase: phase,
+          pipeline_task: %{"base_branch" => "main", "current_sha" => sha}
+        }
+      }
+
+      state = %Orchestrator.State{
+        running: running,
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+      }
+
+      reconciled = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      assert reconciled.running == running
+      Process.exit(worker, :kill)
+      Process.demonitor(ref, [:flush])
+    end
+
+    for unconfirmed_pull_request <- [
+          %{pull_request | merged: false},
+          %{pull_request | base: "release"},
+          %{pull_request | sha: String.duplicate("c", 40)}
+        ],
+        phase <- ["review", "finalize"] do
+      :ets.insert(table, {{:pull_request, issue.id}, unconfirmed_pull_request})
+
+      worker =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      ref = Process.monitor(worker)
+
+      running = %{
+        issue.id => %{
+          pid: worker,
+          ref: ref,
+          identifier: issue.id,
+          started_at: DateTime.utc_now(),
+          issue: issue,
+          pipeline_phase: phase,
+          pipeline_task: %{"base_branch" => "main", "current_sha" => sha}
+        }
+      }
+
+      reconciled =
+        Orchestrator.reconcile_issue_states_for_test(
+          [issue],
+          %Orchestrator.State{
+            running: running,
+            codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+          }
+        )
+
+      refute Map.has_key?(reconciled.running, issue.id)
+      refute Process.alive?(worker)
+      Process.demonitor(ref, [:flush])
+    end
+  end
+
   test "qa-labeled issues start in QA while feature issues keep Build, QA, and Review" do
     qa_issue = %{issue("octo/app#60", 60) | labels: ["qa"]}
     feature_issue = %{issue("octo/app#61", 61) | labels: ["feature"]}
