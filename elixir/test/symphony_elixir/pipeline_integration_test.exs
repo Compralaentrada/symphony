@@ -142,6 +142,151 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert await(fn -> not Process.alive?(held_agent) end)
   end
 
+  test "wait and stop transitions release one slot while retaining resumable work" do
+    issues = Enum.map(800..805, &issue("octo/app##{&1}", &1))
+    [human_review, blocked, done, dropped, backlog, next_ready] = issues
+
+    table =
+      start_board(issues, %{
+        human_review.id => %{
+          build: [build("sha-eight-hundred", human_review.id)],
+          qa: [qa("sha-eight-hundred")],
+          review: [review("sha-eight-hundred")]
+        },
+        backlog.id => %{
+          build: [build("sha-eight-oh-four", backlog.id)],
+          qa: [qa("sha-eight-oh-four")],
+          review: [review("sha-eight-oh-four")]
+        }
+      })
+
+    path = pipeline_database!(table, poll_interval_ms: 60_000, max_concurrent_agents: 1)
+    :ets.insert(table, {:transition_test_owner, self()})
+    orchestrator = start_orchestrator(__MODULE__.WaitTransitionAgent)
+
+    on_exit(fn ->
+      if :ets.info(table) != :undefined do
+        case :ets.lookup(table, {:held_agent_pid, next_ready.id}) do
+          [{_, worker}] -> send(worker, :release)
+          [] -> :ok
+        end
+      end
+
+      try do
+        if Process.alive?(orchestrator), do: GenServer.stop(orchestrator, :normal, 1_000)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
+    for {phase, next_state} <- [{:build, "QA"}, {:qa, "Review"}, {:review, "Human Review"}] do
+      assert_receive {:phase_waiting, issue_id, ^phase, worker}, 5_000
+      assert issue_id == human_review.id
+
+      state = :sys.get_state(orchestrator)
+      assert map_size(state.running) == 1
+      assert state.running[human_review.id].pipeline_phase == Atom.to_string(phase)
+      assert (lookup(table, {:agent_calls, blocked.id, :build}) || 0) == 0
+
+      send(worker, {:continue_phase, phase})
+
+      assert await(fn ->
+               project_state(table, human_review.id) == next_state and
+                 not Map.has_key?(:sys.get_state(orchestrator).running, human_review.id)
+             end)
+
+      if phase != :review, do: refresh!(orchestrator, table)
+    end
+
+    refresh!(orchestrator, table)
+    assert await(fn -> lookup(table, {:held_agent_pid, blocked.id}) != nil end)
+    assert project_state(table, human_review.id) == "Human Review"
+    assert report_phases(table, human_review.id) == [:build, :qa, :review]
+
+    accepted_sha = lookup(table, {:remote_sha, human_review.id})
+    human_review_pr = pull_request(table, human_review.id)
+    assert human_review_pr.branch == human_review.branch_name
+    assert human_review_pr.sha == accepted_sha
+    assert {:ok, %{"status" => "human_review", "current_sha" => ^accepted_sha}} = Store.get_task(human_review.id)
+
+    for {current, next, state_name} <- [
+          {blocked, done, "Blocked"},
+          {done, dropped, "Done"}
+        ] do
+      current_agent = lookup(table, {:held_agent_pid, current.id})
+      workspace = workspace_path(current)
+      assert is_pid(current_agent)
+      assert File.dir?(workspace)
+
+      set_project_state(table, current.id, state_name)
+      refresh!(orchestrator, table)
+
+      assert await(fn -> lookup(table, {:held_agent_pid, next.id}) != nil end)
+      state = :sys.get_state(orchestrator)
+      assert map_size(state.running) == 1
+      assert Map.has_key?(state.running, next.id)
+      refute Map.has_key?(state.running, current.id)
+      assert await(fn -> not Process.alive?(current_agent) end)
+      assert File.dir?(workspace)
+    end
+
+    dropped_agent = lookup(table, {:held_agent_pid, dropped.id})
+    dropped_workspace = workspace_path(dropped)
+    assert is_pid(dropped_agent)
+    assert File.dir?(dropped_workspace)
+    set_project_state(table, dropped.id, "Dropped")
+    refresh!(orchestrator, table)
+
+    assert await(fn -> project_state(table, backlog.id) == "QA" and not Map.has_key?(:sys.get_state(orchestrator).running, backlog.id) end)
+    assert await(fn -> not Process.alive?(dropped_agent) end)
+    refute File.dir?(dropped_workspace)
+    refresh!(orchestrator, table)
+    assert await(fn -> project_state(table, backlog.id) == "Review" and not Map.has_key?(:sys.get_state(orchestrator).running, backlog.id) end)
+    refresh!(orchestrator, table)
+    assert await(fn -> lookup(table, {:paused_review, backlog.id}) != nil end)
+
+    backlog_agent = lookup(table, {:paused_review, backlog.id})
+    backlog_workspace = workspace_path(backlog)
+    backlog_sha = lookup(table, {:remote_sha, backlog.id})
+    backlog_pr = pull_request(table, backlog.id)
+    assert is_pid(backlog_agent)
+    assert map_size(:sys.get_state(orchestrator).running) == 1
+    assert backlog_pr.branch == backlog.branch_name
+    assert backlog_pr.sha == backlog_sha
+    assert File.dir?(backlog_workspace)
+    assert {:ok, %{"status" => "review", "current_sha" => ^backlog_sha}} = Store.get_task(backlog.id)
+
+    checkpoint_query =
+      "SELECT evidence FROM pipeline_checkpoints WHERE issue_id = ? AND generation = 1 AND phase = 'qa' AND sha = ?"
+
+    checkpoint_params = [backlog.id, backlog_sha]
+
+    assert [[checkpoint_evidence]] =
+             sqlite_rows(path, checkpoint_query, checkpoint_params)
+
+    set_project_state(table, backlog.id, "Backlog")
+    refresh!(orchestrator, table)
+
+    assert await(fn -> lookup(table, {:held_agent_pid, next_ready.id}) != nil end)
+    state = :sys.get_state(orchestrator)
+    assert map_size(state.running) == 1
+    assert Map.has_key?(state.running, next_ready.id)
+    refute Map.has_key?(state.running, backlog.id)
+    assert await(fn -> not Process.alive?(backlog_agent) end)
+    assert File.dir?(backlog_workspace)
+    assert pull_request(table, backlog.id).number == backlog_pr.number
+    assert pull_request(table, backlog.id).branch == backlog.branch_name
+    assert pull_request(table, backlog.id).sha == backlog_sha
+    assert {:ok, %{"current_sha" => ^backlog_sha}} = Store.get_task(backlog.id)
+
+    assert [[^checkpoint_evidence]] = sqlite_rows(path, checkpoint_query, checkpoint_params)
+
+    next_ready_agent = lookup(table, {:held_agent_pid, next_ready.id})
+    send(next_ready_agent, :release)
+    assert await(fn -> not Process.alive?(next_ready_agent) end)
+    stop_orchestrator(orchestrator)
+  end
+
   test "a human status change during skill preflight prevents the stale result from claiming" do
     issue = issue("octo/app#16", 16)
     table = start_board([issue], %{})
@@ -1782,7 +1927,13 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
   defp refresh!(orchestrator, table) do
     previous_calls = lookup(table, :fetch_issues_by_ids_calls) || 0
-    assert %{queued: true} = Orchestrator.request_refresh(orchestrator)
+
+    refresh_result =
+      if is_pid(orchestrator),
+        do: GenServer.call(orchestrator, :request_refresh),
+        else: Orchestrator.request_refresh(orchestrator)
+
+    assert %{queued: true} = refresh_result
     assert await(fn -> (lookup(table, :fetch_issues_by_ids_calls) || 0) >= previous_calls + 2 end)
     :sys.get_state(orchestrator)
   end
@@ -2137,6 +2288,32 @@ defmodule SymphonyElixir.PipelineIntegrationTest.PausedReviewAgent do
       Map.put(merged, "_remote_evidence", [passed, handoff])
     else
       FakeAgent.run(issue, recipient, opts)
+    end
+  end
+end
+
+defmodule SymphonyElixir.PipelineIntegrationTest.WaitTransitionAgent do
+  alias SymphonyElixir.PipelineIntegrationTest.{FakeAgent, HoldingAgent, PausedReviewAgent}
+
+  def run(issue, recipient, opts) do
+    case {issue.id, Keyword.fetch!(opts, :phase)} do
+      {"octo/app#800", phase} ->
+        table = Application.fetch_env!(:symphony_elixir, :pipeline_test_board)
+        owner = :ets.lookup_element(table, :transition_test_owner, 2)
+        send(owner, {:phase_waiting, issue.id, phase, self()})
+
+        receive do
+          {:continue_phase, ^phase} -> FakeAgent.run(issue, recipient, opts)
+        end
+
+      {"octo/app#804", :review} ->
+        PausedReviewAgent.run(issue, recipient, opts)
+
+      {"octo/app#804", _phase} ->
+        FakeAgent.run(issue, recipient, opts)
+
+      _ ->
+        HoldingAgent.run(issue, recipient, opts)
     end
   end
 end
