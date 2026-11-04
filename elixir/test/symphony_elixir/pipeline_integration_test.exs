@@ -164,6 +164,21 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     File.rm_rf(Path.dirname(path))
   end
 
+  test "stopping an orchestrator terminates its active worker" do
+    issue = issue("octo/app#62", 62)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    orchestrator = start_orchestrator(HoldingAgent)
+
+    assert await(fn -> lookup(table, {:held_agent_pid, issue.id}) != nil end)
+    worker = lookup(table, {:held_agent_pid, issue.id})
+    assert Process.alive?(worker)
+
+    stop_orchestrator(orchestrator)
+
+    refute Process.alive?(worker)
+  end
+
   test "a slow skill preflight does not stop the orchestrator responding" do
     issue = issue("octo/app#17", 17)
     table = start_board([issue], %{})
@@ -2258,12 +2273,30 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
   defp start_orchestrator(agent_runner \\ __MODULE__.FakeAgent) do
     name = Module.concat(__MODULE__, "Pipeline#{System.unique_integer([:positive])}")
     {:ok, pid} = Orchestrator.start_link(name: name, agent_runner: agent_runner)
+    on_exit(fn -> stop_orchestrator(pid) end)
     pid
   end
 
   defp stop_orchestrator(pid) do
-    if Process.alive?(pid), do: GenServer.stop(pid, :normal, 1_000)
+    if Process.alive?(pid) do
+      %{running: running, task_supervisor: task_supervisor} = :sys.get_state(pid)
+      GenServer.stop(pid, :normal, 1_000)
+      stop_pipeline_workers(running, task_supervisor)
+    end
   end
+
+  defp stop_pipeline_workers(running, task_supervisor) do
+    Enum.each(running, &stop_pipeline_worker(task_supervisor, &1))
+  end
+
+  defp stop_pipeline_worker(task_supervisor, {_issue_id, %{pid: worker}}) when is_pid(worker) do
+    case Task.Supervisor.terminate_child(task_supervisor, worker) do
+      :ok -> :ok
+      {:error, :not_found} -> :ok
+    end
+  end
+
+  defp stop_pipeline_worker(_task_supervisor, _entry), do: :ok
 
   defp stop_holding_orchestrator(pid) do
     if Process.alive?(pid) do
