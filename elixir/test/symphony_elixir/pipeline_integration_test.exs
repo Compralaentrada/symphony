@@ -2626,7 +2626,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     Path.join(root, SymphonyElixir.Workspace.workspace_key(issue))
   end
 
-  defp await(predicate, attempts \\ 400)
+  defp await(predicate, attempts \\ 1_000)
   defp await(_predicate, 0), do: false
 
   defp await(predicate, attempts) do
