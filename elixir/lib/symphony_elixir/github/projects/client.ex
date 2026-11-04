@@ -1900,7 +1900,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          %{} = latest_pr <- find_pull_request(latest, branch, base),
          :ok <- merge_gate(latest_pr, task, get_in(latest, ["repository", "ref", "target", "oid"])),
          :ok <- validate_unchanged_base(get_in(data, ["repository", "ref", "target", "oid"]), get_in(latest, ["repository", "ref", "target", "oid"])),
-         :ok <- merge_if_open(latest_pr, task, settings, request_fun),
+         :ok <- merge_if_open(issue, latest_pr, task, settings, request_fun),
          {:ok, merged_pr} <- confirmed_merged_pull_request(issue, branch, base, settings, request_fun) do
       {:ok,
        %{
@@ -2055,23 +2055,45 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     end
   end
 
-  defp merge_if_open(%{"state" => "MERGED"}, _task, _settings, _request_fun), do: :ok
+  defp merge_if_open(_issue, %{"state" => "MERGED"}, _task, _settings, _request_fun), do: :ok
 
-  defp merge_if_open(pr, task, settings, request_fun) do
-    with {:ok, data} <-
-           graphql(
-             request_fun,
-             @merge_mutation,
-             %{"pullRequestId" => pr["id"], "expectedHeadOid" => task["current_sha"]},
-             settings
-           ),
-         %{"pullRequest" => %{"mergedAt" => merged_at}} when is_binary(merged_at) <- data["mergePullRequest"] do
-      :ok
-    else
-      {:error, _reason} = error -> error
-      _ -> {:error, :pull_request_merge_not_confirmed}
+  defp merge_if_open(issue, pr, task, settings, request_fun) do
+    result =
+      graphql(
+        request_fun,
+        @merge_mutation,
+        %{"pullRequestId" => pr["id"], "expectedHeadOid" => task["current_sha"]},
+        settings
+      )
+
+    case result do
+      {:ok, %{"mergePullRequest" => %{"pullRequest" => %{"mergedAt" => merged_at}}}} when is_binary(merged_at) ->
+        :ok
+
+      _ ->
+        reconcile_merge_response(issue, pr, task, settings, request_fun, result)
     end
   end
+
+  defp reconcile_merge_response(issue, pr, task, settings, request_fun, result) do
+    branch = pr["headRefName"]
+    base = pr["baseRefName"]
+    sha = task["current_sha"]
+
+    case pull_request(issue, settings, request_fun) do
+      {:ok, %{merged: true, branch: ^branch, base: ^base, sha: ^sha}} ->
+        :ok
+
+      {:ok, _pull_request} ->
+        merge_response_error(result)
+
+      {:error, _reason} ->
+        {:error, :pull_request_merge_outcome_uncertain}
+    end
+  end
+
+  defp merge_response_error({:error, _reason} = error), do: error
+  defp merge_response_error(_result), do: {:error, :pull_request_merge_not_confirmed}
 
   defp confirmed_merged_pull_request(issue, branch, base, settings, request_fun) do
     case pull_request(issue, settings, request_fun) do
