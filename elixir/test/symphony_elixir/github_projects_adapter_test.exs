@@ -753,6 +753,15 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert {:ok, %{"outcome" => "merged", "pull_request" => %{"merged" => true}}} = already_merged
     refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
 
+    for github_check_status <- ["PENDING", "FAILURE"] do
+      {stale_base, queries} =
+        run_merge_gate(%{base_changed: true, requeue_github_check_status: github_check_status})
+
+      assert {:error, :pull_request_base_sha_mismatch} = stale_base
+      assert Enum.any?(queries, &(&1 =~ "SymphonySetProjectStatus"))
+      refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
+    end
+
     for {scenario, expected_error} <- [
           {%{host_check_status: "failed"}, :host_checks_not_verified},
           {%{human_decision_changed: true}, :github_human_decision_changed},
@@ -3072,6 +3081,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
   defp merge_gate_query_with_changes(options, queries, number, branch, sha) do
     reads = Agent.get(queries, &Enum.count(&1, fn query -> query =~ "SymphonyPipelineMergeGate" end))
     options = if options[:base_changed] == true and reads > 1, do: Map.put(options, :current_base_sha, "new-base"), else: options
+    options = if reads > 2 and is_binary(options[:requeue_github_check_status]), do: Map.put(options, :github_check_status, options[:requeue_github_check_status]), else: options
     merge_gate_query(options, number, branch, sha)
   end
 

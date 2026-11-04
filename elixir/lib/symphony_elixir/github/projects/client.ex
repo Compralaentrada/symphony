@@ -2092,7 +2092,6 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          %{} = pr <- find_pull_request(data, variables["branch"], variables["base"]),
          true <- pr["state"] == "OPEN" and pr["headRefOid"] == task["current_sha"],
          :ok <- validate_merge_state(pr),
-         :ok <- validate_github_checks(pr),
          :ok <- validate_merge_issue_open(current, pr),
          :ok <- validate_merge_review(issue, context, task, pr, settings, request_fun),
          {:ok, saved} <- Store.get_task(issue.id),
