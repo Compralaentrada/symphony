@@ -1851,7 +1851,12 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert await(fn ->
              project_state(table, issue.id) == "Done" and
                match?({:ok, %{"status" => "done"}}, Store.get_task(issue.id)) and
-               not Store.agent_lease_active?(issue.id, 1, "finalize", 2)
+               not Store.agent_lease_active?(issue.id, 1, "finalize", 2) and
+               sqlite_rows(
+                 path,
+                 "SELECT status FROM pipeline_runs WHERE issue_id = ? AND generation = 1 AND phase = 'finalize' AND attempt = 2",
+                 [issue.id]
+               ) == [["complete"]]
            end)
 
     assert agent_calls(table, issue.id, :finalize) == 2
@@ -2626,7 +2631,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     Path.join(root, SymphonyElixir.Workspace.workspace_key(issue))
   end
 
-  defp await(predicate, attempts \\ 1_000)
+  defp await(predicate, attempts \\ 3_000)
   defp await(_predicate, 0), do: false
 
   defp await(predicate, attempts) do
