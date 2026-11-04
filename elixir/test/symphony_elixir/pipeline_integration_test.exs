@@ -56,6 +56,9 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
     assert report_phases(table, qa_issue.id) == [:qa, :review]
     assert agent_calls(table, qa_issue.id, :build) == 0
+    qa_report = lookup(table, {:report, qa_issue.id, "qa"}) |> Jason.decode!()
+    assert qa_report["files"] == []
+    assert qa_report["sha"] == qa_sha
     assert report_phases(table, feature_issue.id) == [:build, :qa, :review]
 
     stop_orchestrator(orchestrator)
@@ -1765,6 +1768,37 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     File.rm_rf!(Path.dirname(path))
   end
 
+  test "QA publishes test-only changes at the new PR SHA before Review" do
+    issue = issue("octo/app#68", 68)
+    table = start_board([issue], %{issue.id => %{build: [build("initial", issue.id)], qa: [qa("initial")], review: [review("initial")]}})
+    path = pipeline_database!(table)
+    :ets.insert(table, {{:qa_add_test_once, issue.id}, true})
+    orchestrator = start_orchestrator()
+
+    on_exit(fn ->
+      if Process.alive?(orchestrator), do: stop_orchestrator(orchestrator)
+      File.rm_rf!(Path.dirname(path))
+    end)
+
+    assert await(fn -> project_state(table, issue.id) == "Human Review" end)
+    stop_orchestrator(orchestrator)
+    assert report_phases(table, issue.id) == [:build, :qa, :review]
+    assert {:ok, %{"current_sha" => sha}} = Store.get_task(issue.id)
+    assert sha == lookup(table, {:remote_sha, issue.id})
+    assert lookup(table, {:pull_request, issue.id}).sha == sha
+
+    qa_report = lookup(table, {:report, issue.id, "qa"}) |> Jason.decode!()
+    assert qa_report["sha"] == sha
+    assert qa_report["files"] == [%{"path" => "test/qa_added_test.exs", "change" => "added"}]
+    assert qa_report["verification_command"] == "elixir test/qa_added_test.exs"
+
+    assert %{"command" => command, "result" => result, "status" => "passed"} =
+             Enum.find(qa_report["checks"], &(&1["id"] == "qa-unit-test"))
+
+    assert command == qa_report["verification_command"]
+    assert result =~ "1 test, 0 failures"
+  end
+
   test "a QA report with findings returns to Build and keeps finding context through Review" do
     issue = issue("octo/app#12", 12)
     finding = %{"id" => "QA-12-1", "reproduction" => "Run the failing scenario.", "criterion" => "The result matches the acceptance criterion."}
@@ -2018,7 +2052,9 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
           "evidence" => ["qa-unit-test"]
         }
       ],
+      "files" => [],
       "changes" => [],
+      "verification_command" => "mix test test/symphony_elixir/qa_report_test.exs",
       "checks" => [
         %{
           "id" => "qa-unit-test",
@@ -2055,6 +2091,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
         "reason" => nil
       }
     ])
+    |> Map.put("verification_command", "sh ./check.sh")
     |> put_in(["criteria", Access.at(0), "evidence"], ["agent-claimed-check"])
   end
 
@@ -2071,12 +2108,14 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
           "evidence" => ["qa-environment"]
         }
       ],
+      "files" => [],
       "changes" => [],
+      "verification_command" => "mix test test/symphony_elixir/example_test.exs",
       "checks" => [
         %{
           "id" => "qa-environment",
           "layer" => "manual",
-          "command" => nil,
+          "command" => "mix test test/symphony_elixir/example_test.exs",
           "status" => "unavailable",
           "result" => "The test environment could not be reached.",
           "evidence" => "test-environment access error",
@@ -2393,9 +2432,10 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
         }
       end)
 
+    report = maybe_publish_qa_test(table, issue, Map.put(report, "sha", task["current_sha"]), workspace)
+
     report =
       report
-      |> Map.put("sha", task["current_sha"])
       |> Map.put("host_checks", host_checks)
       |> Map.update("findings", check_findings, &(&1 ++ check_findings))
 
@@ -2415,6 +2455,56 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
       {:ok, report, host_checks, [claim]}
     end
   end
+
+  defp maybe_publish_qa_test(table, issue, report, workspace) do
+    if :ets.lookup(table, {:qa_add_test_once, issue.id}) != [] do
+      :ets.delete(table, {:qa_add_test_once, issue.id})
+      path = "test/qa_added_test.exs"
+      verification_command = "elixir #{path}"
+      File.mkdir_p!(Path.dirname(Path.join(workspace, path)))
+
+      File.write!(
+        Path.join(workspace, path),
+        """
+        ExUnit.start()
+
+        defmodule QAPublishedTest do
+          use ExUnit.Case, async: true
+
+          test "QA can publish an executable test" do
+            assert String.trim("  Symphony QA coverage  ") == "Symphony QA coverage"
+          end
+        end
+        """
+      )
+
+      {output, 0} = System.cmd("elixir", [path], cd: workspace, stderr_to_stdout: true)
+      {_output, 0} = System.cmd("git", ["add", path], cd: workspace, stderr_to_stdout: true)
+      {_output, 0} = System.cmd("git", ["commit", "-m", "test: add QA coverage"], cd: workspace, stderr_to_stdout: true)
+      {sha, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: workspace, stderr_to_stdout: true)
+      sha = String.trim(sha)
+      :ets.insert(table, {{:remote_sha, issue.id}, sha})
+
+      case :ets.lookup(table, {:pull_request, issue.id}) do
+        [{{:pull_request, _issue_id}, %{} = pr}] -> :ets.insert(table, {{:pull_request, issue.id}, %{pr | sha: sha}})
+        [] -> :ok
+      end
+
+      report
+      |> Map.put("sha", sha)
+      |> Map.put("files", [%{"path" => path, "change" => "added"}])
+      |> Map.put("changes", ["Added QA coverage in #{path}."])
+      |> Map.put("verification_command", verification_command)
+      |> Map.put("checks", Enum.map(report["checks"], &update_qa_check(&1, verification_command, output)))
+    else
+      report
+    end
+  end
+
+  defp update_qa_check(%{"id" => "qa-unit-test"} = check, command, output),
+    do: Map.merge(check, %{"command" => command, "result" => String.trim(output)})
+
+  defp update_qa_check(check, _command, _output), do: check
 
   defp prepare_report(table, issue, :review, report, _opts, _workspace),
     do: {:ok, Map.put(report, "sha", :ets.lookup_element(table, {:remote_sha, issue.id}, 2)), [], []}
@@ -2830,10 +2920,23 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
         })
   end
 
-  defp handoff_pull_request(issue, context, _report) when context.lane in [:qa, :review] do
+  defp handoff_pull_request(issue, context, report) when context.lane in [:qa, :review] do
     case pull_request(issue) do
-      {:ok, %{} = pr} -> {:ok, pr}
-      {:ok, nil} -> {:error, :pull_request_not_found}
+      {:ok, %{} = pr} ->
+        task = context.task || %{}
+        validate_fake_existing_pull_request(pr, report, task)
+
+      {:ok, nil} ->
+        {:error, :pull_request_not_found}
+    end
+  end
+
+  defp validate_fake_existing_pull_request(pr, report, task) do
+    cond do
+      pr.sha != report["sha"] -> {:error, :pull_request_head_sha_mismatch}
+      is_binary(task["branch"]) and pr.branch != task["branch"] -> {:error, :pull_request_branch_mismatch}
+      is_binary(task["base_branch"]) and pr.base != task["base_branch"] -> {:error, :pull_request_base_mismatch}
+      true -> {:ok, pr}
     end
   end
 

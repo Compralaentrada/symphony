@@ -930,12 +930,13 @@ Failure handling:
   task branch. The diagnostic agent reads the
   issue workpad, saved phase reports, workspace, and PR, then records the blocker, evidence, and
   recovery instruction using its authorized `github_workflow` operations. Symphony checkpoints and
-  validates the returned remote evidence but does not write to GitHub. Before QA or Review starts,
-  the PR head and clean workspace must match the accepted Build SHA; an absent or changed PR head,
-  workspace mismatch, or dirty tree is handed to the diagnostic lane with expected and observed SHA
-  evidence where available. When a blocked QA or Review task is requeued after the PR head changed
-  or the PR is missing, it restarts at Build so the accepted SHA and subsequent QA and Review
-  evidence are refreshed together.
+  validates the returned remote evidence but does not write to GitHub. Before QA starts, the PR head
+  and clean workspace must match the accepted Build SHA. Before Review starts, they must match the
+  SHA in the latest accepted QA report, which may include QA's test-only changes. An absent or
+  changed PR head, workspace mismatch, or dirty tree is handed to the diagnostic lane with expected
+  and observed SHA evidence where available. When a blocked QA or Review task is requeued after the
+  PR head changed or the PR is missing, it restarts at Build so the accepted SHA and subsequent QA
+  and Review evidence are refreshed together.
 - GitHub Projects controls the active phase when it differs from a local checkpoint. Reconcile only
   after the active worker finishes its handoff, retain the workspace and findings, and invalidate
   host-check evidence when the PR SHA changes. QA and Review still require a matching PR and clean

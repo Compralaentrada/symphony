@@ -941,7 +941,9 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
           "evidence" => ["host:make -C elixir all"]
         }
       ],
+      "files" => [],
       "changes" => [],
+      "verification_command" => "make -C elixir all",
       "checks" => [],
       "host_checks" => [
         %{
@@ -1231,7 +1233,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
            } = Client.normalize_agent_report_for_test(%{"outcome" => "passed", "findings" => [finding]}, "qa", passed)
   end
 
-  test "QA-labeled defects block the task and return the PR to draft" do
+  test "QA-labeled test changes update the PR SHA and return product findings to Build" do
     previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
     root = Path.join(System.tmp_dir!(), "symphony-project-qa-defects-#{System.unique_integer([:positive])}")
     Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
@@ -1248,6 +1250,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     number = System.unique_integer([:positive])
     issue_id = "octo/app##{number}"
     sha = String.duplicate("a", 40)
+    reported_sha = String.duplicate("b", 40)
 
     issue = %Issue{
       id: issue_id,
@@ -1270,13 +1273,14 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "branch" => issue.branch_name,
       "base_branch" => "main",
       "current_sha" => sha,
+      "pr_number" => number,
       "required_checks" => ["mix test"]
     }
 
     assert :ok = Store.save_task(task)
     assert :ok = Store.begin_phase(issue_id, 1, "qa", 1)
 
-    {:ok, remote} = Agent.start_link(fn -> %{status: "Ready", report_body: nil, draft: false} end)
+    {:ok, remote} = Agent.start_link(fn -> %{status: "Ready", report_body: nil, draft: false, pr_sha: sha} end)
 
     request_fun = fn query, variables, _settings ->
       Agent.get_and_update(remote, fn data ->
@@ -1295,7 +1299,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
               "mergedAt" => nil,
               "baseRefName" => "main",
               "headRefName" => issue.branch_name,
-              "headRefOid" => sha,
+              "headRefOid" => data.pr_sha,
               "body" => ""
             }
 
@@ -1311,7 +1315,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
               "mergedAt" => nil,
               "baseRefName" => "main",
               "headRefName" => issue.branch_name,
-              "headRefOid" => sha
+              "headRefOid" => data.pr_sha
             }
 
             {{:ok, %{status: 200, body: %{"data" => %{"convertPullRequestToDraft" => %{"pullRequest" => pr}}}}}, %{data | draft: true}}
@@ -1346,9 +1350,11 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "summary" => "QA found a defect.",
       "findings" => [finding],
       "next_step" => "Fix the defect.",
-      "sha" => sha,
+      "sha" => reported_sha,
       "criteria" => [],
-      "changes" => [],
+      "files" => [%{"path" => "test/qa-regression_test.exs", "change" => "added"}],
+      "changes" => ["Added test/qa-regression_test.exs."],
+      "verification_command" => "mix test",
       "checks" => [
         %{
           "id" => "failed-unit-test",
@@ -1391,6 +1397,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert Agent.get(remote, & &1.status) == "QA"
     assert Agent.get(remote, & &1.draft)
 
+    Agent.update(remote, &%{&1 | pr_sha: reported_sha})
+
     handoff =
       AgentTool.execute(
         "github_workflow",
@@ -1401,9 +1409,10 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       )
 
     assert handoff["success"], handoff["output"]
-    assert handoff["evidence"]["project_item"]["status"] == "Blocked"
+    assert handoff["evidence"]["project_item"]["status"] == "Building"
+    assert handoff["evidence"]["pull_request"]["head_sha"] == reported_sha
 
-    assert Agent.get(remote, & &1.status) == "Blocked"
+    assert Agent.get(remote, & &1.status) == "Building"
 
     assert Agent.get(remote, & &1.draft)
 
@@ -1412,6 +1421,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert stored_comment =~ "## QA report\n\nQA found a defect.\n\n"
     assert {:ok, stored_report} = AgentReport.decode_comment(stored_comment)
     assert stored_report["checks"] == report["checks"]
+    assert stored_report["sha"] == reported_sha
+    assert stored_report["files"] == report["files"]
     assert stored_report["host_checks"] == Enum.map(context.host_checks, &Map.put(&1, "source", "host"))
   end
 
@@ -1452,6 +1463,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "branch" => issue.branch_name,
       "base_branch" => "main",
       "current_sha" => sha,
+      "pr_number" => number,
       "required_checks" => ["mix test"]
     }
 
@@ -1522,7 +1534,9 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
           "evidence" => ["focused-unit-test"]
         }
       ],
+      "files" => [],
       "changes" => [],
+      "verification_command" => "mix test test/symphony_elixir/example_test.exs",
       "checks" => [
         %{
           "id" => "focused-unit-test",
@@ -1645,6 +1659,9 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert workpad_result["success"], workpad_result["output"]
     workpad = workpad_result["evidence"]
     assert workpad["report_context"]["task"]["required_checks"] == ["mix test"]
+    assert workpad["report_context"]["task"]["branch"] == issue.branch_name
+    assert workpad["report_context"]["task"]["base_branch"] == "main"
+    assert workpad["report_context"]["task"]["pr_number"] == number
     assert workpad["report_context"]["host_checks"] == context.host_checks
     assert workpad["report_context"]["qa_text"]["checks_failed"] == "One or more required host checks failed or were missing."
 
