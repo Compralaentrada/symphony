@@ -22,6 +22,24 @@ defmodule SymphonyElixir.QAReport do
 
   def valid?(_report, _required_host_checks, _issue_description), do: false
 
+  @doc false
+  @spec review_host_checks_valid?([String.t()], term(), String.t(), String.t() | nil) :: boolean()
+  def review_host_checks_valid?(required, host_checks, sha, replayed_command)
+      when is_list(required) and is_list(host_checks) and is_binary(sha) do
+    Enum.all?(required, fn command ->
+      Enum.any?(host_checks, fn
+        %{} = check ->
+          check["name"] == command and check["source"] == "host" and check["status"] == "passed" and
+            present?(check["evidence"]) and (check["sha"] == sha or command == replayed_command)
+
+        _ ->
+          false
+      end)
+    end)
+  end
+
+  def review_host_checks_valid?(_required, _host_checks, _sha, _replayed_command), do: false
+
   defp valid_delivery?(report, checks, host_checks) do
     valid_files?(report["files"]) and valid_verification_command?(report["verification_command"], checks, host_checks) and
       valid_verification_result?(report, checks, host_checks)

@@ -1253,7 +1253,8 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
           "name" => required_host_check,
           "status" => "passed",
           "evidence" => "Host exit status 0.",
-          "source" => "host"
+          "source" => "host",
+          "sha" => sha
         }
       ],
       "gaps" => [],

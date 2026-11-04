@@ -108,7 +108,8 @@ the exact verification command. For high-risk gaps it writes the reproducing tes
 test-only changes to the existing branch and reports the resulting PR SHA; with no file changes, it
 keeps the incoming SHA. Product defects return to Build, while environment or permission failures
 are blocked with a diagnosis. Review inspects the PR diff against the QA file list and repeats the
-verification command on the accepted SHA before advancing.
+verification command on the accepted SHA before advancing. Each host check records the SHA it ran
+against; other required checks must have passing evidence for the reviewed SHA.
 
 ## Prerequisites
 

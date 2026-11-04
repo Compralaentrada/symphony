@@ -1802,7 +1802,14 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          true <- is_binary(task["base_sha"]) and report["base_sha"] == task["base_sha"],
          true <- QAReport.valid?(report, task["required_checks"] || [], issue_description),
          true <- report["verification_command"] in (task["required_checks"] || []),
-         true <- required_checks_passed?(task["required_checks"] || [], report["host_checks"] || []) do
+         true <- required_checks_passed?(task["required_checks"] || [], report["host_checks"] || []),
+         true <-
+           QAReport.review_host_checks_valid?(
+             task["required_checks"] || [],
+             report["host_checks"] || [],
+             report["sha"],
+             report["verification_command"]
+           ) do
       :ok
     else
       _ -> {:error, :qa_evidence_unavailable}
@@ -2150,7 +2157,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          :ok <- validate_agent_lease(context),
          {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
          :ok <- expected_project_status(current, [settings.statuses.human_review]),
-         :ok <- ensure_merge_checks(task),
+         :ok <- ensure_merge_checks(task, context[:review_verification]),
          {:ok, data} <- graphql(request_fun, @merge_query, variables, settings),
          %{} = pr <- find_pull_request(data, branch, base),
          :ok <- merge_gate(pr, task, get_in(data, ["repository", "ref", "target", "oid"])),
@@ -2265,11 +2272,27 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     end
   end
 
-  defp ensure_merge_checks(task) do
+  defp ensure_merge_checks(task, verification) do
     required = task["required_checks"] || []
     checks = task["host_checks"] || []
-    if required_checks_passed?(required, checks), do: :ok, else: {:error, :host_checks_not_verified}
+    current_sha = task["current_sha"]
+    replayed_command = verified_review_command(verification, task, required)
+
+    if QAReport.review_host_checks_valid?(required, checks, current_sha, replayed_command),
+      do: :ok,
+      else: {:error, :host_checks_not_verified}
   end
+
+  defp verified_review_command(%{"status" => "passed"} = verification, task, required) do
+    command = verification["command"]
+
+    if is_binary(task["current_sha"]) and verification["sha"] == task["current_sha"] and
+         is_binary(task["base_sha"]) and verification["base_sha"] == task["base_sha"] and command in required and
+         present_report_value?(verification["evidence"]),
+       do: command
+  end
+
+  defp verified_review_command(_verification, _task, _required), do: nil
 
   defp find_pull_request(data, branch, base) do
     get_in(data, ["repository", "pullRequests", "nodes"])

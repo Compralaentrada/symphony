@@ -1315,6 +1315,34 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       assert {:error, :qa_evidence_unavailable} =
                Client.validate_review_qa_report_for_test(context, %{"qa" => [phase_report.(invalid)]}, "Run tests.")
     end
+
+    current_check = Map.put(hd(report["host_checks"]), "sha", sha)
+
+    stale_second_check = %{
+      "name" => "mix format --check-formatted",
+      "status" => "passed",
+      "evidence" => "Host exit status 0.",
+      "source" => "host",
+      "sha" => String.duplicate("c", 40)
+    }
+
+    stale_other_check =
+      report
+      |> Map.put("host_checks", [current_check, stale_second_check])
+      |> Map.put("checks", report["checks"])
+
+    stale_context = %{context | task: Map.put(context.task, "required_checks", [command, stale_second_check["name"]])}
+
+    assert {:error, :qa_evidence_unavailable} =
+             Client.validate_review_qa_report_for_test(stale_context, %{"qa" => [phase_report.(stale_other_check)]}, "Run tests.")
+  end
+
+  test "automatic merge rejects stale required check evidence not repeated by Review" do
+    required = ["make -C elixir all", "mix format --check-formatted"]
+    {result, queries} = run_merge_gate(%{required_checks: required, host_check_sha: "previous-head"})
+
+    assert result == {:error, :host_checks_not_verified}
+    refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
   end
 
   test "QA findings turn a passed report into a correction handoff" do
@@ -3116,6 +3144,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     issue_id = "octo/app##{number}"
     branch = "symphony/octo-app-#{number}"
     sha = String.duplicate("a", 40)
+    required_checks = Map.get(options, :required_checks, ["make -C elixir all"])
+    verification_command = List.first(required_checks)
 
     issue = %Issue{
       id: issue_id,
@@ -3135,15 +3165,17 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "current_sha" => sha,
       "base_sha" => "base-current",
       "prior_findings" => Map.get(options, :prior_findings, []),
-      "required_checks" => ["make -C elixir all"],
-      "host_checks" => [
-        %{
-          "name" => "make -C elixir all",
-          "status" => Map.get(options, :host_check_status, "passed"),
-          "evidence" => "exit status 0",
-          "source" => "host"
-        }
-      ]
+      "required_checks" => required_checks,
+      "host_checks" =>
+        Enum.map(required_checks, fn command ->
+          %{
+            "name" => command,
+            "status" => Map.get(options, :host_check_status, "passed"),
+            "evidence" => "exit status 0",
+            "source" => "host",
+            "sha" => Map.get(options, :host_check_sha, sha)
+          }
+        end)
     }
 
     assert :ok = Store.save_task(task)
@@ -3178,7 +3210,20 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       end
     end
 
-    context = %{issue: issue, lane: :review, generation: 1, attempt: 1, task: task}
+    context = %{
+      issue: issue,
+      lane: :review,
+      generation: 1,
+      attempt: 1,
+      task: task,
+      review_verification: %{
+        "command" => verification_command,
+        "status" => "passed",
+        "evidence" => "Host replay passed.",
+        "sha" => sha,
+        "base_sha" => task["base_sha"]
+      }
+    }
 
     result =
       Client.agent_operation(issue, context, "request_merge", %{},

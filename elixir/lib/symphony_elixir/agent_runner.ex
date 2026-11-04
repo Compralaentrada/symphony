@@ -533,7 +533,8 @@ defmodule SymphonyElixir.AgentRunner do
   defp valid_review_qa_report?(report, task, current_base_sha, required_checks, issue_description) do
     report["outcome"] == "passed" and report["sha"] == task["current_sha"] and
       is_binary(task["base_sha"]) and report["base_sha"] == task["base_sha"] and
-      current_base_sha == task["base_sha"] and QAReport.valid?(report, required_checks, issue_description)
+      current_base_sha == task["base_sha"] and QAReport.valid?(report, required_checks, issue_description) and
+      QAReport.review_host_checks_valid?(required_checks, report["host_checks"] || [], report["sha"], report["verification_command"])
   end
 
   defp verify_review_qa_command(command, required_checks, task, current_base_sha, issue, workspace, opts, worker_host) do
@@ -597,14 +598,15 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_pipeline_host_check(workspace, issue, worker_host, command, current_sha) do
     case SymphonyElixir.Workspace.run_required_check(workspace, command, current_sha, issue, worker_host) do
       {:ok, evidence} ->
-        %{"name" => command, "status" => "passed", "evidence" => evidence, "source" => "host"}
+        %{"name" => command, "status" => "passed", "evidence" => evidence, "source" => "host", "sha" => current_sha}
 
       {:error, {:check_failed, status}} ->
         %{
           "name" => command,
           "status" => "failed",
           "evidence" => "Symphony ran the configured check at SHA #{current_sha}; host exit status #{status}.",
-          "source" => "host"
+          "source" => "host",
+          "sha" => current_sha
         }
 
       {:error, {:workspace_sha_mismatch, expected_sha, observed_sha}} ->
@@ -613,7 +615,8 @@ defmodule SymphonyElixir.AgentRunner do
           "status" => "failed",
           "finding_id" => "workspace-sha-mismatch",
           "evidence" => "Symphony did not run the check because workspace HEAD was #{observed_sha || "unavailable"}, not accepted SHA #{expected_sha}.",
-          "source" => "host"
+          "source" => "host",
+          "sha" => expected_sha
         }
 
       {:error, {:workspace_dirty, expected_sha, observed_sha}} ->
@@ -622,7 +625,8 @@ defmodule SymphonyElixir.AgentRunner do
           "status" => "failed",
           "finding_id" => "workspace-dirty",
           "evidence" => "Symphony did not run the check because the workspace had local changes at SHA #{observed_sha || "unavailable"}; accepted SHA was #{expected_sha}.",
-          "source" => "host"
+          "source" => "host",
+          "sha" => expected_sha
         }
 
       {:error, :check_unavailable} ->
@@ -631,7 +635,8 @@ defmodule SymphonyElixir.AgentRunner do
           "status" => "unavailable",
           "evidence" => "Symphony could not execute the required check.",
           "reason" => "The configured command is unavailable in the task host.",
-          "source" => "host"
+          "source" => "host",
+          "sha" => current_sha
         }
     end
   end

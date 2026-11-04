@@ -2914,10 +2914,16 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
            Keyword.get(opts, :worker_host)
          ) do
       {:ok, evidence} ->
-        %{"name" => command, "status" => "passed", "evidence" => evidence, "source" => "host"}
+        %{"name" => command, "status" => "passed", "evidence" => evidence, "source" => "host", "sha" => task["current_sha"]}
 
       {:error, {:check_failed, status}} ->
-        %{"name" => command, "status" => "failed", "evidence" => "Symphony ran the configured check at SHA #{task["current_sha"]}; host exit status #{status}.", "source" => "host"}
+        %{
+          "name" => command,
+          "status" => "failed",
+          "evidence" => "Symphony ran the configured check at SHA #{task["current_sha"]}; host exit status #{status}.",
+          "source" => "host",
+          "sha" => task["current_sha"]
+        }
 
       {:error, {:workspace_sha_mismatch, expected_sha, observed_sha}} ->
         %{
@@ -2925,7 +2931,8 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
           "status" => "failed",
           "finding_id" => "workspace-sha-mismatch",
           "evidence" => "Workspace HEAD was #{observed_sha || "unavailable"}, not accepted SHA #{expected_sha}.",
-          "source" => "host"
+          "source" => "host",
+          "sha" => expected_sha
         }
 
       {:error, {:workspace_dirty, expected_sha, observed_sha}} ->
@@ -2934,7 +2941,8 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
           "status" => "failed",
           "finding_id" => "workspace-dirty",
           "evidence" => "Workspace had local changes at SHA #{observed_sha || "unavailable"}; accepted SHA was #{expected_sha}.",
-          "source" => "host"
+          "source" => "host",
+          "sha" => expected_sha
         }
 
       {:error, :check_unavailable} ->
@@ -2943,7 +2951,8 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
           "status" => "unavailable",
           "evidence" => "Symphony could not execute the required check.",
           "reason" => "The configured command is unavailable in the task host.",
-          "source" => "host"
+          "source" => "host",
+          "sha" => task["current_sha"]
         }
     end
   end

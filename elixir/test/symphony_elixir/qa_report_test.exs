@@ -11,6 +11,23 @@ defmodule SymphonyElixir.QAReportTest do
     refute QAReport.valid?(report, ["missing host check"])
   end
 
+  test "Review only carries required host checks forward from the accepted SHA" do
+    sha = String.duplicate("a", 40)
+    replayed = "mix test"
+    other = "mix format --check-formatted"
+
+    checks = [
+      %{"name" => replayed, "status" => "passed", "evidence" => "exit 0", "source" => "host", "sha" => "old-head"},
+      %{"name" => other, "status" => "passed", "evidence" => "exit 0", "source" => "host", "sha" => sha}
+    ]
+
+    assert QAReport.review_host_checks_valid?([replayed, other], checks, sha, replayed)
+    refute QAReport.review_host_checks_valid?([replayed, other], put_in(checks, [Access.at(1), "sha"], "old-head"), sha, replayed)
+    refute QAReport.review_host_checks_valid?([replayed, other], checks, sha, other)
+    refute QAReport.review_host_checks_valid?([replayed], [nil], sha, nil)
+    refute QAReport.review_host_checks_valid?([replayed], [], nil, nil)
+  end
+
   test "file changes and the verification command are explicit QA evidence" do
     report = report()
 
