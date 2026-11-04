@@ -159,6 +159,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     repository(owner: $owner, name: $name) {
       pullRequests(first: 100, states: [OPEN, CLOSED, MERGED], headRefName: $branch, baseRefName: $base) {
         nodes { id number url state isDraft mergedAt baseRefName baseRefOid headRefName headRefOid reviewDecision body }
+        pageInfo { hasNextPage }
       }
     }
   }
@@ -2418,8 +2419,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp pipeline_pull_request_nodes(data) do
-    case get_in(data, ["repository", "pullRequests", "nodes"]) do
-      nodes when is_list(nodes) -> {:ok, nodes}
+    case get_in(data, ["repository", "pullRequests"]) do
+      %{"nodes" => nodes, "pageInfo" => %{"hasNextPage" => false}} when is_list(nodes) -> {:ok, nodes}
       _ -> ambiguous_pipeline_pull_request_lookup()
     end
   end

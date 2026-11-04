@@ -280,7 +280,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
             "body" => ""
           }
 
-          {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [pr]}}}}}}
+          {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([pr])}}}}}
 
         query =~ "updateProjectV2ItemFieldValue" ->
           Agent.update(remote_status, fn _status -> "QA" end)
@@ -441,7 +441,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
               pipeline_pr(issue, existing_body)
               |> Map.merge(%{"number" => 107, "id" => "PR_#{number}", "headRefOid" => sha})
 
-            body = %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [existing_pr]}}}}
+            body = %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([existing_pr])}}}
             {{:ok, %{status: 200, body: body}}, data}
 
           query =~ "SymphonyUpdatePipelinePullRequestBody" ->
@@ -596,7 +596,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
           query =~ "SymphonyPipelinePullRequest" ->
             events = [:pull_request_read | data.events]
-            body = %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [merged_pr]}}}}
+            body = %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([merged_pr])}}}
             {{:ok, %{status: 200, body: body}}, %{data | events: events}}
 
           query =~ "SymphonyPipelineCloseIssue" ->
@@ -1321,7 +1321,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
               "body" => ""
             }
 
-            {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [pr]}}}}}}, data}
+            {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([pr])}}}}}, data}
 
           query =~ "SymphonyConvertPipelinePullRequestToDraft" ->
             pr = %{
@@ -1511,7 +1511,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
               "body" => ""
             }
 
-            {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [pr]}}}}}}, data}
+            {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([pr])}}}}}, data}
 
           query =~ "SymphonyPipelineViewer" ->
             {{:ok, %{status: 200, body: %{"data" => %{"viewer" => %{"login" => "agent"}}}}}, data}
@@ -1806,7 +1806,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
               "body" => ""
             }
 
-            {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [pr]}}}}}}, data}
+            {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([pr])}}}}}, data}
 
           query =~ "SymphonyPipelineReportComments" ->
             comments = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
@@ -2137,7 +2137,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     request_fun = fn query, variables, _settings ->
       cond do
         query =~ "pullRequests" ->
-          {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => []}}}}}}
+          {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([])}}}}}
 
         query =~ "SymphonyPipelineRepository" ->
           {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"id" => "R_octopus"}}}}}
@@ -2158,7 +2158,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     request_fun = fn query, _variables, _settings ->
       assert query =~ "pullRequests"
-      {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => []}}}}}}
+      {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([])}}}}}
     end
 
     assert {:error, :github_pull_request_body_required} =
@@ -2174,17 +2174,30 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     settings = tracker_settings()
     issue = %SymphonyElixir.Tracker.Issue{id: "octo/app#7", branch_name: "symphony/octo-app-7", native_ref: %{repository: "octo/app"}}
     attrs = %{branch: issue.branch_name, base: "main", sha: "sha-seven", body: "Fixes #7\n\nDescription"}
+    truncated_nodes = Enum.map(1..100, &(pipeline_pr(issue, "") |> Map.merge(%{"number" => &1, "state" => "CLOSED"})))
 
     lookup_results = [
       {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{}}}}}},
       {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => "incomplete"}}}}}},
+      {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => []}}}}}},
       {:ok,
        %{
          status: 200,
          body: %{
            "data" => %{
              "repository" => %{
-               "pullRequests" => %{"nodes" => [pipeline_pr(issue, "body") |> Map.put("headRefName", "symphony/wrong-issue")]}
+               "pullRequests" => %{"nodes" => truncated_nodes, "pageInfo" => %{"hasNextPage" => true}}
+             }
+           }
+         }
+       }},
+      {:ok,
+       %{
+         status: 200,
+         body: %{
+           "data" => %{
+             "repository" => %{
+               "pullRequests" => pipeline_pull_request_connection([pipeline_pr(issue, "body") |> Map.put("headRefName", "symphony/wrong-issue")])
              }
            }
          }
@@ -2200,6 +2213,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
         cond do
           query =~ "SymphonyPipelinePullRequest" ->
+            assert query =~ "pageInfo { hasNextPage }"
             lookup_result
 
           query =~ "SymphonyPipelineRepository" ->
@@ -2234,7 +2248,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       assert query =~ "states: [OPEN, CLOSED, MERGED]"
       assert variables == %{"owner" => "octo", "name" => "app", "branch" => issue.branch_name, "base" => "main"}
 
-      {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [merged_pr]}}}}}}
+      {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([merged_pr])}}}}}
     end
 
     assert {:ok, %{merged: true, state: "MERGED", base: "main"}} =
@@ -2255,7 +2269,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
         if query =~ "pullRequests" do
           pr = pipeline_pr(issue, existing_body)
-          {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [pr]}}}}}}
+          {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([pr])}}}}}
         else
           assert should_update?
           assert query =~ "updatePullRequest"
@@ -2285,7 +2299,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
       pr = pipeline_pr(issue, "<!-- symphony:delivery:start -->\n\nOld report\n<!-- symphony:delivery:end -->")
       pr = Map.put(pr, "headRefOid", "stale-sha")
-      {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [pr]}}}}}}
+      {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([pr])}}}}}
     end
 
     assert {:error, :pull_request_head_sha_mismatch} =
@@ -2816,7 +2830,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
                  assert variables["owner"] == owner
                  assert variables["name"] == repository
                  assert variables["branch"] == issue.branch_name
-                 {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [pipeline_pr(issue, "")]}}}}}}
+                 connection = pipeline_pull_request_connection([pipeline_pr(issue, "")])
+                 {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => connection}}}}}
                end)
 
       assert pull_request.branch == issue.branch_name
@@ -3058,7 +3073,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
             "body" => ""
           }
 
-          body = %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [merged_pull_request]}}}}
+          body = %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([merged_pull_request])}}}
           {:ok, %{status: 200, body: body}}
 
         true ->
@@ -3112,7 +3127,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     }
 
     current_ref = merge_gate_base_ref(current_base_sha)
-    body = %{"data" => %{"repository" => %{"ref" => current_ref, "pullRequests" => %{"nodes" => [pull_request]}}}}
+    body = %{"data" => %{"repository" => %{"ref" => current_ref, "pullRequests" => pipeline_pull_request_connection([pull_request])}}}
     {:ok, %{status: 200, body: body}}
   end
 
@@ -3267,6 +3282,9 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "body" => body
     }
   end
+
+  defp pipeline_pull_request_connection(nodes),
+    do: %{"nodes" => nodes, "pageInfo" => %{"hasNextPage" => false}}
 
   defp issue_item(repository, number, status, issue_state) do
     item = issue_item(repository, number, status)
