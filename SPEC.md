@@ -175,7 +175,8 @@ Fields:
 - `title` (string)
 - `description` (string or null)
 - `priority` (integer or null)
-  - Lower numbers are higher priority in dispatch sorting.
+  - Lower numbers are higher priority in dispatch sorting outside the GitHub Projects `Ready`
+    queue.
 - `state` (string)
   - REQUIRED current provider-native state name.
 - `branch_name` (string or null)
@@ -198,6 +199,9 @@ Fields:
   - The orchestrator still applies configured state, label, claim, retry, and concurrency rules.
 - `created_at` (timestamp or null)
 - `updated_at` (timestamp or null)
+- `ready_at` (timestamp or null)
+  - For a GitHub Projects item currently in `Ready`, the time its Status value last entered
+    `Ready`. It MUST NOT be inferred from issue creation or update time.
 
 #### 4.1.2 Workflow Definition
 
@@ -773,9 +777,11 @@ checked separately by the surrounding algorithm.
 
 Sorting order (stable intent):
 
-1. `priority` ascending for values `1..4`; all other integers and null sort after that bucket
-2. `created_at` oldest first; null sorts last
-3. `identifier` lexicographic tie-breaker
+1. For GitHub Projects items currently in `Ready`, `ready_at` oldest first; missing values sort
+   last. Priority and issue timestamps MUST NOT change the relative order of Ready items.
+2. Other items retain `priority` ascending for values `1..4`, then `created_at` oldest first; null
+   sorts last.
+3. `identifier` lexicographic tie-breaker.
 
 ### 8.3 Concurrency Control
 
@@ -1302,10 +1308,12 @@ Adapter output MUST satisfy Section 4.1.1. In addition:
 - `labels` MUST be trimmed, lowercased strings; blank labels MUST be dropped and duplicate labels
   SHOULD be removed.
 - `priority` MUST be an integer or null.
-- The scheduler ranks priorities `1..4` before null/unknown values; other integers sort with
-  null/unknown unless an implementation documents a different mapping.
+- The scheduler ranks priorities `1..4` before null/unknown values for non-Ready work; priority
+  MUST NOT affect ordering among GitHub Projects items in `Ready`.
 - `created_at` and `updated_at` MUST represent parsed RFC 3339 instants or null; the in-memory
   timestamp type is implementation-defined.
+- `ready_at` MUST represent the parsed time of the current GitHub Projects Status field value for a
+  `Ready` item, or null when unavailable; it MUST NOT be inferred from the linked issue timestamps.
 - Unusable provider values for nullable fields MAY normalize to `null`. Unusable best-effort
   collection entries MAY be dropped; if no usable entries remain, use an empty list. These
   fallbacks MUST NOT be used for `id`, `identifier`, `title`, `state`, or explicit
@@ -2216,7 +2224,9 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
 
-- Dispatch sort order is priority then oldest creation time
+- GitHub Projects `Ready` issues sort by the oldest Status value update time; priority and issue
+  creation time do not affect their relative order
+- Other issues sort by priority then oldest creation time
 - `dispatchable=false` issues are not eligible
 - Required-label filtering is case-insensitive and applies after adapter normalization
 - Active-state issue refresh updates running entry state

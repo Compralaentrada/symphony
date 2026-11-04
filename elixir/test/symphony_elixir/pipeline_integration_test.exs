@@ -80,6 +80,71 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     stop_orchestrator(orchestrator)
   end
 
+  test "concurrent poll events reserve the global slot and keep one owner per task generation" do
+    issues = [issue("octo/app#801", 801), issue("octo/app#802", 802)]
+    table = start_board(issues, %{})
+    pipeline_database!(table, poll_interval_ms: 60_000, max_concurrent_agents: 1)
+    orchestrator = start_orchestrator(HoldingAgent)
+    on_exit(fn -> stop_holding_orchestrator(orchestrator) end)
+
+    assert await(fn -> Enum.any?(issues, &(lookup(table, {:held_agent_pid, &1.id}) != nil)) end)
+
+    active_issue = Enum.find(issues, &(lookup(table, {:held_agent_pid, &1.id}) != nil))
+    waiting_issue = Enum.find(issues, &(&1.id != active_issue.id))
+    held_agent = lookup(table, {:held_agent_pid, active_issue.id})
+    initial_refreshes = lookup(table, :fetch_issues_by_ids_calls) || 0
+
+    1..12
+    |> Task.async_stream(fn _ -> send(orchestrator, :run_poll_cycle) end, max_concurrency: 12)
+    |> Enum.to_list()
+
+    assert await(fn -> (lookup(table, :fetch_issues_by_ids_calls) || 0) >= initial_refreshes + 12 end)
+
+    state = :sys.get_state(orchestrator)
+    assert map_size(state.running) == 1
+    assert Map.has_key?(state.running, active_issue.id)
+    refute Map.has_key?(state.running, waiting_issue.id)
+    assert MapSet.equal?(state.claimed, MapSet.new([active_issue.id]))
+    assert lookup(table, {:agent_calls, active_issue.id, :build}) == 1
+    assert (lookup(table, {:agent_calls, waiting_issue.id, :build}) || 0) == 0
+    assert {:ok, %{"generation" => 1, "attempts" => %{"build" => 1}}} = Store.get_task(active_issue.id)
+
+    send(held_agent, :release)
+    assert await(fn -> not Process.alive?(held_agent) end)
+  end
+
+  test "concurrent polls keep one attempt per task generation when slots remain free" do
+    issue = issue("octo/app#803", 803)
+    table = start_board([issue], %{})
+    pipeline_database!(table, poll_interval_ms: 60_000, max_concurrent_agents: 3)
+    orchestrator = start_orchestrator(HoldingAgent)
+    on_exit(fn -> stop_holding_orchestrator(orchestrator) end)
+
+    assert await(fn -> lookup(table, {:held_agent_pid, issue.id}) != nil end)
+
+    held_agent = lookup(table, {:held_agent_pid, issue.id})
+    initial_refreshes = lookup(table, :fetch_issues_by_ids_calls) || 0
+
+    1..12
+    |> Task.async_stream(fn _ -> send(orchestrator, :run_poll_cycle) end, max_concurrency: 12)
+    |> Enum.to_list()
+
+    assert await(fn -> (lookup(table, :fetch_issues_by_ids_calls) || 0) >= initial_refreshes + 12 end)
+
+    state = :sys.get_state(orchestrator)
+    assert state.max_concurrent_agents == 3
+    assert map_size(state.running) == 1
+    assert Map.has_key?(state.running, issue.id)
+    assert MapSet.equal?(state.claimed, MapSet.new([issue.id]))
+    assert lookup(table, {:agent_calls, issue.id, :build}) == 1
+    assert {:ok, %{"generation" => 1, "attempts" => %{"build" => attempt}}} = Store.get_task(issue.id)
+    assert state.running[issue.id].pipeline_attempt == attempt
+    assert Store.agent_lease_active?(issue.id, 1, "build", attempt)
+
+    send(held_agent, :release)
+    assert await(fn -> not Process.alive?(held_agent) end)
+  end
+
   test "a human status change during skill preflight prevents the stale result from claiming" do
     issue = issue("octo/app#16", 16)
     table = start_board([issue], %{})
@@ -122,7 +187,11 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
     assert {:ok, task, "build"} = Pipeline.prepare(issue)
     expected_skills = task["effective_config"]["skills"]
-    assert [%{"name" => "ponytail", "version" => "v5.3.2"}] = expected_skills["build"]
+
+    assert [
+             %{"name" => "ponytail", "version" => "v5.3.2"},
+             %{"name" => "tdd-autonomous", "version" => "v1.0.0"}
+           ] = expected_skills["build"]
 
     set_project_state(table, issue.id, "Backlog")
 
@@ -141,10 +210,15 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     table = start_board([issue], %{})
     pipeline_database!(table)
     workspace = Path.join(Config.local_workspace_root(), Workspace.workspace_key(issue))
+    skill_root = Path.expand("../../..", __DIR__) |> Path.join(".agents/skills")
+
+    for skill <- ["ponytail", "tdd-autonomous"] do
+      skill_dir = Path.join([workspace, ".agents", "skills", skill])
+      File.mkdir_p!(Path.dirname(skill_dir))
+      File.cp_r!(Path.join(skill_root, skill), skill_dir)
+    end
+
     skill_dir = Path.join([workspace, ".agents", "skills", "ponytail"])
-    source = Path.expand("../../..", __DIR__) |> Path.join(".agents/skills/ponytail")
-    File.mkdir_p!(Path.dirname(skill_dir))
-    File.cp_r!(source, skill_dir)
     skill_path = Path.join(skill_dir, "SKILL.md")
     File.write!(skill_path, File.read!(skill_path) <> "\nchanged\n")
     on_exit(fn -> File.rm_rf!(workspace) end)
@@ -155,7 +229,19 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
     assert project_state(table, issue.id) == "Ready"
     assert lookup(table, {:agent_calls, issue.id, :build}) == nil
-    assert {:ok, %{"effective_config" => %{"skills" => %{"build" => [%{"version" => "v5.3.2"}]}}}} = Store.get_task(issue.id)
+
+    assert {:ok,
+            %{
+              "effective_config" => %{
+                "skills" => %{
+                  "build" => [
+                    %{"name" => "ponytail", "version" => "v5.3.2"},
+                    %{"name" => "tdd-autonomous", "version" => "v1.0.0"}
+                  ]
+                }
+              }
+            }} = Store.get_task(issue.id)
+
     assert {:ok, %{"skill_readiness" => %{"reason" => reason, "next_step" => next_step}}} = Store.get_task(issue.id)
     assert reason =~ "ponytail"
     assert next_step =~ "v5.3.2"
@@ -1646,7 +1732,12 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     Application.put_env(:symphony_elixir, :github_projects_client_module, __MODULE__.FakeClient)
     Application.put_env(:symphony_elixir, :pipeline_database_path, path)
     Application.put_env(:symphony_elixir, :pipeline_test_workspace, workspace)
-    write_pipeline_workflow!(Keyword.get(opts, :retry_backoff_ms, 1), Keyword.get(opts, :poll_interval_ms, 20))
+
+    write_pipeline_workflow!(
+      Keyword.get(opts, :retry_backoff_ms, 1),
+      Keyword.get(opts, :poll_interval_ms, 20),
+      Keyword.get(opts, :max_concurrent_agents, 5)
+    )
 
     on_exit(fn ->
       File.rm_rf(root)
@@ -1661,7 +1752,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     path
   end
 
-  defp write_pipeline_workflow!(retry_backoff_ms, poll_interval_ms) do
+  defp write_pipeline_workflow!(retry_backoff_ms, poll_interval_ms, max_concurrent_agents) do
     File.write!(Workflow.workflow_file_path(), """
     ---
     tracker:
@@ -1682,7 +1773,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     workspace:
       root: /tmp/symphony-pipeline-workspaces
     agent:
-      max_concurrent_agents: 5
+      max_concurrent_agents: #{max_concurrent_agents}
       max_turns: 2
       max_retry_backoff_ms: #{retry_backoff_ms}
     codex:
@@ -1706,6 +1797,15 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
   defp stop_orchestrator(pid) do
     if Process.alive?(pid), do: GenServer.stop(pid, :normal, 1_000)
+  end
+
+  defp stop_holding_orchestrator(pid) do
+    if Process.alive?(pid) do
+      state = :sys.get_state(pid)
+      Enum.each(state.running, fn {_issue_id, %{pid: child_pid}} -> send(child_pid, :release) end)
+    end
+
+    stop_orchestrator(pid)
   end
 
   defp refresh!(orchestrator, table) do

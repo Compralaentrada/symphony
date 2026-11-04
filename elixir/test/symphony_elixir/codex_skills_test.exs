@@ -21,6 +21,28 @@ defmodule SymphonyElixir.Codex.SkillsTest do
     assert :ok = Skills.ensure_available(workspace, issue)
   end
 
+  test "preflights autonomous TDD for Build in a prepared workspace" do
+    workspace = Path.join(System.tmp_dir!(), "codex-build-skills-#{System.unique_integer([:positive])}")
+    issue = %Issue{labels: ["backend"]}
+    on_exit(fn -> File.rm_rf(workspace) end)
+
+    copy_skills(workspace, Skills.select(issue, :build))
+
+    assert :ok = Skills.ensure_available(workspace, issue, :build)
+  end
+
+  test "autonomous TDD chooses and records public interfaces without human approval" do
+    repository = Path.expand("../../..", __DIR__)
+    skill_path = Path.join([repository, ".agents", "skills", "tdd-autonomous", "SKILL.md"])
+    skill = File.read!(skill_path)
+
+    assert skill =~ "public interface"
+    assert skill =~ "Record those interfaces"
+    assert skill =~ "do not ask for human approval"
+    assert skill =~ "fails because the behavior is not implemented"
+    assert skill =~ "confirm it passes"
+  end
+
   test "reports a missing required skill before Codex starts" do
     workspace = Path.join(System.tmp_dir!(), "codex-skills-missing-#{System.unique_integer([:positive])}")
     issue = %Issue{labels: ["ready-for-agent", "customer-facing"]}
@@ -92,7 +114,7 @@ defmodule SymphonyElixir.Codex.SkillsTest do
     skill_dir = Path.join([workspace, ".agents", "skills", "ponytail"])
     on_exit(fn -> File.rm_rf(workspace) end)
 
-    copy_skills(workspace, ["ponytail"])
+    copy_skills(workspace, ["ponytail", "tdd-autonomous"])
     skill_path = Path.join(skill_dir, "SKILL.md")
     File.write!(skill_path, File.read!(skill_path) <> "\nchanged\n")
 
@@ -101,7 +123,7 @@ defmodule SymphonyElixir.Codex.SkillsTest do
 
     assert output =~ "Skill file checksum mismatch"
 
-    copy_skills(workspace, ["ponytail"])
+    copy_skills(workspace, ["ponytail", "tdd-autonomous"])
     checksum_path = Path.join(skill_dir, "CHECKSUMS.sha256")
     File.write!(checksum_path, File.read!(checksum_path) <> "\n")
 
@@ -115,9 +137,14 @@ defmodule SymphonyElixir.Codex.SkillsTest do
     issue = %Issue{labels: ["customer-facing"]}
     config = Skills.effective_config(issue)
 
-    assert [%{"name" => "ponytail", "version" => "v5.3.2", "fingerprint" => fingerprint}, %{"name" => "humanizer", "version" => "v3.1.0"}] = config["skills"]["build"]
+    assert [
+             %{"name" => "ponytail", "version" => "v5.3.2", "fingerprint" => fingerprint},
+             %{"name" => "tdd-autonomous", "version" => "v1.0.0", "fingerprint" => tdd_fingerprint},
+             %{"name" => "humanizer", "version" => "v3.1.0"}
+           ] = config["skills"]["build"]
 
     assert fingerprint == "c45df1e5846a557d1d4e1ccf103d5f7ef301de1e7d75d4d66b39aebd47a4497a"
+    assert tdd_fingerprint == "35f53a76898dc0bc6507f58f70611f14caf842da1be7bfae389c4fbe275c5b15"
     assert [%{"name" => "humanizer", "version" => "v3.1.0"}] = config["skills"]["qa"]
     assert Skills.attempt_snapshot(issue, %{"effective_config" => config}, :build) == config["skills"]["build"]
     assert Skills.attempt_snapshot(issue, nil, nil) == Skills.snapshot_for_phase(issue, nil)
@@ -164,7 +191,7 @@ defmodule SymphonyElixir.Codex.SkillsTest do
   test "selects pipeline skills by fixed phase and applicable task labels" do
     backend_issue = %Issue{labels: ["backend"]}
 
-    assert Skills.select(backend_issue, :build) == ["ponytail"]
+    assert Skills.select(backend_issue, :build) == ["ponytail", "tdd-autonomous"]
     assert Skills.select(backend_issue, :qa) == []
     assert Skills.select(backend_issue, :review) == []
     assert Skills.select(backend_issue, :diagnostic) == []
@@ -172,9 +199,25 @@ defmodule SymphonyElixir.Codex.SkillsTest do
 
     frontend_copy_issue = %Issue{labels: ["frontend", "customer-facing"]}
 
-    assert Skills.select(frontend_copy_issue, :build) == ["ponytail", "humanizer"]
+    assert Skills.select(frontend_copy_issue, :build) == ["ponytail", "tdd-autonomous", "humanizer"]
     assert Skills.select(frontend_copy_issue, :qa) == ["humanizer"]
     assert Skills.select(frontend_copy_issue, :review) == ["humanizer"]
+  end
+
+  test "selects autonomous TDD for code, docs, and mixed Build tasks, but not text-only tasks" do
+    assert Skills.select(%Issue{labels: ["backend"]}, :build) == ["ponytail", "tdd-autonomous"]
+    assert Skills.select(%Issue{labels: ["writing-only"]}, :build) == []
+    assert Skills.select(%Issue{labels: ["text-only"]}, :build) == []
+    assert Skills.select(%Issue{labels: ["docs"]}, :build) == ["ponytail", "tdd-autonomous"]
+
+    assert Skills.select(%Issue{labels: ["backend", "docs"]}, :build) == [
+             "ponytail",
+             "tdd-autonomous"
+           ]
+
+    assert Skills.select(%Issue{labels: ["writing-only", "user-facing"]}, :build) == ["humanizer"]
+    assert Skills.select(%Issue{labels: ["backend"]}, :qa) == []
+    assert Skills.select(%Issue{labels: ["backend"]}, :review) == []
   end
 
   defp copy_skills(workspace, skills) do
