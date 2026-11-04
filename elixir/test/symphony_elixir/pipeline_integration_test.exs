@@ -1449,7 +1449,11 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
         missing_check.id => %{
           build: [build("sha-six-old", missing_check.id), build("sha-six-fixed", missing_check.id)],
           qa: [qa_missing_check("sha-six-old"), qa("sha-six-fixed")],
-          review: [Map.put(review("sha-six-fixed"), "resolutions", ["required-check:sh ./check.sh"])]
+          review: [
+            Map.put(review("sha-six-fixed"), "resolutions", [
+              %{"id" => "required-check:sh ./check.sh", "status" => "resolved", "evidence" => "The configured check passed after QA correction.", "reason" => nil}
+            ])
+          ]
         },
         unavailable_check.id => %{build: [build("sha-ten", unavailable_check.id)], qa: [qa_missing_check("sha-ten")]}
       })
@@ -1745,7 +1749,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
         issue.id => %{
           build: [build("dirty", issue.id), build("clean", issue.id)],
           qa: [qa("dirty"), qa("clean")],
-          review: [Map.put(review("clean"), "resolutions", ["workspace-dirty"])]
+          review: [Map.put(review("clean"), "resolutions", [%{"id" => "workspace-dirty", "status" => "resolved", "evidence" => "Review confirmed the accepted workspace is clean.", "reason" => nil}])]
         }
       })
 
@@ -1810,7 +1814,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
           qa: [qa_with_finding, qa("fixed"), qa("fixed-two")],
           review: [
             review("fixed"),
-            Map.put(review("fixed-two"), "resolutions", [finding["id"] <> " — resolved: confirmed in review."])
+            Map.put(review("fixed-two"), "resolutions", [%{"id" => finding["id"], "status" => "resolved", "evidence" => "Confirmed in review.", "reason" => nil}])
           ]
         }
       })
@@ -1841,7 +1845,10 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
         issue.id => %{
           build: [build("first", issue.id), build("fixed", issue.id)],
           qa: [qa("first"), qa("fixed")],
-          review: [review_with_finding, Map.put(review("fixed"), "resolutions", [finding["id"]])]
+          review: [
+            review_with_finding,
+            Map.put(review("fixed"), "resolutions", [%{"id" => finding["id"], "status" => "resolved", "evidence" => "The affected path now passes review.", "reason" => nil}])
+          ]
         }
       })
 
@@ -2070,7 +2077,8 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
       "findings" => [],
       "next_step" => "Run autonomous review.",
       "reason" => nil,
-      "sha" => sha
+      "sha" => sha,
+      "base_sha" => "base-sha"
     }
   end
 
@@ -2143,6 +2151,15 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
       "summary" => "No defects found.",
       "findings" => [],
       "resolutions" => [],
+      "base_sha" => "base-sha",
+      "qa_verification" => %{
+        "command" => "mix test test/symphony_elixir/qa_report_test.exs",
+        "status" => "passed",
+        "evidence" => "Host replay passed on #{sha}.",
+        "sha" => sha,
+        "base_sha" => "base-sha",
+        "finding_id" => nil
+      },
       "next_step" => "Wait for human review.",
       "sha" => sha
     }
@@ -2313,7 +2330,25 @@ defmodule SymphonyElixir.PipelineIntegrationTest.PausedReviewAgent do
     if Keyword.fetch!(opts, :phase) == :review do
       task = Keyword.fetch!(opts, :pipeline_task)
       context = %{issue: issue, lane: :review, task: task, generation: Keyword.fetch!(opts, :generation), attempt: Keyword.fetch!(opts, :phase_attempt)}
-      report = %{"outcome" => "passed", "summary" => "Reviewed.", "sha" => task["current_sha"], "findings" => [], "resolutions" => [], "next_step" => "Merge."}
+
+      report = %{
+        "outcome" => "passed",
+        "summary" => "Reviewed.",
+        "sha" => task["current_sha"],
+        "base_sha" => task["base_sha"],
+        "qa_verification" => %{
+          "command" => "mix test test/symphony_elixir/qa_report_test.exs",
+          "status" => "passed",
+          "evidence" => "Host replay passed.",
+          "sha" => task["current_sha"],
+          "base_sha" => task["base_sha"],
+          "finding_id" => nil
+        },
+        "findings" => [],
+        "resolutions" => [],
+        "next_step" => "Merge."
+      }
+
       {:ok, passed} = FakeClient.workflow_operation(context, "handoff", %{"report" => report})
       table = Application.fetch_env!(:symphony_elixir, :pipeline_test_board)
       :ets.insert(table, {{:paused_review, issue.id}, self()})
@@ -2411,6 +2446,16 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
     end
   end
 
+  defp prepare_report(table, issue, :review, report, opts, _workspace) do
+    task = Keyword.get(opts, :pipeline_task, %{})
+    sha = :ets.lookup_element(table, {:remote_sha, issue.id}, 2)
+    base_sha = task["base_sha"] || report["base_sha"]
+    verification = report["qa_verification"] || %{}
+    verification = Map.merge(verification, %{"status" => "passed", "sha" => sha, "base_sha" => base_sha})
+
+    {:ok, Map.merge(report, %{"sha" => sha, "base_sha" => base_sha, "qa_verification" => verification}), [], []}
+  end
+
   defp prepare_report(table, issue, :qa, report, opts, workspace) do
     if :ets.lookup(table, {:dirty_once, issue.id}) != [] do
       :ets.delete(table, {:dirty_once, issue.id})
@@ -2504,9 +2549,6 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
     do: Map.merge(check, %{"command" => command, "result" => String.trim(output)})
 
   defp update_qa_check(check, _command, _output), do: check
-
-  defp prepare_report(table, issue, :review, report, _opts, _workspace),
-    do: {:ok, Map.put(report, "sha", :ets.lookup_element(table, {:remote_sha, issue.id}, 2)), [], []}
 
   defp ensure_delivery_commit(workspace, sha) do
     delivery_path = Path.join(workspace, "delivery.txt")
@@ -2605,7 +2647,8 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
       attempt: Keyword.get(opts, :phase_attempt),
       tracker_kind: "github_projects",
       merge_policy: Map.get(SymphonyElixir.Config.settings!().tracker.provider, "merge_policy", "human"),
-      host_checks: host_checks
+      host_checks: host_checks,
+      review_verification: Keyword.get(opts, :review_verification)
     }
 
     case AgentTool.execute(
@@ -2897,6 +2940,9 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
     end
   end
 
+  defp handoff_pull_request(_issue, _context, %{"outcome" => outcome}) when outcome in ["blocked", "no_changes"],
+    do: {:ok, nil}
+
   defp handoff_pull_request(issue, context, %{"outcome" => "ready", "sha" => sha} = report)
        when context.lane in [:build, :individual] do
     table = table()
@@ -2930,22 +2976,19 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
     end
   end
 
+  defp handoff_pull_request(issue, _context, _report) do
+    case pull_request(issue) do
+      {:ok, %{} = pr} -> {:ok, pr}
+      {:ok, nil} -> {:error, :pull_request_not_found}
+    end
+  end
+
   defp validate_fake_existing_pull_request(pr, report, task) do
     cond do
       pr.sha != report["sha"] -> {:error, :pull_request_head_sha_mismatch}
       is_binary(task["branch"]) and pr.branch != task["branch"] -> {:error, :pull_request_branch_mismatch}
       is_binary(task["base_branch"]) and pr.base != task["base_branch"] -> {:error, :pull_request_base_mismatch}
       true -> {:ok, pr}
-    end
-  end
-
-  defp handoff_pull_request(_issue, _context, %{"outcome" => outcome}) when outcome in ["blocked", "no_changes"],
-    do: {:ok, nil}
-
-  defp handoff_pull_request(issue, _context, _report) do
-    case pull_request(issue) do
-      {:ok, %{} = pr} -> {:ok, pr}
-      {:ok, nil} -> {:error, :pull_request_not_found}
     end
   end
 

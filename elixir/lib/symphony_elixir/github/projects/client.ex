@@ -438,7 +438,22 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp valid_findings?(findings), do: is_list(findings) and Enum.all?(findings, &(is_map(&1) and is_binary(&1["id"])))
-  defp valid_resolutions?(resolutions), do: is_list(resolutions) and Enum.all?(resolutions, &is_binary/1)
+
+  defp valid_resolutions?(resolutions) do
+    is_list(resolutions) and Enum.all?(resolutions, &valid_resolution?/1)
+  end
+
+  defp valid_resolution?(resolution) when is_binary(resolution), do: true
+
+  defp valid_resolution?(%{"id" => id, "status" => "resolved", "evidence" => evidence, "reason" => nil}),
+    do: present_report_value?(id) and present_report_value?(evidence)
+
+  defp valid_resolution?(%{"id" => id, "status" => status, "evidence" => nil, "reason" => reason})
+       when status in ["open", "not_applicable"],
+       do: present_report_value?(id) and present_report_value?(reason)
+
+  defp valid_resolution?(_resolution), do: false
+
   defp valid_checks?("qa", checks), do: is_list(checks) and Enum.all?(checks, &is_map/1)
   defp valid_checks?(_phase, _checks), do: true
 
@@ -1166,50 +1181,62 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp normalize_agent_report(report, "qa", context) do
     checks = context[:host_checks] |> normalize_report_list() |> Enum.map(&Map.put(&1, "source", "host"))
-    required = get_in(context, [:task, "required_checks"]) || []
-    report = Map.put(report, "host_checks", checks)
-
-    normalized =
-      cond do
-        report["outcome"] == "blocked" ->
-          report
-
-        required_checks_status(required, checks) == :unavailable ->
-          report
-          |> Map.put("outcome", "blocked")
-          |> Map.put("summary", qa_text(context, :checks_unavailable))
-          |> Map.put("reason", qa_text(context, :checks_unavailable))
-          |> Map.put("next_step", qa_text(context, :checks_recovery))
-
-        required_checks_status(required, checks) == :failed ->
-          report
-          |> Map.put("outcome", "changes_requested")
-          |> Map.put("summary", qa_text(context, :checks_failed))
-          |> Map.put("next_step", qa_text(context, :next_step))
-
-        not required_checks_passed?(required, checks) ->
-          report
-          |> Map.put("outcome", "changes_requested")
-          |> Map.put("summary", qa_text(context, :checks_failed))
-
-        report["outcome"] == "passed" and report["findings"] not in [nil, []] ->
-          Map.merge(report, %{
-            "outcome" => "changes_requested",
-            "summary" => qa_text(context, :findings),
-            "next_step" => qa_text(context, :next_step)
-          })
-
-        true ->
-          report
-      end
-
-    normalized
+    task = context[:task] || %{}
+    required = task["required_checks"] || []
+    report = report |> Map.put("host_checks", checks) |> Map.merge(Map.take(task, ["base_sha"]))
+    normalize_qa_outcome(report, required, checks, context)
   end
 
   defp normalize_agent_report(report, "review", context) do
-    resolutions = report["resolutions"] || []
+    report
+    |> add_review_history(context)
+    |> add_review_verification(context)
+    |> normalize_review_outcome(context)
+  end
+
+  defp normalize_agent_report(report, _lane, _context), do: report
+
+  defp normalize_qa_outcome(report, required, checks, context) do
+    check_status = required_checks_status(required, checks)
+
+    cond do
+      report["outcome"] == "blocked" ->
+        report
+
+      check_status == :unavailable ->
+        report
+        |> Map.put("outcome", "blocked")
+        |> Map.put("summary", qa_text(context, :checks_unavailable))
+        |> Map.put("reason", qa_text(context, :checks_unavailable))
+        |> Map.put("next_step", qa_text(context, :checks_recovery))
+
+      check_status == :failed ->
+        report
+        |> Map.put("outcome", "changes_requested")
+        |> Map.put("summary", qa_text(context, :checks_failed))
+        |> Map.put("next_step", qa_text(context, :next_step))
+
+      not required_checks_passed?(required, checks) ->
+        report
+        |> Map.put("outcome", "changes_requested")
+        |> Map.put("summary", qa_text(context, :checks_failed))
+
+      report["outcome"] == "passed" and report["findings"] not in [nil, []] ->
+        Map.merge(report, %{
+          "outcome" => "changes_requested",
+          "summary" => qa_text(context, :findings),
+          "next_step" => qa_text(context, :next_step)
+        })
+
+      true ->
+        report
+    end
+  end
+
+  defp add_review_history(report, context) do
     task = context[:task] || %{}
     prior_findings = task["prior_findings"] || []
+    resolutions = normalize_review_resolutions(report["resolutions"] || [], prior_findings)
 
     findings =
       ((report["findings"] || []) ++ prior_findings)
@@ -1218,41 +1245,159 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
     metadata =
       task
-      |> Map.take(["branch", "base_branch", "pr_number"])
+      |> Map.take(["branch", "base_branch", "base_sha", "pr_number"])
       |> Map.merge(if(is_binary(task["current_sha"]), do: %{"sha" => task["current_sha"]}, else: %{}))
 
-    report = report |> Map.put("findings", findings) |> Map.merge(metadata)
-
-    normalized =
-      if report["outcome"] == "passed" and findings != [],
-        do: Map.put(report, "outcome", "changes_requested"),
-        else: report
-
-    normalized
+    report |> Map.put("findings", findings) |> Map.put("resolutions", resolutions) |> Map.merge(metadata)
   end
 
-  defp normalize_agent_report(report, _lane, _context), do: report
+  defp add_review_verification(report, context) do
+    case context[:review_verification] do
+      %{"status" => "passed"} = verification ->
+        Map.put(report, "qa_verification", verification)
+
+      %{"status" => status, "finding_id" => finding_id, "evidence" => evidence} = verification
+      when status in ["failed", "unavailable"] ->
+        report
+        |> Map.put("qa_verification", verification)
+        |> add_review_verification_finding(finding_id, evidence, context)
+
+      _ ->
+        report
+    end
+  end
+
+  defp normalize_review_outcome(%{"outcome" => outcome, "findings" => [_ | _]} = report, context)
+       when outcome in ["passed", "merged"] do
+    report
+    |> Map.put("outcome", "changes_requested")
+    |> Map.put("summary", review_changes_requested_text(context))
+    |> Map.put("next_step", review_next_step_text(context))
+  end
+
+  defp normalize_review_outcome(report, _context), do: report
+
+  defp normalize_review_resolutions(resolutions, prior_findings) do
+    resolutions = Enum.map(resolutions, &normalize_review_resolution/1)
+
+    prior_findings
+    |> Enum.reduce(resolutions, fn finding, acc ->
+      id = finding["id"]
+
+      if Enum.any?(acc, &(&1["id"] == id)) do
+        acc
+      else
+        acc ++ [%{"id" => id, "status" => "open", "evidence" => nil, "reason" => "No resolution evidence was provided; this finding remains open."}]
+      end
+    end)
+    |> Enum.uniq_by(& &1["id"])
+  end
+
+  defp normalize_review_resolution(%{"id" => id, "status" => "resolved", "evidence" => evidence} = resolution)
+       when is_binary(id) and is_binary(evidence) and evidence != "",
+       do: Map.merge(%{"id" => id, "status" => "resolved", "evidence" => evidence, "reason" => nil}, Map.take(resolution, ["id", "status", "evidence", "reason"]))
+
+  defp normalize_review_resolution(%{"id" => id, "status" => status, "reason" => reason} = resolution)
+       when is_binary(id) and status in ["open", "not_applicable"] and is_binary(reason) and reason != "",
+       do: Map.merge(%{"id" => id, "status" => status, "evidence" => nil, "reason" => reason}, Map.take(resolution, ["id", "status", "evidence", "reason"]))
+
+  defp normalize_review_resolution(value) when is_binary(value) do
+    case Regex.run(~r/\A(.+?) — resolved:\s*(.+)\z/u, value) || Regex.run(~r/\A(.+?): Resuelto;\s*(.+)\z/u, value) do
+      [_, id, evidence] -> %{"id" => id, "status" => "resolved", "evidence" => evidence, "reason" => nil}
+      _ -> %{"id" => value, "status" => "open", "evidence" => nil, "reason" => "No resolution evidence was provided; this finding remains open."}
+    end
+  end
+
+  defp normalize_review_resolution(_resolution), do: %{"id" => "invalid-resolution", "status" => "open", "evidence" => nil, "reason" => "The resolution record was invalid and cannot close a finding."}
+
+  defp add_review_verification_finding(report, finding_id, evidence, context) do
+    finding_id = if is_binary(finding_id) and finding_id != "", do: finding_id, else: "QA-EVIDENCE"
+    evidence = if is_binary(evidence) and evidence != "", do: evidence, else: "The QA verification evidence is unavailable."
+    finding = %{"id" => finding_id, "reproduction" => evidence, "criterion" => "The current QA verification command passes on the accepted head and base SHA."}
+
+    findings = [finding | Enum.reject(report["findings"] || [], &(&1["id"] == finding_id))]
+    resolutions = Enum.reject(report["resolutions"] || [], &(&1["id"] == finding_id))
+    resolution = %{"id" => finding_id, "status" => "open", "evidence" => nil, "reason" => evidence}
+
+    report
+    |> Map.put("findings", findings)
+    |> Map.put("resolutions", resolutions ++ [resolution])
+    |> Map.put("outcome", "changes_requested")
+    |> Map.put("summary", review_changes_requested_text(context))
+    |> Map.put("next_step", review_next_step_text(context))
+  end
+
+  defp review_changes_requested_text(%{report_locale: :es}), do: "La validación de QA encontró evidencia que debe corregirse antes de aprobar la PR."
+  defp review_changes_requested_text(_context), do: "Review found QA evidence that must be corrected before approving the pull request."
+  defp review_next_step_text(%{report_locale: :es}), do: "Corrige o vuelve a registrar la evidencia de QA y repite Build, QA y Review."
+  defp review_next_step_text(_context), do: "Correct or resubmit the QA evidence, then rerun Build, QA, and Review."
 
   defp validate_agent_handoff_report("qa", report, context) do
     task = context[:task] || %{}
     required = task["required_checks"] || []
 
-    cond do
-      not qa_sha_transition_valid?(report, task) ->
-        {:error, :qa_report_sha_mismatch}
+    with :ok <- validate_qa_handoff_identity(report, task),
+         :ok <- validate_agent_report_shape(report) do
+      validate_qa_report_content(report, required, context)
+    end
+  end
 
-      not valid_agent_report?(report) ->
-        {:error, :invalid_qa_report}
+  defp validate_agent_handoff_report("review", report, context) do
+    task = context[:task] || %{}
+    verification = context[:review_verification]
 
-      not QAReport.valid?(report, required, context[:issue] && context[:issue].description) ->
-        {:error, :invalid_qa_report}
-
-      true ->
-        :ok
+    with :ok <- validate_review_resolutions(report) do
+      validate_review_approval_evidence(report, task, verification, context)
     end
   end
 
   defp validate_agent_handoff_report(_lane, _report, _context), do: :ok
+
+  defp validate_qa_handoff_identity(report, task) do
+    cond do
+      not qa_sha_transition_valid?(report, task) -> {:error, :qa_report_sha_mismatch}
+      report["outcome"] != "blocked" and not matches_expected_value?(report["base_sha"], task["base_sha"]) -> {:error, :qa_report_base_sha_mismatch}
+      true -> :ok
+    end
+  end
+
+  defp validate_agent_report_shape(report),
+    do: if(valid_agent_report?(report), do: :ok, else: {:error, :invalid_qa_report})
+
+  defp validate_qa_report_content(report, required, context) do
+    description = context[:issue] && context[:issue].description
+    if QAReport.valid?(report, required, description), do: :ok, else: {:error, :invalid_qa_report}
+  end
+
+  defp validate_review_resolutions(report) do
+    if valid_resolutions?(report["resolutions"] || []), do: :ok, else: {:error, :invalid_review_resolutions}
+  end
+
+  defp validate_review_approval_evidence(report, task, verification, _context) do
+    if report["outcome"] in ["passed", "merged"] do
+      cond do
+        not is_map(verification) or verification["status"] != "passed" ->
+          {:error, :review_qa_verification_not_passed}
+
+        not matches_expected_value?(verification["sha"], task["current_sha"]) ->
+          {:error, :review_qa_verification_sha_mismatch}
+
+        not matches_expected_value?(report["base_sha"], task["base_sha"]) ->
+          {:error, :review_base_sha_mismatch}
+
+        not matches_expected_value?(verification["base_sha"], task["base_sha"]) ->
+          {:error, :review_base_sha_mismatch}
+
+        true ->
+          :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp matches_expected_value?(value, expected) when is_binary(expected), do: value == expected
+  defp matches_expected_value?(_value, _expected), do: false
 
   defp qa_sha_transition_valid?(%{"outcome" => "blocked"}, _task), do: true
 
@@ -1291,6 +1436,11 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   @spec normalize_agent_report_for_test(map(), String.t(), map()) :: map()
   def normalize_agent_report_for_test(report, lane, context),
     do: normalize_agent_report(report, lane, context)
+
+  @doc false
+  @spec validate_review_qa_report_for_test(map(), map(), String.t() | nil) :: :ok | {:error, term()}
+  def validate_review_qa_report_for_test(context, phase_reports, issue_description),
+    do: validate_review_qa_report(context, phase_reports, issue_description)
 
   defp handoff_source_status("review", _issue, current, target, %{statuses: %{human_review: target, review: review}} = settings) do
     allowed = if settings.merge_policy == "auto", do: [review], else: [target, review]
@@ -1377,29 +1527,35 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       {:ok, pr} ->
         task = context[:task] || %{}
         expected_sha = if to_string(context.lane) == "qa", do: report["sha"], else: task["current_sha"]
-        validate_existing_pull_request(pr, task, expected_sha)
+        expected_base_sha = if to_string(context.lane) in ["qa", "review"] and report["outcome"] == "passed", do: report["base_sha"]
+        validate_existing_pull_request(pr, task, expected_sha, expected_base_sha)
 
       {:error, _reason} = error ->
         error
     end
   end
 
-  defp validate_existing_pull_request(pr, task, expected_sha) do
-    cond do
-      is_binary(expected_sha) and pr.sha != expected_sha -> {:error, :pull_request_head_sha_mismatch}
-      is_binary(task["branch"]) and pr.branch != task["branch"] -> {:error, :pull_request_branch_mismatch}
-      is_binary(task["base_branch"]) and pr.base != task["base_branch"] -> {:error, :pull_request_base_mismatch}
-      true -> {:ok, pr_evidence(pr)}
+  defp validate_existing_pull_request(pr, task, expected_sha, expected_base_sha) do
+    with :ok <- validate_optional_pr_value(pr.sha, expected_sha, :pull_request_head_sha_mismatch),
+         :ok <- validate_optional_pr_value(pr.base_sha, expected_base_sha, :pull_request_base_sha_mismatch),
+         :ok <- validate_optional_pr_value(pr.branch, task["branch"], :pull_request_branch_mismatch),
+         :ok <- validate_optional_pr_value(pr.base, task["base_branch"], :pull_request_base_mismatch) do
+      {:ok, pr_evidence(pr)}
     end
   end
 
-  defp maybe_set_review_stage(issue, "review", %{"outcome" => outcome}, _pr, target, settings, tracker_settings, request_fun)
+  defp validate_optional_pr_value(_actual, expected, _reason) when not is_binary(expected), do: :ok
+  defp validate_optional_pr_value(actual, expected, _reason) when actual == expected, do: :ok
+  defp validate_optional_pr_value(_actual, _expected, reason), do: {:error, reason}
+
+  defp maybe_set_review_stage(issue, "review", %{"outcome" => outcome} = report, _pr, target, settings, tracker_settings, request_fun)
        when outcome in ["passed", "changes_requested", "failed", "defects_found"] do
     stage = if outcome == "passed", do: :ready, else: :draft
 
     with {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
          :ok <- handoff_source_status("review", issue, current, target, settings),
          {:ok, %{} = pr} <- pull_request(issue, settings, request_fun),
+         true <- outcome != "passed" or pr.base_sha == report["base_sha"],
          {:ok, updated} <- update_pull_request_stage(pr, stage, settings, request_fun) do
       {:ok, pr_evidence(updated)}
     end
@@ -1536,7 +1692,9 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          {:ok, report} <- decode_phase_report_comment(body),
          true <- report["outcome"] == "passed",
          true <- report["sha"] == task["current_sha"],
+         true <- is_binary(task["base_sha"]) and report["base_sha"] == task["base_sha"],
          true <- QAReport.valid?(report, task["required_checks"] || [], issue_description),
+         true <- report["verification_command"] in (task["required_checks"] || []),
          true <- required_checks_passed?(task["required_checks"] || [], report["host_checks"] || []) do
       :ok
     else
@@ -1572,35 +1730,35 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     lane = to_string(context.lane)
     task = context[:task]
     task = if is_map(task), do: task, else: %{}
-
-    fields =
-      case lane do
-        "build" -> ["branch", "base_branch", "required_checks"]
-        "qa" -> ["branch", "base_branch", "pr_number", "current_sha", "required_checks"]
-        "review" -> ["branch", "base_branch", "pr_number", "current_sha", "prior_findings"]
-        "finalize" -> ["branch", "base_branch", "pr_number", "current_sha"]
-        _ -> []
-      end
-
-    report_context = %{"lane" => lane, "task" => Map.take(task, fields)}
-
-    if lane == "qa" do
-      locale = context[:report_locale] || :en
-
-      Map.merge(report_context, %{
-        "host_checks" => normalize_report_list(context[:host_checks]),
-        "report_locale" => to_string(locale),
-        "qa_text" => %{
-          "checks_unavailable" => qa_text(%{report_locale: locale}, :checks_unavailable),
-          "checks_failed" => qa_text(%{report_locale: locale}, :checks_failed),
-          "findings" => qa_text(%{report_locale: locale}, :findings),
-          "next_step" => qa_text(%{report_locale: locale}, :next_step)
-        }
-      })
-    else
-      report_context
-    end
+    report_context = %{"lane" => lane, "task" => Map.take(task, report_task_fields(lane))}
+    add_lane_report_context(report_context, lane, context)
   end
+
+  defp report_task_fields("build"), do: ["branch", "base_branch", "required_checks"]
+  defp report_task_fields("qa"), do: ["branch", "base_branch", "base_sha", "pr_number", "current_sha", "required_checks"]
+  defp report_task_fields("review"), do: ["branch", "base_branch", "base_sha", "pr_number", "current_sha", "required_checks", "prior_findings"]
+  defp report_task_fields("finalize"), do: ["branch", "base_branch", "pr_number", "current_sha"]
+  defp report_task_fields(_lane), do: []
+
+  defp add_lane_report_context(report_context, "review", context),
+    do: Map.put(report_context, "review_verification", context[:review_verification])
+
+  defp add_lane_report_context(report_context, "qa", context) do
+    locale = context[:report_locale] || :en
+
+    Map.merge(report_context, %{
+      "host_checks" => normalize_report_list(context[:host_checks]),
+      "report_locale" => to_string(locale),
+      "qa_text" => %{
+        "checks_unavailable" => qa_text(%{report_locale: locale}, :checks_unavailable),
+        "checks_failed" => qa_text(%{report_locale: locale}, :checks_failed),
+        "findings" => qa_text(%{report_locale: locale}, :findings),
+        "next_step" => qa_text(%{report_locale: locale}, :next_step)
+      }
+    })
+  end
+
+  defp add_lane_report_context(report_context, _lane, _context), do: report_context
 
   defp list_issue_comments(issue_ref, settings, request_fun, cursor, comments) do
     list_issue_comments(issue_ref, settings, request_fun, cursor, comments, [])
@@ -1989,6 +2147,10 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
          {:ok, report} <- decode_phase_report_comment(body),
          true <- report["outcome"] == "passed" or (report["outcome"] == "merged" and pr["state"] == "MERGED"),
          true <- report["sha"] == task["current_sha"],
+         true <- report["base_sha"] == task["base_sha"],
+         true <- get_in(report, ["qa_verification", "status"]) == "passed",
+         true <- get_in(report, ["qa_verification", "sha"]) == report["sha"],
+         true <- get_in(report, ["qa_verification", "base_sha"]) == report["base_sha"],
          %{"findings" => []} <- normalize_agent_report(report, "review", context) do
       :ok
     else
@@ -2016,10 +2178,14 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
     with :ok <- validate_merge_shas(head_sha, current_base_sha),
          :ok <- validate_merge_identity(pr, head_sha, current_base_sha),
+         :ok <- validate_reviewed_base_sha(task["base_sha"], current_base_sha),
          :ok <- validate_github_checks(pr) do
       validate_merge_state(pr)
     end
   end
+
+  defp validate_reviewed_base_sha(base_sha, base_sha), do: :ok
+  defp validate_reviewed_base_sha(_reviewed_base_sha, _current_base_sha), do: {:error, :pull_request_base_sha_mismatch}
 
   defp validate_merge_shas(head_sha, base_sha) do
     cond do
