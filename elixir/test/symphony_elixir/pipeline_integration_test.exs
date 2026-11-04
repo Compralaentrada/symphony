@@ -1636,7 +1636,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
     assert await(fn ->
              project_state(table, issue.id) == "Human Review" and
-               lookup(table, {:status_unconfirmed, issue.id}) and
+               lookup(table, {:status_unconfirmed, issue.id}) == true and
                not Store.agent_lease_active?(issue.id, 1, "review", 1)
            end)
 
