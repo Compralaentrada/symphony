@@ -771,6 +771,14 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert {:ok, %{"outcome" => "merged", "pull_request" => %{"merged" => true}}} = already_merged
     refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
 
+    {reconciled_merge, queries} = run_merge_gate(%{merge_response_lost: true})
+    assert {:ok, %{"outcome" => "merged", "pull_request" => %{"merged" => true}}} = reconciled_merge
+    assert Enum.count(queries, &(&1 =~ "SymphonyPipelineMergePullRequest")) == 1
+
+    {unconfirmed_merge, queries} = run_merge_gate(%{merge_response_lost: true, merge_stays_open: true})
+    assert {:error, {:github_projects_api_error, _}} = unconfirmed_merge
+    assert Enum.count(queries, &(&1 =~ "SymphonyPipelineMergePullRequest")) == 1
+
     for {scenario, expected_error} <- [
           {%{host_check_status: "failed"}, :host_checks_not_verified},
           {%{human_decision_changed: true}, :github_human_decision_changed},
@@ -3049,32 +3057,12 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
         query =~ "SymphonyPipelineMergeGate" ->
           merge_gate_query_with_changes(options, queries, number, branch, sha)
 
-        query =~ "SymphonyPipelineMergePullRequest" ->
-          body = %{"data" => %{"mergePullRequest" => %{"pullRequest" => %{"mergedAt" => "2026-10-23T08:00:00Z"}}}}
-          {:ok, %{status: 200, body: body}}
+        query =~ "SymphonyPipelineMergePullRequest" or query =~ "SymphonyPipelinePullRequest" ->
+          merge_gate_pull_request_response(query, options, queries, number, branch, sha)
 
         query =~ "SymphonySetProjectStatus" ->
           assert variables["optionId"] == "option-ready"
           {:ok, %{status: 200, body: %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}}}
-
-        query =~ "SymphonyPipelinePullRequest" ->
-          merged_pull_request = %{
-            "id" => "PR_#{number}",
-            "number" => number,
-            "url" => "https://github.com/octo/app/pull/#{number}",
-            "state" => "MERGED",
-            "isDraft" => false,
-            "mergedAt" => "2026-10-23T08:00:00Z",
-            "baseRefName" => "main",
-            "baseRefOid" => Map.get(options, :current_base_sha, "base-current"),
-            "headRefName" => branch,
-            "headRefOid" => Map.get(options, :pr_head_sha, sha),
-            "reviewDecision" => nil,
-            "body" => ""
-          }
-
-          body = %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([merged_pull_request])}}}
-          {:ok, %{status: 200, body: body}}
 
         true ->
           flunk("unexpected GitHub Projects query: #{query}")
@@ -3095,10 +3083,55 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     {result, calls}
   end
 
+  defp merge_gate_pull_request_response(query, options, queries, number, branch, sha) do
+    if String.contains?(query, "SymphonyPipelineMergePullRequest"),
+      do: merge_gate_merge_response(options),
+      else: merge_gate_pull_request_read_response(options, queries, number, branch, sha)
+  end
+
+  defp merge_gate_merge_response(%{merge_response_lost: true}), do: {:error, :response_lost}
+
+  defp merge_gate_merge_response(_options) do
+    body = %{"data" => %{"mergePullRequest" => %{"pullRequest" => %{"mergedAt" => "2026-10-23T08:00:00Z"}}}}
+    {:ok, %{status: 200, body: body}}
+  end
+
+  defp merge_gate_pull_request_read_response(options, queries, number, branch, sha) do
+    state = merge_gate_pull_request_state(options, queries)
+
+    merged_pull_request = %{
+      "id" => "PR_#{number}",
+      "number" => number,
+      "url" => "https://github.com/octo/app/pull/#{number}",
+      "state" => state,
+      "isDraft" => state != "MERGED",
+      "mergedAt" => if(state == "MERGED", do: "2026-10-23T08:00:00Z"),
+      "baseRefName" => "main",
+      "baseRefOid" => Map.get(options, :current_base_sha, "base-current"),
+      "headRefName" => branch,
+      "headRefOid" => Map.get(options, :pr_head_sha, sha),
+      "reviewDecision" => nil,
+      "body" => ""
+    }
+
+    body = %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([merged_pull_request])}}}
+    {:ok, %{status: 200, body: body}}
+  end
+
   defp merge_gate_query_with_changes(options, queries, number, branch, sha) do
     reads = Agent.get(queries, &Enum.count(&1, fn query -> query =~ "SymphonyPipelineMergeGate" end))
     options = if options[:base_changed] == true and reads > 1, do: Map.put(options, :current_base_sha, "new-base"), else: options
     merge_gate_query(options, number, branch, sha)
+  end
+
+  defp merge_gate_pull_request_state(options, queries) do
+    merge_attempted? = Agent.get(queries, &Enum.any?(&1, fn query -> query =~ "SymphonyPipelineMergePullRequest" end))
+
+    cond do
+      options[:merge_response_lost] == true and merge_attempted? and options[:merge_stays_open] == true -> "OPEN"
+      options[:merge_response_lost] == true and merge_attempted? -> "MERGED"
+      true -> "MERGED"
+    end
   end
 
   defp merge_gate_comparison(options) do
