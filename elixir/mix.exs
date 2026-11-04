@@ -82,7 +82,7 @@ defmodule SymphonyElixir.MixProject do
       {:tongue, "~> 2.3"},
       {:yaml_elixir, "~> 2.12"},
       {:solid, "~> 1.2"},
-      {:ecto, "~> 3.13"},
+      {:ecto, ">= 3.14.3 and < 4.0.0"},
       {:exqlite, "~> 0.42"},
       {:burrito, "~> 1.5", only: :prod, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
