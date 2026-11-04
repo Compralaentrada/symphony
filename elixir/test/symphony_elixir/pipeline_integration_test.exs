@@ -1643,8 +1643,14 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
     qa_report = lookup(table, {:report, issue.id, "qa"}) |> Jason.decode!()
     assert qa_report["sha"] == sha
-    assert qa_report["files"] == [%{"path" => "test/qa-added-test.txt", "change" => "added"}]
-    assert qa_report["verification_command"] == "mix test test/symphony_elixir/qa_report_test.exs"
+    assert qa_report["files"] == [%{"path" => "test/qa_added_test.exs", "change" => "added"}]
+    assert qa_report["verification_command"] == "elixir test/qa_added_test.exs"
+
+    assert %{"command" => command, "result" => result, "status" => "passed"} =
+             Enum.find(qa_report["checks"], &(&1["id"] == "qa-unit-test"))
+
+    assert command == qa_report["verification_command"]
+    assert result =~ "1 test, 0 failures"
   end
 
   test "a QA report with findings returns to Build and keeps finding context through Review" do
@@ -2275,9 +2281,26 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
   defp maybe_publish_qa_test(table, issue, report, workspace) do
     if :ets.lookup(table, {:qa_add_test_once, issue.id}) != [] do
       :ets.delete(table, {:qa_add_test_once, issue.id})
-      path = "test/qa-added-test.txt"
+      path = "test/qa_added_test.exs"
+      verification_command = "elixir #{path}"
       File.mkdir_p!(Path.dirname(Path.join(workspace, path)))
-      File.write!(Path.join(workspace, path), "QA coverage\n")
+
+      File.write!(
+        Path.join(workspace, path),
+        """
+        ExUnit.start()
+
+        defmodule QAPublishedTest do
+          use ExUnit.Case, async: true
+
+          test "QA can publish an executable test" do
+            assert String.trim("  Symphony QA coverage  ") == "Symphony QA coverage"
+          end
+        end
+        """
+      )
+
+      {output, 0} = System.cmd("elixir", [path], cd: workspace, stderr_to_stdout: true)
       {_output, 0} = System.cmd("git", ["add", path], cd: workspace, stderr_to_stdout: true)
       {_output, 0} = System.cmd("git", ["commit", "-m", "test: add QA coverage"], cd: workspace, stderr_to_stdout: true)
       {sha, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: workspace, stderr_to_stdout: true)
@@ -2293,10 +2316,17 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
       |> Map.put("sha", sha)
       |> Map.put("files", [%{"path" => path, "change" => "added"}])
       |> Map.put("changes", ["Added QA coverage in #{path}."])
+      |> Map.put("verification_command", verification_command)
+      |> Map.put("checks", Enum.map(report["checks"], &update_qa_check(&1, verification_command, output)))
     else
       report
     end
   end
+
+  defp update_qa_check(%{"id" => "qa-unit-test"} = check, command, output),
+    do: Map.merge(check, %{"command" => command, "result" => String.trim(output)})
+
+  defp update_qa_check(check, _command, _output), do: check
 
   defp prepare_report(table, issue, :review, report, _opts, _workspace),
     do: {:ok, Map.put(report, "sha", :ets.lookup_element(table, {:remote_sha, issue.id}, 2)), [], []}
