@@ -2215,6 +2215,40 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert issue.labels == ["bug"]
   end
 
+  test "Ready issues use the Status field update time as their Ready timestamp" do
+    ready_since = "2026-10-30T09:15:00Z"
+
+    item =
+      issue_item("octo/app", 7, "Ready")
+      |> put_in(["content", "createdAt"], "2026-01-01T00:00:00Z")
+      |> put_in(["fieldValues", "nodes", Access.at(0), "createdAt"], "2026-10-20T00:00:00Z")
+      |> put_in(["fieldValues", "nodes", Access.at(0), "updatedAt"], ready_since)
+
+    assert {:ok, [issue]} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn query, _variables, _settings ->
+               assert query =~ "updatedAt"
+               {:ok, %{status: 200, body: project_response([item])}}
+             end)
+
+    assert issue.created_at == ~U[2026-01-01 00:00:00Z]
+    assert issue.ready_at == ~U[2026-10-30 09:15:00Z]
+  end
+
+  test "Ready issues have no Ready timestamp when the Status update time is unavailable" do
+    item =
+      issue_item("octo/app", 7, "Ready")
+      |> put_in(["content", "createdAt"], "2026-01-01T00:00:00Z")
+      |> put_in(["fieldValues", "nodes", Access.at(0), "createdAt"], "2026-10-20T00:00:00Z")
+
+    assert {:ok, [issue]} =
+             Client.fetch_issues_by_states_for_test(["Ready"], tracker_settings(), fn _query, _variables, _settings ->
+               {:ok, %{status: 200, body: project_response([item])}}
+             end)
+
+    assert issue.created_at == ~U[2026-01-01 00:00:00Z]
+    assert issue.ready_at == nil
+  end
+
   test "Project readiness rejects a missing Status field without writing to GitHub" do
     response = project_response([issue_item("octo/app", 7, "Ready")])
     response = update_in(response, ["data", "organization", "projectV2", "fields", "nodes"], fn _ -> [] end)

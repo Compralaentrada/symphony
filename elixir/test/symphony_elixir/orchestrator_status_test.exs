@@ -124,6 +124,57 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute MapSet.member?(updated_state.claimed, issue.id)
   end
 
+  test "dispatches the oldest eligible Ready issue within the free slot limit" do
+    write_projects_workflow!()
+
+    issue = fn id, ready_at, blocked_by ->
+      %Issue{
+        id: id,
+        identifier: id,
+        title: id,
+        state: "Ready",
+        ready_at: ready_at,
+        blocked_by: blocked_by,
+        dispatchable: true
+      }
+    end
+
+    pending = issue.("oldest-pending", ~U[2026-10-01 00:00:00Z], [%{id: "blocker", state: "OPEN"}])
+
+    oldest_eligible =
+      issue.("oldest-eligible", ~U[2026-10-02 00:00:00Z], [])
+      |> Map.merge(%{priority: 4, created_at: ~U[2026-10-02 00:00:00Z]})
+
+    newer_eligible =
+      issue.("newer-eligible", ~U[2026-10-03 00:00:00Z], [])
+      |> Map.merge(%{priority: 1, created_at: ~U[2026-01-01 00:00:00Z]})
+
+    missing_timestamp = issue.("missing-timestamp", nil, [])
+
+    state = %Orchestrator.State{max_concurrent_agents: 1, running: %{}, claimed: MapSet.new(), blocked: %{}}
+
+    ordered =
+      Orchestrator.sort_issues_for_dispatch_for_test([
+        missing_timestamp,
+        newer_eligible,
+        pending,
+        oldest_eligible
+      ])
+
+    assert Enum.map(ordered, & &1.id) == [
+             "oldest-pending",
+             "oldest-eligible",
+             "newer-eligible",
+             "missing-timestamp"
+           ]
+
+    selected = Enum.find(ordered, &Orchestrator.should_dispatch_issue_for_test(&1, state))
+    assert selected == oldest_eligible
+
+    full_state = %{state | running: %{"in-progress" => %{issue: %Issue{state: "Building"}}}}
+    refute Orchestrator.should_dispatch_issue_for_test(newer_eligible, full_state)
+  end
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()

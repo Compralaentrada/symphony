@@ -61,6 +61,7 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
             __typename
             ... on ProjectV2ItemFieldSingleSelectValue {
               name
+              updatedAt
               field { ... on ProjectV2SingleSelectField { name } }
             }
           }
@@ -776,7 +777,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       blocked_by: blockers,
       dependency_error: dependency_error,
       created_at: parse_datetime(content["createdAt"]),
-      updated_at: parse_datetime(content["updatedAt"])
+      updated_at: parse_datetime(content["updatedAt"]),
+      ready_at: project_item_ready_at(item, project_status, settings)
     }
   end
 
@@ -895,21 +897,37 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   end
 
   defp item_status(item, status_field) do
+    case item_status_value(item, status_field) do
+      %{"name" => status} -> status
+      _ -> nil
+    end
+  end
+
+  defp item_status_updated_at(item, status_field) do
+    case item_status_value(item, status_field) do
+      %{} = value -> parse_datetime(value["updatedAt"])
+      _ -> nil
+    end
+  end
+
+  defp project_item_ready_at(item, project_status, settings) do
+    if status_in?(project_status, [settings.statuses.ready]),
+      do: item_status_updated_at(item, settings.status_field),
+      else: nil
+  end
+
+  defp item_status_value(item, status_field) do
     item
     |> get_in(["fieldValues", "nodes"])
     |> case do
       values when is_list(values) ->
-        Enum.find_value(values, &status_value(&1, status_field))
+        Enum.find(values, fn
+          %{} = value -> get_in(value, ["field", "name"]) == status_field
+          _ -> false
+        end)
 
       _ ->
         nil
-    end
-  end
-
-  defp status_value(value, status_field) do
-    case get_in(value, ["field", "name"]) do
-      ^status_field -> value["name"]
-      _ -> nil
     end
   end
 
