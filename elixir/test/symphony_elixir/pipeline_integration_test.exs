@@ -667,6 +667,113 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert project_state(table, issue.id) == "QA"
   end
 
+  test "runtime recovery restores repository identity and blocks unresolved Project mismatches" do
+    alpha = recovery_issue("octo/alpha", 31, "PVTI_alpha_31", "main")
+    beta = recovery_issue("octo/beta", 31, "PVTI_beta_31", "release")
+    ambiguous = recovery_issue("octo/beta", 32, "PVTI_beta_32", "release")
+    issues = [alpha, beta, ambiguous]
+    table = start_board(issues, %{})
+    multi_repo_pipeline_database!(table)
+
+    tasks =
+      Map.new(issues, fn issue ->
+        assert {:ok, task, "build"} = Pipeline.prepare(issue)
+        workspace = ensure_test_workspace!(issue)
+        File.write!(Path.join(workspace, "confirmed-work.txt"), issue.id)
+        {issue.id, task}
+      end)
+
+    Enum.each(issues, fn issue ->
+      assert :ok = Store.save_task(Map.merge(tasks[issue.id], %{"phase" => "review", "status" => "human_review"}))
+      set_project_state(table, issue.id, "Human Review")
+    end)
+
+    first_runtime = start_orchestrator()
+    assert await(fn -> (lookup(table, :fetch_issues_by_ids_calls) || 0) > 0 end)
+    stop_orchestrator(first_runtime)
+
+    alpha_task = tasks[alpha.id]
+
+    beta_task =
+      tasks[beta.id]
+      |> Map.merge(%{
+        "phase" => "qa",
+        "status" => "qa",
+        "current_sha" => "beta-confirmed-sha",
+        "host_checks" => [%{"name" => "required", "status" => "passed"}],
+        "attempts" => %{"build" => 3, "qa" => 4}
+      })
+
+    ambiguous_task =
+      tasks[ambiguous.id]
+      |> Map.merge(%{
+        "current_sha" => "confirmed-before-mismatch",
+        "host_checks" => [%{"name" => "required", "status" => "passed"}],
+        "attempts" => %{"build" => 5}
+      })
+
+    assert :ok = Store.save_task(alpha_task)
+    assert :ok = Store.save_task(beta_task)
+    assert :ok = Store.save_task(ambiguous_task)
+
+    set_project_state(table, alpha.id, "QA")
+    set_project_state(table, beta.id, "Building")
+    set_project_state(table, ambiguous.id, "Blocked")
+
+    restarted_runtime = start_orchestrator(HoldingAgent)
+    on_exit(fn -> stop_holding_orchestrator(restarted_runtime) end)
+
+    assert await(fn ->
+             state = :sys.get_state(restarted_runtime)
+
+             match?({:ok, %{"status" => "qa", "phase" => "qa"}}, Store.get_task(alpha.id)) and
+               match?({:ok, %{"status" => "building", "phase" => "build"}}, Store.get_task(beta.id)) and
+               match?({:ok, %{"status" => "blocked"}}, Store.get_task(ambiguous.id)) and
+               Map.has_key?(state.running, alpha.id) and Map.has_key?(state.running, beta.id) and
+               state.running[alpha.id].workspace_path == recovered_workspace_path(Store.get_task(alpha.id) |> elem(1)) and
+               state.running[beta.id].workspace_path == recovered_workspace_path(Store.get_task(beta.id) |> elem(1))
+           end)
+
+    assert {:ok, recovered_alpha} = Store.get_task(alpha.id)
+    assert recovered_alpha["repository"] == "octo/alpha"
+    assert recovered_alpha["branch"] == alpha.branch_name
+    assert recovered_alpha["base_branch"] == "main"
+    assert recovered_alpha["required_checks"] == ["true"]
+    assert recovered_alpha["execution_identity"] == Issue.execution_identity(alpha)
+    assert recovered_alpha["phase"] == "qa"
+
+    assert {:ok, recovered_beta} = Store.get_task(beta.id)
+    assert recovered_beta["repository"] == "octo/beta"
+    assert recovered_beta["branch"] == beta.branch_name
+    assert recovered_beta["base_branch"] == "release"
+    assert recovered_beta["required_checks"] == ["true", "git status --short"]
+    assert recovered_beta["execution_identity"] == Issue.execution_identity(beta)
+    assert recovered_beta["current_sha"] == nil
+    refute Map.has_key?(recovered_beta, "host_checks")
+
+    assert {:ok, blocked} = Store.get_task(ambiguous.id)
+    assert blocked["status"] == "blocked"
+    assert blocked["blocked_reason"] =~ "tracker state is Blocked"
+    assert blocked["current_sha"] == "confirmed-before-mismatch"
+    assert blocked["host_checks"] == [%{"name" => "required", "status" => "passed"}]
+    assert blocked["attempts"] == %{"build" => 5}
+    assert project_state(table, ambiguous.id) == "Blocked"
+
+    running = :sys.get_state(restarted_runtime).running
+    assert running[alpha.id].pipeline_task["required_checks"] == ["true"]
+    assert running[beta.id].pipeline_task["required_checks"] == ["true", "git status --short"]
+
+    alpha_workspace = recovered_workspace_path(recovered_alpha)
+    beta_workspace = recovered_workspace_path(recovered_beta)
+    assert alpha_workspace != beta_workspace
+    assert running[alpha.id].workspace_path == alpha_workspace
+    assert running[beta.id].workspace_path == beta_workspace
+    assert File.read!(Path.join(alpha_workspace, "confirmed-work.txt")) == alpha.id
+    assert File.read!(Path.join(beta_workspace, "confirmed-work.txt")) == beta.id
+
+    stop_holding_orchestrator(restarted_runtime)
+  end
+
   test "QA on the board resumes a locally blocked Build checkpoint using the current PR" do
     issue = issue("octo/app#23", 23)
     issue = %{issue | state: "QA", native_ref: Map.put(issue.native_ref, :project_status, "QA")}
@@ -1867,6 +1974,77 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     end)
 
     path
+  end
+
+  defp multi_repo_pipeline_database!(table) do
+    path = pipeline_database!(table)
+
+    File.write!(Workflow.workflow_file_path(), """
+    ---
+    tracker:
+      kind: github_projects
+      active_states: [Ready, Building, QA, Review, Human Review]
+      terminal_states: [closed, Dropped]
+      provider:
+        owner: acme
+        project_number: 1
+        repositories:
+          - repository: octo/alpha
+            base_branch: main
+            prepare_command: "true"
+            required_checks: ["true"]
+          - repository: octo/beta
+            base_branch: release
+            prepare_command: "true"
+            required_checks: ["true", "git status --short"]
+        token: test-token
+    polling:
+      interval_ms: 60000
+    workspace:
+      root: /tmp/symphony-pipeline-workspaces
+    agent:
+      max_concurrent_agents: 5
+      max_turns: 2
+      max_retry_backoff_ms: 300000
+    codex:
+      stall_timeout_ms: 0
+    ---
+    Return JSON phase reports.
+    """)
+
+    assert :ok = WorkflowStore.force_reload()
+    path
+  end
+
+  defp recovery_issue(repository, number, project_item_id, base_branch) do
+    id = "#{repository}##{number}"
+    required_checks = if repository == "octo/beta", do: ["true", "git status --short"], else: ["true"]
+
+    %Issue{
+      id: id,
+      identifier: id,
+      title: "Recovery fixture #{id}",
+      description: "Reconcile the visible Project state after restart.",
+      state: "Building",
+      branch_name: "symphony/#{String.replace(repository, "/", "-")}-#{number}",
+      url: "https://github.com/#{repository}/issues/#{number}",
+      dispatchable: true,
+      native_ref: %{
+        project_id: "PVT_recovery",
+        project_item_id: project_item_id,
+        issue_number: number,
+        repository: repository,
+        base_branch: base_branch,
+        prepare_command: "true",
+        required_checks: required_checks,
+        project_status: "Building"
+      }
+    }
+  end
+
+  defp recovered_workspace_path(task) do
+    root = Application.fetch_env!(:symphony_elixir, :pipeline_test_workspace)
+    Path.join(root, Workspace.workspace_key(task["execution_identity"]))
   end
 
   defp write_pipeline_workflow!(retry_backoff_ms, poll_interval_ms, max_concurrent_agents) do
