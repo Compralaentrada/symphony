@@ -419,31 +419,44 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
             {{:ok, %{status: 200, body: project_response([issue_item("octo/app", number, data.status)])}}, data}
 
           query =~ "SymphonyPipelineDelivery" ->
+            assert variables == %{"owner" => "octo", "name" => "app", "branch" => "refs/heads/" <> branch}
             body = %{"data" => %{"repository" => %{"ref" => %{"name" => branch, "target" => %{"oid" => sha}}}}}
             {{:ok, %{status: 200, body: body}}, data}
 
           query =~ "SymphonyPipelinePullRequest" ->
-            body = %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => []}}}}
+            assert variables == %{"owner" => "octo", "name" => "app", "branch" => branch, "base" => "main"}
+
+            existing_body = """
+            Human-authored note before the delivery block.
+
+            <!-- symphony:delivery:start -->
+
+            Old report block.
+            <!-- symphony:delivery:end -->
+
+            Human-authored note after the delivery block.
+            """
+
+            existing_pr =
+              pipeline_pr(issue, existing_body)
+              |> Map.merge(%{"number" => 107, "id" => "PR_#{number}", "headRefOid" => sha})
+
+            body = %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [existing_pr]}}}}
             {{:ok, %{status: 200, body: body}}, data}
 
-          query =~ "SymphonyPipelineRepository" ->
-            {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"id" => "R_octopus"}}}}}, data}
+          query =~ "SymphonyUpdatePipelinePullRequestBody" ->
+            assert variables["pullRequestId"] == "PR_#{number}"
+            assert variables["body"] =~ "Human-authored note before the delivery block."
+            assert variables["body"] =~ "Human-authored note after the delivery block."
+            assert variables["body"] =~ "Fixes ##{number}"
+            refute variables["body"] =~ "Old report block."
 
-          query =~ "createPullRequest" ->
-            pr = %{
-              "id" => "PR_#{number}",
-              "number" => number,
-              "url" => "https://github.com/octo/app/pull/#{number}",
-              "state" => "OPEN",
-              "isDraft" => true,
-              "mergedAt" => nil,
-              "baseRefName" => "main",
-              "headRefName" => branch,
-              "headRefOid" => sha,
-              "body" => variables["input"]["body"]
-            }
+            pr =
+              pipeline_pr(issue, variables["body"])
+              |> Map.merge(%{"number" => 107, "id" => "PR_#{number}", "headRefOid" => sha})
 
-            {{:ok, %{status: 200, body: %{"data" => %{"createPullRequest" => %{"pullRequest" => pr}}}}}, data}
+            body = %{"data" => %{"updatePullRequest" => %{"pullRequest" => pr}}}
+            {{:ok, %{status: 200, body: body}}, data}
 
           query =~ "SymphonyPipelineReportComments" ->
             comments = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
@@ -514,6 +527,11 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
              )
 
     assert evidence["pull_request_body"] == body
+    assert evidence["pull_request"]["id"] == "PR_#{number}"
+    assert evidence["pull_request"]["number"] == 107
+    assert evidence["pull_request"]["head_sha"] == sha
+    assert evidence["pull_request"]["base"] == "main"
+    assert evidence["pull_request"]["draft"]
   end
 
   test "Finalize resumes from Ready and verifies the merged PR before moving to Done" do
@@ -2152,6 +2170,53 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
              )
   end
 
+  test "a failed or ambiguous pull request lookup never starts a parallel PR creation" do
+    settings = tracker_settings()
+    issue = %SymphonyElixir.Tracker.Issue{id: "octo/app#7", branch_name: "symphony/octo-app-7", native_ref: %{repository: "octo/app"}}
+    attrs = %{branch: issue.branch_name, base: "main", sha: "sha-seven", body: "Fixes #7\n\nDescription"}
+
+    lookup_results = [
+      {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{}}}}}},
+      {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => "incomplete"}}}}}},
+      {:ok,
+       %{
+         status: 200,
+         body: %{
+           "data" => %{
+             "repository" => %{
+               "pullRequests" => %{"nodes" => [pipeline_pr(issue, "body") |> Map.put("headRefName", "symphony/wrong-issue")]}
+             }
+           }
+         }
+       }},
+      {:error, :read_failed}
+    ]
+
+    for lookup_result <- lookup_results do
+      requests = Agent.start_link(fn -> [] end) |> elem(1)
+
+      request_fun = fn query, variables, _settings ->
+        Agent.update(requests, &[query | &1])
+
+        cond do
+          query =~ "SymphonyPipelinePullRequest" ->
+            lookup_result
+
+          query =~ "SymphonyPipelineRepository" ->
+            {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"id" => "R_octopus"}}}}}
+
+          query =~ "createPullRequest" ->
+            pr = pipeline_pr(issue, variables["input"]["body"])
+            {:ok, %{status: 200, body: %{"data" => %{"createPullRequest" => %{"pullRequest" => pr}}}}}
+        end
+      end
+
+      assert {:error, _reason} = Client.upsert_pull_request_for_test(issue, attrs, settings, request_fun)
+      assert Agent.get(requests, &length/1) == 1
+      refute Enum.any?(Agent.get(requests, & &1), &(&1 =~ "createPullRequest"))
+    end
+  end
+
   test "pipeline PR lookup includes merged pull requests" do
     settings = tracker_settings()
 
@@ -2204,6 +2269,29 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       assert result.body == if(should_update?, do: body, else: existing_body)
       assert length(Agent.get(calls, & &1)) == if(should_update?, do: 2, else: 1)
     end
+  end
+
+  test "an existing PR with a stale head SHA is rejected before updating its body" do
+    settings = tracker_settings()
+    issue = %SymphonyElixir.Tracker.Issue{id: "octo/app#7", branch_name: "symphony/octo-app-7", native_ref: %{repository: "octo/app"}}
+    body = "<!-- symphony:delivery:start -->\n\nNew report\n<!-- symphony:delivery:end -->"
+    attrs = %{branch: issue.branch_name, base: "main", sha: "sha-seven", body: body}
+    calls = Agent.start_link(fn -> [] end) |> elem(1)
+
+    request_fun = fn query, variables, _settings ->
+      Agent.update(calls, &[{query, variables} | &1])
+      assert query =~ "SymphonyPipelinePullRequest"
+      assert variables == %{"owner" => "octo", "name" => "app", "branch" => issue.branch_name, "base" => "main"}
+
+      pr = pipeline_pr(issue, "<!-- symphony:delivery:start -->\n\nOld report\n<!-- symphony:delivery:end -->")
+      pr = Map.put(pr, "headRefOid", "stale-sha")
+      {:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => %{"nodes" => [pr]}}}}}}
+    end
+
+    assert {:error, :pull_request_head_sha_mismatch} =
+             Client.upsert_pull_request_for_test(issue, attrs, settings, request_fun)
+
+    assert Agent.get(calls, &length/1) == 1
   end
 
   test "fetches Ready native issues from the configured Project and qualifies identity by repository" do
