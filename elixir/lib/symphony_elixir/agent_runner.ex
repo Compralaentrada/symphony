@@ -637,7 +637,8 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp github_agent_context(issue, opts) do
-    tracker = Config.settings!().tracker
+    settings = Config.settings!()
+    tracker = settings.tracker
     phase = Keyword.get(opts, :phase, :individual)
     diagnostic? = Keyword.get(opts, :diagnostic, false)
 
@@ -661,7 +662,7 @@ defmodule SymphonyElixir.AgentRunner do
       host_checks: Keyword.get(opts, :host_checks, []),
       report_locale: Keyword.get(opts, :report_locale, Pipeline.report_locale(issue)),
       tracker_kind: tracker.kind,
-      merge_policy: Map.get(tracker.provider, "merge_policy", "human")
+      merge_policy: settings.merge_policy
     }
   end
 
@@ -1000,7 +1001,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp pipeline_phase_instructions(:review, _opts) do
-    merge_policy = Map.get(Config.settings!().tracker.provider, "merge_policy", "human")
+    merge_policy = Config.settings!().merge_policy
 
     """
     Pipeline phase: autonomous code review in a new session. Before any other GitHub write, call `github_workflow` with operation `claim`; this moves a requeued Ready item to Review and confirms an item already in Review. Before reading Builder or QA summaries, independently inspect the issue acceptance criteria and the current PR diff at the accepted head/base. For `bug` or `feature` tasks, inspect product code and tests. For an issue labeled `qa`, inspect the QA report and the diff of tests/evidence only; do not claim a product-code diff that does not exist. Form initial observations from the criteria and diff first.

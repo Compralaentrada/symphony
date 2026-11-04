@@ -1137,6 +1137,14 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       generation: 1,
       attempt: 1,
       task: task,
+      review_verification: %{
+        "status" => "passed",
+        "command" => "make -C elixir all",
+        "sha" => sha,
+        "base_sha" => base_sha,
+        "evidence" => "Host replay passed on #{sha}.",
+        "finding_id" => nil
+      },
       tracker_kind: "github_projects"
     }
 
@@ -1157,6 +1165,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert hd(qa_reports)["body"] =~ "QA-1"
     assert List.last(qa_reports)["body"] =~ "Host exit status 0 on #{sha}"
     assert evidence["report_context"]["task"]["current_sha"] == sha
+    assert evidence["report_context"]["review_verification"] == review_context.review_verification
     refute Enum.any?(qa_reports, &String.contains?(&1["body"], old_sha))
 
     legacy_comments =

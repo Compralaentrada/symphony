@@ -425,7 +425,10 @@ defmodule SymphonyElixir.Config.Schema do
           {settings.tracker.api_key, settings.tracker.assignee, provider, []}
       end
 
-    provider = merge_policy_into_provider(provider, settings.tracker.kind, settings.merge_policy, merge_policy_explicit?)
+    merge_policy =
+      effective_merge_policy(settings.tracker.kind, provider, settings.merge_policy, merge_policy_explicit?)
+
+    provider = merge_policy_into_provider(provider, settings.tracker.kind, merge_policy, merge_policy_explicit?)
 
     {active_states, terminal_states} =
       case settings.tracker.kind do
@@ -462,8 +465,15 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    %{settings | merge_policy: merge_policy, tracker: tracker, workspace: workspace, codex: codex}
   end
+
+  defp effective_merge_policy(_kind, _provider, merge_policy, true), do: merge_policy
+
+  defp effective_merge_policy(kind, provider, merge_policy, false) when kind in ["github", "github_projects"],
+    do: Map.get(provider, "merge_policy") || merge_policy
+
+  defp effective_merge_policy(_kind, _provider, merge_policy, false), do: merge_policy
 
   defp merge_policy_into_provider(provider, kind, merge_policy, explicit?) when kind in ["github", "github_projects"] do
     if explicit?, do: Map.put(provider, "merge_policy", merge_policy), else: Map.put_new(provider, "merge_policy", merge_policy)
