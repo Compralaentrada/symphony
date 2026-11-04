@@ -11,6 +11,32 @@ defmodule SymphonyElixir.QAReportTest do
     refute QAReport.valid?(report, ["missing host check"])
   end
 
+  test "file changes and the verification command are explicit QA evidence" do
+    report = report()
+
+    assert QAReport.valid?(
+             Map.merge(report, %{
+               "files" => [%{"path" => "test/search_test.exs", "change" => "added"}],
+               "verification_command" => "mix test test/symphony_elixir/search_test.exs"
+             })
+           )
+
+    refute QAReport.valid?(Map.delete(report, "files"))
+    refute QAReport.valid?(Map.put(report, "files", [nil]))
+    refute QAReport.valid?(Map.put(report, "files", [%{"path" => "../lib/search.ex", "change" => "modified"}]))
+    refute QAReport.valid?(Map.put(report, "files", [%{"path" => "test/search_test.exs", "change" => "deleted"}]))
+    refute QAReport.valid?(Map.put(report, "verification_command", "mix test"))
+    refute QAReport.valid?(Map.put(report, "verification_command", nil))
+
+    unverified_command =
+      report
+      |> put_in(["checks", Access.at(0), "status"], "failed")
+      |> put_in(["checks", Access.at(0), "required"], false)
+      |> put_in(["criteria", Access.at(0), "evidence"], ["host:make -C elixir all"])
+
+    refute QAReport.valid?(unverified_command)
+  end
+
   test "the report covers every source acceptance criterion" do
     description = "## Acceptance Criteria\n- The search returns matching results.\n- The search respects the configured limit."
 
@@ -209,7 +235,9 @@ defmodule SymphonyElixir.QAReportTest do
           "evidence" => ["unit-search"]
         }
       ],
+      "files" => [],
       "changes" => [],
+      "verification_command" => "mix test test/symphony_elixir/search_test.exs",
       "checks" => [
         %{
           "id" => "unit-search",

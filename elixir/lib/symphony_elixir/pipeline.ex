@@ -810,15 +810,14 @@ defmodule SymphonyElixir.Pipeline do
 
   defp finish_valid_phase(issue, task, "qa", attempt, %{"outcome" => "passed", "sha" => sha} = result)
        when is_binary(sha) do
-    with :ok <- ensure_current_sha(task, sha),
-         :ok <- validate_required_checks(task["required_checks"], result["host_checks"] || []) do
-      next = task |> Map.merge(%{"phase" => "review", "status" => "review", "host_checks" => result["host_checks"] || []})
-      operations = report_ops(next, "qa", attempt, result) ++ [status_op(next, :review, nil, attempt)]
-      commit(issue, next, "qa", attempt, result, operations)
-    else
-      {:error, :phase_sha_mismatch} ->
-        {reason, next_step} = qa_block_text(report_locale(issue), :sha_mismatch)
-        block_qa_phase(issue, task, attempt, result, reason, next_step)
+    case validate_required_checks(task["required_checks"], result["host_checks"] || []) do
+      :ok ->
+        next =
+          task
+          |> Map.merge(%{"phase" => "review", "status" => "review", "current_sha" => sha, "host_checks" => result["host_checks"] || []})
+
+        operations = report_ops(next, "qa", attempt, result) ++ [status_op(next, :review, nil, attempt)]
+        commit(issue, next, "qa", attempt, result, operations)
 
       {:error, :required_checks_unavailable} ->
         {reason, next_step} = qa_block_text(report_locale(issue), :checks_unavailable)
@@ -831,26 +830,6 @@ defmodule SymphonyElixir.Pipeline do
         commit(issue, next, "qa", attempt, result, operations)
     end
   end
-
-  defp block_qa_phase(issue, task, attempt, result, reason, next_step) do
-    result = Map.merge(result, %{"outcome" => "blocked", "reason" => reason, "next_step" => next_step})
-    next = task |> Map.put("phase", "qa") |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
-    operations = report_ops(next, "qa", attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
-    commit(issue, next, "qa", attempt, result, operations)
-  end
-
-  defp qa_block_text(:es, :sha_mismatch),
-    do: {"El SHA del informe QA no coincide con el SHA aceptado.", "Verifica la rama y vuelve a ejecutar QA sobre el SHA aceptado; no hace falta un cambio de Builder."}
-
-  defp qa_block_text(:es, :checks_unavailable),
-    do:
-      {"Symphony no tiene resultados utilizables de todas las comprobaciones requeridas.", "Repara el entorno o la herramienta que impidió la comprobación y vuelve a ejecutar QA sobre el mismo SHA."}
-
-  defp qa_block_text(_locale, :sha_mismatch),
-    do: {"The QA report SHA does not match the accepted SHA.", "Verify the task branch and rerun QA on the accepted SHA; Builder code changes are not required."}
-
-  defp qa_block_text(_locale, :checks_unavailable),
-    do: {"Symphony does not have usable results for every required check.", "Repair the environment or tool that prevented the check and rerun QA on the same SHA."}
 
   defp finish_valid_phase(issue, task, "review", attempt, %{"outcome" => "passed", "sha" => sha} = result) do
     with :ok <- ensure_current_sha(task, sha),
@@ -906,12 +885,28 @@ defmodule SymphonyElixir.Pipeline do
 
   defp finish_valid_phase(_issue, _task, phase, _attempt, result), do: {:error, {:invalid_phase_result, phase, result["outcome"]}}
 
+  defp block_qa_phase(issue, task, attempt, result, reason, next_step) do
+    result = Map.merge(result, %{"outcome" => "blocked", "reason" => reason, "next_step" => next_step})
+    next = task |> Map.put("phase", "qa") |> Map.put("status", "blocked") |> Map.put("blocked_reason", reason)
+    operations = report_ops(next, "qa", attempt, result) ++ [status_op(next, :blocked, reason, attempt)]
+    commit(issue, next, "qa", attempt, result, operations)
+  end
+
+  defp qa_block_text(:es, :checks_unavailable),
+    do:
+      {"Symphony no tiene resultados utilizables de todas las comprobaciones requeridas.", "Repara el entorno o la herramienta que impidió la comprobación y vuelve a ejecutar QA sobre el mismo SHA."}
+
+  defp qa_block_text(_locale, :checks_unavailable),
+    do: {"Symphony does not have usable results for every required check.", "Repair the environment or tool that prevented the check and rerun QA on the same SHA."}
+
   defp rework_phase(issue, task, phase, attempt, result) do
     next =
       task
       |> Map.put("phase", "build")
       |> Map.put("status", "building")
       |> Map.put("prior_findings", pending_findings(task, result))
+
+    next = if phase == "qa", do: Map.put(next, "current_sha", nil), else: next
 
     operations = report_ops(next, phase, attempt, result) ++ [status_op(next, :building, nil, attempt, phase)]
     commit(issue, next, phase, attempt, result, operations)

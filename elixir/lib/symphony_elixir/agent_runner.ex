@@ -836,7 +836,10 @@ defmodule SymphonyElixir.AgentRunner do
   defp pipeline_phase_instructions(:qa, _opts) do
     """
     Pipeline phase: independent QA. Before any other GitHub write, call `github_workflow` with operation `claim`; stop if the claim is rejected. This moves a requeued Ready item to QA and confirms an item already in QA. On a direct `qa` route there is no Build report; use `report_context.task` for the accepted commit, branch, required checks, and PR. Then read the issue's workpad and current-generation phase reports with `github_workflow` operation `read_workpad`; use the saved task records to identify the accepted commit, branch, required checks, and prior findings.
-    Symphony runs the configured host checks on the accepted SHA. `read_workpad` returns authoritative `report_context.host_checks`, required checks, and locale-specific canonical QA text. Copy host evidence exactly into the report and hidden JSON; identify it as host evidence, not agent work. Do not modify files or invent results.
+    Symphony runs the configured host checks on the accepted SHA. `read_workpad` returns authoritative `report_context.host_checks`, required checks, branch, base branch, PR number, and locale-specific canonical QA text. Copy host evidence exactly into the report and hidden JSON; identify it as host evidence, not agent work.
+    You may add or modify test and test-evidence files in the existing delivery. Do not change product implementation. For a high-risk coverage gap, first add a test that reproduces the scenario and run it; then complete the test-only coverage. If the test exposes a product defect or the correction needs product code, leave the product untouched and hand the reproduction plus unmet criterion back to Builder as a finding.
+    In `files`, list every file you added or modified with its repository-relative path and `change` (`added` or `modified`). Keep `changes` for a short summary. Put the exact verification command you ran in `verification_command` and in a matching agent check with its result and evidence. Review will inspect the PR diff against this file list and rerun that command on the delivered SHA.
+    If no files changed, keep the received SHA. If you changed files, commit and push them to the existing task branch, then verify the PR head and local HEAD have the same new SHA before handoff. Do not create another PR, change the base, or change product files. A push failure or another environment or permission failure is an operational blocker; diagnose it and hand off `blocked` without trying to repair product code.
     For every acceptance criterion, record its exact text, status, concrete procedure, and evidence references. Each reference must identify an agent check by id or a host check as `host:<exact command>`. A summary never covers an untested criterion.
     Record agent checks with their layer (`unit`, `component`, `e2e`, or `manual`), exact command when applicable, status, reproducible result, evidence reference, and whether they are required. Use only `passed`, `failed`, `unstable`, `skipped`, or `unavailable`; skipped, unstable, and unavailable checks need a reason. A required check that is not passed cannot approve QA.
     Keep Symphony-run results in `host_checks`; they are host evidence, not agent work. Include the accepted SHA. Analyze uncovered scenarios with impact and missing coverage, order high-risk gaps first, and consider errors, limits, permissions, and determinism when relevant.
@@ -855,6 +858,7 @@ defmodule SymphonyElixir.AgentRunner do
     Do not invoke the repository's `code-review` skill or its Markdown report format; perform this review directly under the pipeline's JSON contract.
     The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
     Do not modify files. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Resolve prior finding ids explicitly.
+    Inspect the PR diff and compare it with the latest QA report's `files`. Confirm QA changes are limited to tests and evidence, then run the exact `verification_command` from that report on the accepted SHA and record the result before passing Review.
     Update the persistent workpad with review findings and resolutions using `github_workflow` operation `workpad`. In the report, include only unresolved findings in `findings`; list each resolved finding's exact ID as a separate string in `resolutions`. Keep the Markdown and JSON conclusions consistent.
     The configured merge policy is #{merge_policy}. With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`, then call `request_merge`; if the host confirms the merge, hand off outcome `merged` so the host verifies it before closing the issue and moving the item to Done. If the gate reports `pull_request_base_not_in_head` or `pull_request_base_sha_mismatch`, finish with the existing `passed` report; the host requeues the task for Build. For other gate failures, leave the PR in Human Review.
     Finish with exactly one JSON object containing outcome (passed, merged, changes_requested, or blocked), summary, findings, resolutions, next_step, reason when blocked, and sha equal to the accepted commit.
@@ -1091,6 +1095,19 @@ defmodule SymphonyElixir.AgentRunner do
               }
             },
             "changes" => string_array_schema(),
+            "files" => %{
+              "type" => "array",
+              "items" => %{
+                "type" => "object",
+                "properties" => %{
+                  "path" => %{"type" => "string"},
+                  "change" => %{"type" => "string", "enum" => ["added", "modified"]}
+                },
+                "required" => ["path", "change"],
+                "additionalProperties" => false
+              }
+            },
+            "verification_command" => %{"type" => "string"},
             "checks" => %{
               "type" => "array",
               "items" => %{

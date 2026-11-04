@@ -14,13 +14,27 @@ defmodule SymphonyElixir.QAReport do
     checks = report["checks"]
     host_checks = Map.get(report, "host_checks", report["_host_checks"])
 
-    valid_checks?(checks) and valid_host_checks?(host_checks) and
+    valid_checks?(checks) and valid_host_checks?(host_checks) and valid_delivery?(report, checks, host_checks) and
       valid_criteria?(report["criteria"], checks, host_checks, criteria_from_description(issue_description)) and
       valid_gaps?(report["gaps"]) and
       valid_outcome?(report, checks, host_checks, required_host_checks)
   end
 
   def valid?(_report, _required_host_checks, _issue_description), do: false
+
+  defp valid_delivery?(report, checks, host_checks) do
+    valid_files?(report["files"]) and valid_verification_command?(report["verification_command"], checks, host_checks) and
+      valid_verification_result?(report, checks, host_checks)
+  end
+
+  defp valid_verification_result?(%{"outcome" => "passed"} = report, checks, host_checks) do
+    command = report["verification_command"]
+
+    Enum.any?(checks, &(&1["command"] == command and &1["status"] == "passed")) or
+      (is_list(host_checks) and Enum.any?(host_checks, &(&1["name"] == command and &1["status"] == "passed" and &1["source"] == "host")))
+  end
+
+  defp valid_verification_result?(_report, _checks, _host_checks), do: true
 
   @spec criteria_from_description(String.t() | nil) :: [String.t()] | nil
   def criteria_from_description(description) when is_binary(description) do
@@ -99,6 +113,27 @@ defmodule SymphonyElixir.QAReport do
   end
 
   defp valid_checks?(_checks), do: false
+
+  defp valid_files?(files) when is_list(files) do
+    Enum.all?(files, fn
+      %{"path" => path, "change" => change} ->
+        present?(path) and not String.starts_with?(path, "/") and
+          Enum.all?(Path.split(path), &(&1 not in [".", "..", ""])) and change in ["added", "modified"]
+
+      _ ->
+        false
+    end) and length(files) == MapSet.size(MapSet.new(files, & &1["path"]))
+  end
+
+  defp valid_files?(_files), do: false
+
+  defp valid_verification_command?(command, checks, host_checks) when is_binary(command) and is_list(checks) do
+    present?(command) and
+      (Enum.any?(checks, &(&1["command"] == command)) or
+         (is_list(host_checks) and Enum.any?(host_checks, &(&1["name"] == command and &1["source"] == "host"))))
+  end
+
+  defp valid_verification_command?(_command, _checks, _host_checks), do: false
 
   defp valid_check?(%{
          "id" => id,
