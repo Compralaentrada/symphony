@@ -1067,6 +1067,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     })
 
     orchestrator = start_orchestrator(SymphonyElixir.PipelineIntegrationTest.FinalizationDiagnosticAgent)
+    on_exit(fn -> stop_orchestrator(orchestrator) end)
 
     assert await(fn ->
              project_state(table, issue.id) == "Blocked" and
@@ -1092,14 +1093,14 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
       }
     })
 
+    refresh!(orchestrator, table)
+
     assert await(fn ->
              project_state(table, issue.id) == "Done" and
                match?({:ok, %{"status" => "done", "phase" => "finalize"}}, Store.get_task(issue.id))
            end)
 
     assert lookup(table, {:agent_calls, issue.id, :finalize}) == 1
-
-    stop_orchestrator(orchestrator)
   end
 
   test "open Project blockers pause pending Finalize work" do
