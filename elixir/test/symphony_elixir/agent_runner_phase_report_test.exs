@@ -906,6 +906,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert review_prompt =~ "report_context.review_verification"
       assert review_prompt =~ "Do not invoke shell commands yourself"
       assert review_prompt =~ "not_applicable"
+      assert review_prompt =~ "If the handoff result includes `requeued: true`, stop without calling `request_merge`"
       assert review_prompt =~ "The configured merge policy is human."
       assert review_prompt =~ "outcome (passed, merged, changes_requested, or blocked)"
       refute review_prompt =~ "finding-from-task"

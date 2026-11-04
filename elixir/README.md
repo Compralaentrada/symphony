@@ -90,7 +90,10 @@ head SHA, the current base SHA, an approved Review for the current attempt, and 
 If GitHub reports checks, they must also pass. The gate stops when GitHub cannot
 confirm any of that state. When the gate passes, Symphony merges the PR and verifies that GitHub
 reports it merged before closing the issue and moving the Project item to Done. Symphony never
-approves PRs automatically; a rejected gate leaves the PR in Human Review.
+approves PRs automatically. If the base advances before auto-merge, including before the approved
+Review handoff completes, Symphony requeues the task to Ready for Build; Build merges the current
+base, then QA and Review run again on the resulting SHA. Other rejected gate outcomes leave the PR
+in Human Review.
 For automatic Review, a handoff retried after the item has already reached Human Review is rejected:
 the runtime cannot distinguish a completed transition from a human move to that state. After a
 restart, reconciliation retains Human Review without merging and waits for a human decision.

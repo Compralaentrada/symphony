@@ -1126,36 +1126,136 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     submitted_report = Map.put(report, "outcome", outcome)
     report = normalize_agent_report(submitted_report, lane, context)
 
-    with {:ok, body} <- AgentReport.normalize_body(Map.get(arguments, "body"), report, submitted_report),
-         :ok <- validate_agent_pr_body(lane, report, issue),
-         :ok <- validate_agent_handoff_report(lane, report, context),
-         :ok <- AgentReport.validate_body(body, report),
-         {:ok, status} <- handoff_status(lane, report, settings),
+    result =
+      with {:ok, body} <- AgentReport.normalize_body(Map.get(arguments, "body"), report, submitted_report),
+           :ok <- validate_agent_pr_body(lane, report, issue),
+           :ok <- validate_agent_handoff_report(lane, report, context),
+           :ok <- AgentReport.validate_body(body, report),
+           {:ok, status} <- handoff_status(lane, report, settings),
+           {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
+           :ok <- handoff_source_status(lane, issue, current, status, settings),
+           {:ok, pr} <- handoff_pull_request(issue, context, report, tracker_settings, settings, request_fun),
+           {:ok, pr} <-
+             maybe_set_review_stage(issue, lane, report, pr, status, settings, tracker_settings, request_fun),
+           {:ok, closed_issue} <-
+             maybe_finalize_merged_issue(issue, context, report, pr, tracker_settings, settings, request_fun),
+           {:ok, comment} <-
+             publish_agent_report(issue, context, body, status, settings, tracker_settings, request_fun),
+           {:ok, status_evidence} <-
+             apply_project_status(issue, current, status, lane, settings, tracker_settings, request_fun) do
+        {:ok,
+         %{
+           "outcome" => report["outcome"],
+           "reason" => report["reason"],
+           "next_step" => report["next_step"],
+           "issue" => %{"id" => issue.id, "url" => issue.url},
+           "closed_issue" => closed_issue,
+           "project_item" => status_evidence,
+           "comment" => comment,
+           "pull_request" => pr,
+           "pull_request_body" => report["pull_request_body"],
+           "sha" => report["sha"]
+         }}
+      end
+
+    case {result, lane, report["outcome"], settings.merge_policy} do
+      {{:error, :pull_request_base_sha_mismatch}, "review", "passed", "auto"} ->
+        requeue_stale_review_handoff(
+          issue,
+          context,
+          report,
+          Map.get(arguments, "body"),
+          tracker_settings,
+          settings,
+          request_fun
+        )
+
+      _ ->
+        result
+    end
+  end
+
+  defp requeue_stale_review_handoff(issue, context, report, body, tracker_settings, settings, request_fun) do
+    task = context[:task] || %{}
+
+    with :ok <- validate_agent_lease(context),
          {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
-         :ok <- handoff_source_status(lane, issue, current, status, settings),
-         {:ok, pr} <- handoff_pull_request(issue, context, report, tracker_settings, settings, request_fun),
-         {:ok, pr} <- maybe_set_review_stage(issue, lane, report, pr, status, settings, tracker_settings, request_fun),
-         {:ok, closed_issue} <-
-           maybe_finalize_merged_issue(issue, context, report, pr, tracker_settings, settings, request_fun),
+         :ok <- handoff_source_status("review", issue, current, settings.statuses.human_review, settings),
+         {:ok, pr} <- pull_request(issue, settings, request_fun),
+         :ok <- validate_stale_review_handoff_pr(pr, task),
+         {:ok, saved} <- Store.get_task(issue.id),
+         true <- saved["generation"] == context.generation and saved["phase"] == "review" and saved["current_sha"] == task["current_sha"],
+         requeue_report = stale_base_requeue_report(report, pr, context),
+         requeue_text = stale_base_requeue_notice(pr, context) <> "\n\n" <> body,
+         {:ok, requeue_body} <- AgentReport.normalize_body(requeue_text, requeue_report, report),
          {:ok, comment} <-
-           publish_agent_report(issue, context, body, status, settings, tracker_settings, request_fun),
-         {:ok, status_evidence} <-
-           apply_project_status(issue, current, status, lane, settings, tracker_settings, request_fun) do
+           publish_agent_report(
+             issue,
+             context,
+             requeue_body,
+             settings.statuses.human_review,
+             settings,
+             tracker_settings,
+             request_fun
+           ),
+         {:ok, status_evidence} <- apply_project_status(issue, current, settings.statuses.ready, "review", settings, tracker_settings, request_fun),
+         :ok <- Store.replace_task_if_unchanged(saved, Map.put(saved, "stale_merge_retry", true)) do
       {:ok,
        %{
          "outcome" => report["outcome"],
          "reason" => report["reason"],
-         "next_step" => report["next_step"],
+         "next_step" => requeue_report["next_step"],
          "issue" => %{"id" => issue.id, "url" => issue.url},
-         "closed_issue" => closed_issue,
          "project_item" => status_evidence,
          "comment" => comment,
-         "pull_request" => pr,
+         "pull_request" => pr_evidence(pr),
          "pull_request_body" => report["pull_request_body"],
-         "sha" => report["sha"]
+         "sha" => report["sha"],
+         "requeued" => true
        }}
+    else
+      false -> {:error, :pull_request_base_sha_mismatch}
+      :stale -> {:error, :stale_agent_lease}
+      {:error, _reason} = error -> error
     end
   end
+
+  defp validate_stale_review_handoff_pr(nil, _task), do: {:error, :pull_request_not_found}
+
+  defp validate_stale_review_handoff_pr(pr, task) do
+    cond do
+      pr.state != "OPEN" -> {:error, :pull_request_not_open}
+      pr.merged -> {:error, :pull_request_already_merged}
+      pr.sha != task["current_sha"] -> {:error, :pull_request_head_sha_mismatch}
+      pr.branch != task["branch"] -> {:error, :pull_request_branch_mismatch}
+      pr.base != task["base_branch"] -> {:error, :pull_request_base_mismatch}
+      not is_binary(pr.base_sha) -> {:error, :pull_request_base_sha_unavailable}
+      pr.base_sha == task["base_sha"] -> {:error, :pull_request_base_sha_mismatch}
+      true -> :ok
+    end
+  end
+
+  defp stale_base_requeue_report(report, pr, %{report_locale: :es}) do
+    Map.merge(report, %{
+      "summary" => "Review validó la entrega, pero la base avanzó antes del handoff automático.",
+      "next_step" => "Integra la base vigente en Build y repite QA y Review sobre la nueva SHA.",
+      "base_change" => %{"reviewed_base_sha" => report["base_sha"], "current_base_sha" => pr.base_sha}
+    })
+  end
+
+  defp stale_base_requeue_report(report, pr, _context) do
+    Map.merge(report, %{
+      "summary" => "Review passed, but the base advanced before the automatic handoff.",
+      "next_step" => "Merge the current base in Build, then rerun QA and Review on the new SHA.",
+      "base_change" => %{"reviewed_base_sha" => report["base_sha"], "current_base_sha" => pr.base_sha}
+    })
+  end
+
+  defp stale_base_requeue_notice(pr, %{report_locale: :es}),
+    do: "La base configurada avanzó antes del handoff automático. Esta entrega debe volver a Build para integrar la base y repetir QA y Review. SHA de base actual: #{pr.base_sha}."
+
+  defp stale_base_requeue_notice(pr, _context),
+    do: "The configured base advanced before automatic handoff. Build must integrate the base and rerun QA and Review for this delivery. Current base SHA: #{pr.base_sha}."
 
   defp validate_agent_pr_body(lane, %{"outcome" => "ready"} = report, issue) when lane in ["build", "individual"],
     do: PRBody.validate_agent_body(report["pull_request_body"], issue.id)
@@ -1557,7 +1657,12 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     with {:ok, current} <- current_project_issue(issue, tracker_settings, request_fun),
          :ok <- handoff_source_status("review", issue, current, target, settings),
          {:ok, %{} = pr} <- pull_request(issue, settings, request_fun),
-         true <- outcome != "passed" or pr.base_sha == report["base_sha"],
+         :ok <-
+           if(
+             outcome != "passed" or pr.base_sha == report["base_sha"],
+             do: :ok,
+             else: {:error, :pull_request_base_sha_mismatch}
+           ),
          {:ok, updated} <- update_pull_request_stage(pr, stage, settings, request_fun) do
       {:ok, pr_evidence(updated)}
     end

@@ -945,6 +945,20 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
              )
   end
 
+  test "automatic Review requeues to Build when the base advances before handoff" do
+    {result, status, report_body, task, queries} = run_review_handoff("Review", "base-new")
+
+    assert {:ok, %{"outcome" => "passed", "project_item" => %{"status" => "Ready"}, "requeued" => true}} = result
+    assert status == "Ready"
+    assert {:ok, report} = AgentReport.decode_comment(report_body)
+    assert report["base_change"] == %{"reviewed_base_sha" => "base-old", "current_base_sha" => "base-new"}
+    assert {:ok, %{"stale_merge_retry" => true}} = Store.get_task(task["issue_id"])
+    assert Enum.any?(queries, &(&1 =~ "SymphonySetProjectStatus"))
+    assert Enum.any?(queries, &(&1 =~ "SymphonyAddIssueComment"))
+    refute Enum.any?(queries, &(&1 =~ "SymphonyMarkPipelinePullRequestReady"))
+    refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
+  end
+
   test "Build report persists the task branch for later phases" do
     report = %{"outcome" => "ready", "sha" => String.duplicate("a", 40)}
 
@@ -3176,6 +3190,137 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     calls = Agent.get(queries, &Enum.reverse/1)
     Agent.stop(queries)
     {result, calls}
+  end
+
+  defp run_review_handoff(initial_status, pr_base_sha) do
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    root = Path.join(System.tmp_dir!(), "symphony-review-handoff-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    number = System.unique_integer([:positive])
+    issue_id = "octo/app##{number}"
+    branch = "symphony/octo-app-#{number}"
+    sha = String.duplicate("a", 40)
+    old_base_sha = "base-old"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: issue_id,
+      branch_name: branch,
+      state: initial_status,
+      native_ref: %{repository: "octo/app", base_branch: "main", issue_node_id: "I_issue_#{number}"}
+    }
+
+    verification = %{
+      "status" => "passed",
+      "sha" => sha,
+      "base_sha" => old_base_sha,
+      "command" => "mix test",
+      "evidence" => "Host replay passed."
+    }
+
+    task = %{
+      "issue_id" => issue_id,
+      "generation" => 1,
+      "phase" => "review",
+      "status" => "review",
+      "attempts" => %{"review" => 1},
+      "branch" => branch,
+      "base_branch" => "main",
+      "current_sha" => sha,
+      "base_sha" => old_base_sha,
+      "required_checks" => ["mix test"],
+      "prior_findings" => []
+    }
+
+    assert :ok = Store.save_task(task)
+    assert :ok = Store.begin_phase(issue_id, 1, "review", 1)
+
+    report = %{
+      "outcome" => "passed",
+      "summary" => "Reviewed the accepted head and base.",
+      "sha" => sha,
+      "base_sha" => old_base_sha,
+      "findings" => [],
+      "resolutions" => [],
+      "next_step" => "Continue to the merge gate."
+    }
+
+    body = "Review passed.\n\n<!-- symphony:report:json\n#{Jason.encode!(report)}\n-->"
+    {:ok, remote} = Agent.start_link(fn -> %{status: initial_status, queries: [], report_body: nil} end)
+
+    request = fn query, variables, _settings ->
+      Agent.get_and_update(remote, fn state ->
+        review_handoff_response(query, variables, state, number, branch, sha, pr_base_sha)
+      end)
+    end
+
+    context = %{issue: issue, lane: :review, generation: 1, attempt: 1, task: task, review_verification: verification}
+
+    result =
+      Client.agent_operation(issue, context, "handoff", %{"report" => report, "body" => body},
+        tracker_settings: tracker_settings(%{"merge_policy" => "auto"}),
+        projects_request: request
+      )
+
+    state = Agent.get(remote, & &1)
+    Agent.stop(remote)
+    {result, state.status, state.report_body, task, Enum.reverse(state.queries)}
+  end
+
+  defp review_handoff_response(query, variables, state, number, branch, sha, pr_base_sha) do
+    state = %{state | queries: [query | state.queries]}
+
+    cond do
+      query =~ "SymphonyProject" ->
+        body = project_response([issue_item("octo/app", number, state.status)])
+        {{:ok, %{status: 200, body: body}}, state}
+
+      query =~ "SymphonyPipelinePullRequest" ->
+        pull_request = %{
+          "id" => "PR_#{number}",
+          "number" => number,
+          "url" => "https://github.com/octo/app/pull/#{number}",
+          "state" => "OPEN",
+          "isDraft" => true,
+          "mergedAt" => nil,
+          "baseRefName" => "main",
+          "baseRefOid" => pr_base_sha,
+          "headRefName" => branch,
+          "headRefOid" => sha,
+          "reviewDecision" => nil,
+          "body" => ""
+        }
+
+        body = %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([pull_request])}}}
+        {{:ok, %{status: 200, body: body}}, state}
+
+      query =~ "SymphonyPipelineReportComments" ->
+        comments = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
+        body = %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}
+        {{:ok, %{status: 200, body: body}}, state}
+
+      query =~ "SymphonyAddIssueComment" ->
+        comment = %{"id" => "IC_review_#{number}", "url" => "https://github.com/octo/app/issues/#{number}#issuecomment-1"}
+        body = %{"data" => %{"addComment" => %{"commentEdge" => %{"node" => comment}}}}
+        {{:ok, %{status: 200, body: body}}, %{state | report_body: variables["body"]}}
+
+      query =~ "SymphonySetProjectStatus" ->
+        body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
+        {{:ok, %{status: 200, body: body}}, %{state | status: "Ready"}}
+
+      true ->
+        flunk("unexpected handoff query: #{query}")
+    end
   end
 
   defp merge_gate_pull_request_response(query, options, queries, number, branch, sha) do
