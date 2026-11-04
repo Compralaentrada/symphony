@@ -1612,12 +1612,15 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     File.rm_rf!(Path.dirname(path))
   end
 
-  test "uncertain PR and report responses reconcile after orchestrator restarts without duplicates" do
+  test "uncertain PR, report, and status responses reconcile after orchestrator restarts without duplicates" do
     issue = issue("octo/app#5", 5)
     table = start_board([issue], %{issue.id => %{build: [build("sha-five", issue.id)], qa: [qa("sha-five")], review: [review("sha-five")]}})
     path = pipeline_database!(table, retry_backoff_ms: 300_000)
+    human_comment = %{"id" => "human-comment", "author" => "human", "body" => "Please keep this note."}
+    :ets.insert(table, {{:issue_comments, issue.id}, [human_comment]})
     :ets.insert(table, {:uncertain_pr_once, true})
     :ets.insert(table, {:uncertain_report_once, true})
+    :ets.insert(table, {{:uncertain_transition_once, issue.id}, "Human Review"})
 
     orchestrator = start_orchestrator()
     assert await(fn -> pull_request(table, issue.id) != nil end)
@@ -1630,10 +1633,36 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     stop_orchestrator(orchestrator)
 
     orchestrator = start_orchestrator()
-    assert await(fn -> project_state(table, issue.id) == "Human Review" end)
+
+    assert await(fn ->
+             project_state(table, issue.id) == "Human Review" and
+               lookup(table, {:status_unconfirmed, issue.id}) == true and
+               not Store.agent_lease_active?(issue.id, 1, "review", 1)
+           end)
+
+    stop_orchestrator(orchestrator)
+    orchestrator = start_orchestrator()
+
+    assert await(fn ->
+             project_state(table, issue.id) == "Human Review" and
+               match?({:ok, %{"status" => "human_review"}}, Store.get_task(issue.id))
+           end)
+
     assert report_phases(table, issue.id) == [:build, :qa, :review]
     assert pull_request_count(table, issue.id) == 1
     assert agent_calls(table, issue.id) == 5
+    assert agent_calls(table, issue.id, :review) == 1
+    assert lookup(table, {:status_transitions, issue.id}) |> Enum.frequencies() == %{"QA" => 1, "Review" => 1, "Human Review" => 1}
+    comments = lookup(table, {:issue_comments, issue.id})
+    assert Enum.filter(comments, &(&1["author"] == "human")) == [human_comment]
+
+    assert Enum.filter(comments, &(&1["author"] == "symphony")) |> Enum.map(& &1["marker"]) |> Enum.sort() == [
+             "#{issue.id}:1:build",
+             "#{issue.id}:1:qa",
+             "#{issue.id}:1:review"
+           ]
+
+    assert (lookup(table, :coordinator_write_calls) || 0) == 0
 
     stop_orchestrator(orchestrator)
     File.rm_rf!(Path.dirname(path))
@@ -2858,9 +2887,20 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
     end
   end
 
-  def claim_issue(issue), do: set_pipeline_status(issue, :building)
-  def complete_issue(issue), do: set_pipeline_status(issue, :done)
-  def block_issue(issue, _reason), do: set_pipeline_status(issue, :blocked)
+  def claim_issue(issue) do
+    record_coordinator_write()
+    set_pipeline_status(issue, :building)
+  end
+
+  def complete_issue(issue) do
+    record_coordinator_write()
+    set_pipeline_status(issue, :done)
+  end
+
+  def block_issue(issue, _reason) do
+    record_coordinator_write()
+    set_pipeline_status(issue, :blocked)
+  end
 
   def workflow_operation(context, "workpad", _arguments) do
     with :ok <- validate_lease(context) do
@@ -3005,6 +3045,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
   def phase_reports(issue), do: {:ok, lookup(table(), {:remote_reports, issue.id}) || []}
 
   def publish_phase_report(issue, marker, body, phase) do
+    record_coordinator_write()
     table = table()
     key = {:report, issue.id, phase}
     reports = lookup(table, {:reports, issue.id}) || %{}
@@ -3143,6 +3184,16 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
     reports = lookup(table(), {:reports, issue.id}) || %{}
     body = Jason.encode!(report, pretty: true)
     :ets.insert(table(), {{:reports, issue.id}, Map.put(reports, marker, body)})
+    comments = lookup(table(), {:issue_comments, issue.id}) || []
+    report_comment = %{"author" => "symphony", "marker" => marker, "body" => body}
+
+    comments =
+      case Enum.find_index(comments, &(&1["marker"] == marker)) do
+        nil -> comments ++ [report_comment]
+        index -> List.replace_at(comments, index, Map.merge(Enum.at(comments, index), report_comment))
+      end
+
+    :ets.insert(table(), {{:issue_comments, issue.id}, comments})
 
     if lookup(table(), :uncertain_report_once) do
       :ets.delete(table(), :uncertain_report_once)
@@ -3171,8 +3222,25 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
           do: %{updated | native_ref: Map.put(updated.native_ref || %{}, :issue_state, "closed")},
           else: updated
 
+      current = fetch_issue(table(), issue.id)
+      previous_status = current_project_status(current)
+      next_status = current_project_status(updated)
       :ets.insert(table(), {{:issue, issue.id}, updated})
-      :ok
+
+      if previous_status != next_status do
+        transitions = lookup(table(), {:status_transitions, issue.id}) || []
+        :ets.insert(table(), {{:status_transitions, issue.id}, transitions ++ [next_status]})
+      end
+
+      case :ets.lookup(table(), {:uncertain_transition_once, issue.id}) do
+        [{{:uncertain_transition_once, _issue_id}, ^next_status}] when previous_status != next_status ->
+          :ets.delete(table(), {:uncertain_transition_once, issue.id})
+          :ets.insert(table(), {{:status_unconfirmed, issue.id}, true})
+          {:error, :response_lost}
+
+        _ ->
+          :ok
+      end
     end
   end
 
@@ -3223,6 +3291,10 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
   end
 
   defp report_marker(issue, context, lane), do: "#{issue.id}:#{context.generation}:#{lane}"
+
+  defp record_coordinator_write do
+    :ets.update_counter(table(), :coordinator_write_calls, {2, 1}, {:coordinator_write_calls, 0})
+  end
 
   defp comment_evidence(issue, marker),
     do: %{"id" => "comment-#{marker}", "url" => "#{issue.url}#comment-#{marker}"}
