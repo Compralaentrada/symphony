@@ -41,6 +41,20 @@ defmodule SymphonyElixir.PilotDocumentationTest do
     end
   end
 
+  test "merge policy matrix documents automatic recovery and completion" do
+    runbook = File.read!(@runbook)
+
+    for outcome <- [
+          "cierra la issue y mueve el item del Project a `Done` tras verificar el merge",
+          "conserva la tarea allí para una decisión humana y no asume quién movió el item",
+          "Build integra la base en la rama de la tarea",
+          "QA y Review se repiten sobre el SHA resultante",
+          "el rollup de GitHub puede faltar y, si existe, debe ser satisfactorio"
+        ] do
+      assert runbook =~ outcome, "merge policy matrix is missing #{outcome}"
+    end
+  end
+
   test "documented policy and capacity options match the configuration schema" do
     runbook = File.read!(@runbook)
     evidence_template = File.read!(@evidence_template)
