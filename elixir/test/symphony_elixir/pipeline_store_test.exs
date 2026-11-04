@@ -4,7 +4,8 @@ defmodule SymphonyElixir.PipelineStoreTest do
   alias SymphonyElixir.Pipeline.Store
 
   setup do
-    root = Path.join(System.tmp_dir!(), "symphony-pipeline-store-#{System.unique_integer([:positive])}")
+    suffix = Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
+    root = Path.join(System.tmp_dir!(), "symphony-pipeline-store-#{suffix}")
     database_path = Path.join(root, "pipeline.sqlite3")
     previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
     Application.put_env(:symphony_elixir, :pipeline_database_path, database_path)

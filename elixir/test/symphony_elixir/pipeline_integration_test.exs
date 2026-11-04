@@ -161,7 +161,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert report_phases(table, feature_issue.id) == [:build, :qa, :review]
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "a slow skill preflight does not stop the orchestrator responding" do
@@ -1514,7 +1514,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert agent_calls(table, issue.id) == 6
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "legacy issue status mappings do not remap the canonical pipeline" do
@@ -1555,7 +1555,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert await(fn -> project_state(table, issue.id) == statuses.done end)
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "Blocked Review reruns Build and QA when the pull request head changes" do
@@ -1587,7 +1587,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert pull_request(table, issue.id).sha == lookup(table, {:remote_sha, issue.id})
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "Blocked QA reruns Build when the pull request head changes" do
@@ -1619,7 +1619,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert pull_request(table, issue.id).sha == lookup(table, {:remote_sha, issue.id})
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "Blocked QA without an accepted SHA restarts Build before retrying" do
@@ -1638,7 +1638,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert :ok = Store.save_task(task)
     assert {:ok, %{"phase" => "build", "status" => "building", "current_sha" => nil}, "build"} = Pipeline.prepare(issue)
 
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "no_changes waits for human confirmation, Blocked resumes, and transient failures retry" do
@@ -1712,7 +1712,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert lookup(table, {:report, unavailable_check.id, "qa"}) =~ "unavailable"
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "uncertain PR, report, and status responses reconcile after orchestrator restarts without duplicates" do
@@ -1768,7 +1768,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert (lookup(table, :coordinator_write_calls) || 0) == 0
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "closed merged work resumes Finalize after a lost report response and restart" do
@@ -1869,7 +1869,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
              )
 
     assert Jason.decode!(checkpoint)["_remote_evidence"] != []
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "closed work preserves Finalize workspace and retry backoff after failures" do
@@ -1933,7 +1933,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert lookup(table, {:workspace_existed, issue.id, :finalize, 3})
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "PR creation revalidates the pushed SHA after Build commits its outbox" do
@@ -1950,7 +1950,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert pull_request_count(table, issue.id) == 0
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "QA retries a report missing the changes summary" do
@@ -1974,7 +1974,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert report_phases(table, issue.id) == [:build, :qa, :review]
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "QA host checks reject workspace drift after the accepted Build SHA" do
@@ -2004,7 +2004,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
            |> Enum.any?(&String.contains?(&1, "workspace"))
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "QA publishes test-only changes at the new PR SHA before Review" do
@@ -2016,7 +2016,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
     on_exit(fn ->
       if Process.alive?(orchestrator), do: stop_orchestrator(orchestrator)
-      File.rm_rf!(Path.dirname(path))
+      File.rm_rf(Path.dirname(path))
     end)
 
     assert await(fn -> project_state(table, issue.id) == "Human Review" end)
@@ -2068,7 +2068,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert lookup(table, {:agent_prior_findings, issue.id, :review, 2}) == [finding]
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "a Review report with findings returns to Build instead of Human Review" do
@@ -2097,7 +2097,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert lookup(table, {:agent_prior_findings, issue.id, :review, 2}) == [finding]
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   defp start_board(issues, agent_results) do
@@ -2117,7 +2117,8 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
   defp pipeline_database!(table, opts \\ []) do
     env_keys = [:pipeline_test_board, :pipeline_database_path, :pipeline_test_workspace, :github_projects_client_module]
     previous_env = Map.new(env_keys, &{&1, Application.fetch_env(:symphony_elixir, &1)})
-    root = Path.join(System.tmp_dir!(), "symphony-pipeline-#{System.unique_integer([:positive])}")
+    suffix = Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
+    root = Path.join(System.tmp_dir!(), "symphony-pipeline-#{suffix}")
     File.mkdir_p!(root)
     path = Path.join(root, "pipeline.sqlite3")
     workspace = Path.join(root, "workspaces")
