@@ -110,6 +110,11 @@ keeps the incoming SHA. Product defects return to Build, while environment or pe
 are blocked with a diagnosis. Review inspects the PR diff against the QA file list and repeats the
 verification command on the accepted SHA before advancing. Each host check records the SHA it ran
 against; other required checks must have passing evidence for the reviewed SHA.
+Review sends findings limited to tests, commands, or evidence back to QA on the existing branch, PR,
+and SHA. Product findings and mixed findings that require product changes return first to Build;
+after a new Build delivery, QA and Review repeat on that SHA. Finding IDs and resolution history
+carry forward. Environment, access, tool, or unavailable-check failures are blocked with the command
+or resource and a concrete recovery action.
 
 ## Prerequisites
 

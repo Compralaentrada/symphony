@@ -15,4 +15,15 @@ defmodule SymphonyElixir.PipelineFindingsTest do
     refute Findings.resolved?(nil, [finding_id])
     refute Findings.resolved?(finding_id, nil)
   end
+
+  test "Review returns only QA-owned findings to QA and sends mixed findings to Build" do
+    qa_finding = %{"id" => "QA-1", "resolution_phase" => "qa"}
+    product_finding = %{"id" => "REV-1", "resolution_phase" => "build"}
+    legacy_finding = %{"id" => "QA-legacy"}
+
+    assert Findings.review_rework_phase([qa_finding]) == "qa"
+    assert Findings.review_rework_phase([qa_finding, product_finding]) == "build"
+    assert Findings.review_rework_phase([qa_finding, legacy_finding]) == "build"
+    assert Findings.review_rework_phase([]) == "build"
+  end
 end
