@@ -23,5 +23,12 @@ defmodule SymphonyElixir.Pipeline.Findings do
 
   def resolved?(_finding_id, _resolutions), do: false
 
+  @spec review_rework_phase(term()) :: String.t()
+  def review_rework_phase(findings) when is_list(findings) and findings != [] do
+    if Enum.all?(findings, &match?(%{"resolution_phase" => "qa"}, &1)), do: "qa", else: "build"
+  end
+
+  def review_rework_phase(_findings), do: "build"
+
   defp present?(value), do: is_binary(value) and String.trim(value) != ""
 end

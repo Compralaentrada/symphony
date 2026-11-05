@@ -559,16 +559,16 @@ defmodule SymphonyElixir.AgentRunner do
     do: review_verification_failure(verification, "QA-VERIFICATION", "The configured QA verification command exited with status #{status}.")
 
   defp review_check_result({:error, {:workspace_sha_mismatch, expected_sha, observed_sha}}, verification),
-    do: review_verification_failure(verification, "QA-SHA", "The workspace was at SHA #{observed_sha || "unavailable"}, not accepted SHA #{expected_sha}.")
+    do: review_verification_unavailable(verification, "QA-SHA", "The workspace was at SHA #{observed_sha || "unavailable"}, not accepted SHA #{expected_sha}.")
 
   defp review_check_result({:error, {:workspace_dirty, _expected_sha, _observed_sha}}, verification),
-    do: review_verification_failure(verification, "QA-WORKSPACE", "The QA verification command could not run on a clean accepted workspace.")
+    do: review_verification_unavailable(verification, "QA-WORKSPACE", "The QA verification command could not run on a clean accepted workspace.")
 
   defp review_check_result({:error, :check_unavailable}, verification),
-    do: review_verification_failure(verification, "QA-VERIFICATION", "The configured QA verification command is unavailable on the task host.")
+    do: review_verification_unavailable(verification, "QA-VERIFICATION", "The configured QA verification command is unavailable on the task host.")
 
   defp review_check_result(other, verification),
-    do: review_verification_failure(verification, "QA-VERIFICATION", "The QA verification command could not be reproduced: #{inspect(other)}.")
+    do: review_verification_unavailable(verification, "QA-VERIFICATION", "The QA verification command could not be reproduced: #{inspect(other)}.")
 
   defp invalid_review_verification(task, current_base_sha, evidence) do
     verification = %{"command" => nil, "sha" => task["current_sha"], "base_sha" => current_base_sha}
@@ -589,6 +589,9 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp review_verification_failure(verification, finding_id, evidence),
     do: Map.merge(verification, %{"status" => "failed", "evidence" => evidence, "finding_id" => finding_id})
+
+  defp review_verification_unavailable(verification, finding_id, evidence),
+    do: Map.merge(verification, %{"status" => "unavailable", "evidence" => evidence, "finding_id" => finding_id})
 
   @doc false
   @spec review_verification_for_test(Path.t(), Issue.t(), keyword(), worker_host()) :: map() | {:error, term()}
@@ -1013,7 +1016,7 @@ defmodule SymphonyElixir.AgentRunner do
     Then call `github_workflow` with operation `read_workpad` and use all current-generation phase reports and `report_context.task` to identify the accepted head SHA, base branch and base SHA, PR number, QA report, evidence, and every prior finding. Include the task's branch, base branch, PR number, current head SHA, and accepted base SHA in your report. Use the QA report's host-check evidence for its recorded SHA; do not require a separate GitHub status context for Symphony's host-run check.
     Do not invoke the repository's `code-review` skill or its Markdown report format; perform this review directly under the pipeline's JSON contract.
     The task's Markdown requirement applies only to GitHub comments; this response is the internal phase result.
-    Do not modify files. Each finding must include the exact keys id, reproduction, and criterion as non-empty strings. Keep every finding ID stable.
+    Do not modify files. Each Review finding must include non-empty `id`, `reproduction`, and `criterion` strings, plus `resolution_phase`: `qa` when the correction is limited to tests, commands, or evidence; `build` when product code must change or findings are mixed. Keep every finding ID stable. A result unavailable because of environment, access, tool, or check availability must be `blocked`, with the command/resource in `reason` and a concrete recovery action in `next_step`.
     Inspect the PR diff and compare it with the latest QA report's `files`. Confirm QA changes are limited to tests and evidence. Symphony has already repeated the report's exact `verification_command` on the same clean checkout and accepted SHA when it exactly matched a configured required check. Read `report_context.review_verification`; a failed, unavailable, or stale result must never pass Review. Do not invoke shell commands yourself.
     For every prior finding, report one resolution record with its exact `id` and `status`: `resolved` requires concrete `evidence`, `open` requires a `reason` and remains in `findings`, and `not_applicable` requires a `reason`. Do not resolve a finding without evidence or a not-applicable reason. Update the persistent workpad with review findings and resolutions using `github_workflow` operation `workpad`. Keep the Markdown and JSON conclusions consistent.
     The configured merge policy is #{merge_policy}. With human merge policy, hand off outcome `passed` to prepare the PR for human review. With auto merge policy, first hand off `passed`. If the handoff result includes `requeued: true`, stop without calling `request_merge`; the host returned the task to Ready because the base advanced, and Build, QA, and Review must run again. Otherwise call `request_merge`; if the host confirms the merge, hand off outcome `merged` so the host verifies it before closing the issue and moving the item to Done. If the gate reports `pull_request_base_not_in_head` or `pull_request_base_sha_mismatch`, finish with the existing `passed` report; the host requeues the task for Build. For other gate failures, leave the PR in Human Review.
@@ -1208,6 +1211,24 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp phase_report_schema(phase) when phase in [:qa, :review] do
+    finding_properties = %{
+      "id" => %{"type" => "string"},
+      "reproduction" => %{"type" => "string"},
+      "criterion" => %{"type" => "string"}
+    }
+
+    finding_required = ["id", "reproduction", "criterion"]
+
+    {finding_properties, finding_required} =
+      if phase == :review do
+        {
+          Map.put(finding_properties, "resolution_phase", %{"type" => "string", "enum" => ["build", "qa"]}),
+          finding_required ++ ["resolution_phase"]
+        }
+      else
+        {finding_properties, finding_required}
+      end
+
     properties = %{
       "outcome" => %{
         "type" => "string",
@@ -1218,12 +1239,8 @@ defmodule SymphonyElixir.AgentRunner do
         "type" => "array",
         "items" => %{
           "type" => "object",
-          "properties" => %{
-            "id" => %{"type" => "string"},
-            "reproduction" => %{"type" => "string"},
-            "criterion" => %{"type" => "string"}
-          },
-          "required" => ["id", "reproduction", "criterion"],
+          "properties" => finding_properties,
+          "required" => finding_required,
           "additionalProperties" => false
         }
       },
@@ -1306,7 +1323,7 @@ defmodule SymphonyElixir.AgentRunner do
               "type" => "object",
               "properties" => %{
                 "command" => %{"type" => ["string", "null"]},
-                "status" => %{"type" => "string", "enum" => ["passed", "failed"]},
+                "status" => %{"type" => "string", "enum" => ["passed", "failed", "unavailable"]},
                 "evidence" => %{"type" => "string"},
                 "sha" => %{"type" => ["string", "null"]},
                 "base_sha" => %{"type" => ["string", "null"]},

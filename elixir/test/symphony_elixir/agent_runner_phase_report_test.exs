@@ -135,6 +135,32 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
     assert verification["evidence"] =~ "status 1"
   end
 
+  test "Review records an unavailable replay as an operational blocker" do
+    sha = String.duplicate("a", 40)
+    base_sha = String.duplicate("b", 40)
+    command = "mix test"
+    issue = %Issue{id: "octo/app#59", identifier: "octo/app#59", description: "Run the configured tests."}
+    report = review_qa_report(command, sha, base_sha, command)
+
+    verification =
+      AgentRunner.review_verification_for_test(
+        "workspace",
+        issue,
+        [
+          pipeline_task: review_task(sha, base_sha, [command]),
+          current_base_sha: base_sha,
+          phase_reports_fun: fn _issue -> {:ok, [qa_report_entry(report)]} end,
+          review_check_runner: fn _workspace, _command, _sha, _issue, _host -> {:error, :check_unavailable} end
+        ],
+        nil
+      )
+
+    assert verification["status"] == "unavailable"
+    assert verification["command"] == command
+    assert verification["finding_id"] == "QA-VERIFICATION"
+    assert verification["evidence"] =~ "unavailable"
+  end
+
   test "does not treat a failed completed turn as a phase report" do
     test_root =
       Path.join(
@@ -904,6 +930,9 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert review_prompt =~ "new session"
       assert review_prompt =~ "For an issue labeled `qa`, inspect the QA report and the diff of tests/evidence only"
       assert review_prompt =~ "report_context.review_verification"
+      assert review_prompt =~ "resolution_phase"
+      assert review_prompt =~ "findings are mixed"
+      assert review_prompt =~ "must be `blocked`"
       assert review_prompt =~ "Do not invoke shell commands yourself"
       assert review_prompt =~ "not_applicable"
       assert review_prompt =~ "If the handoff result includes `requeued: true`, stop without calling `request_merge`"
@@ -936,9 +965,10 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert "findings" in schema["required"]
       assert "base_sha" in schema["required"]
       assert "qa_verification" in schema["required"]
-      assert get_in(schema, ["properties", "findings", "items", "required"]) == ["id", "reproduction", "criterion"]
+      assert get_in(schema, ["properties", "findings", "items", "required"]) == ["id", "reproduction", "criterion", "resolution_phase"]
+      assert get_in(schema, ["properties", "findings", "items", "properties", "resolution_phase", "enum"]) == ["build", "qa"]
       assert get_in(schema, ["properties", "resolutions", "items", "properties", "status", "enum"]) == ["resolved", "open", "not_applicable"]
-      assert get_in(schema, ["properties", "qa_verification", "properties", "status", "enum"]) == ["passed", "failed"]
+      assert get_in(schema, ["properties", "qa_verification", "properties", "status", "enum"]) == ["passed", "failed", "unavailable"]
       assert is_map(get_in(correction_turn, ["params", "outputSchema"]))
     after
       File.rm_rf(test_root)

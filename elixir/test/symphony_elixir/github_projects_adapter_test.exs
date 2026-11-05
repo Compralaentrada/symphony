@@ -847,6 +847,58 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
              Client.normalize_agent_report_for_test(report, "review", %{task: %{"prior_findings" => [resolved]}})
   end
 
+  test "Review routes QA-only findings to QA and mixed findings to Build" do
+    qa_finding = %{
+      "id" => "QA-EVIDENCE",
+      "reproduction" => "Run the configured QA command.",
+      "criterion" => "Its saved evidence matches the accepted SHA.",
+      "resolution_phase" => "qa"
+    }
+
+    product_finding = %{
+      "id" => "REV-PRODUCT",
+      "reproduction" => "Run the affected product path.",
+      "criterion" => "Product behavior matches the acceptance criterion.",
+      "resolution_phase" => "build"
+    }
+
+    context = %{report_locale: :es, task: %{"prior_findings" => []}}
+
+    qa_result = Client.normalize_agent_report_for_test(%{"outcome" => "changes_requested", "findings" => [qa_finding]}, "review", context)
+    mixed_result = Client.normalize_agent_report_for_test(%{"outcome" => "changes_requested", "findings" => [qa_finding, product_finding]}, "review", context)
+
+    assert qa_result["findings"] == [qa_finding]
+    assert qa_result["next_step"] =~ "Vuelve a QA"
+    assert Pipeline.Findings.review_rework_phase(qa_result["findings"]) == "qa"
+    assert mixed_result["findings"] == [qa_finding, product_finding]
+    assert mixed_result["next_step"] =~ "Build"
+    assert Pipeline.Findings.review_rework_phase(mixed_result["findings"]) == "build"
+  end
+
+  test "an unavailable Review check blocks with the command and a recovery action" do
+    verification = %{
+      "command" => "mise exec -- mix test",
+      "status" => "unavailable",
+      "evidence" => "The configured command is unavailable on the task host.",
+      "sha" => String.duplicate("a", 40),
+      "base_sha" => String.duplicate("b", 40),
+      "finding_id" => "QA-VERIFICATION"
+    }
+
+    result =
+      Client.normalize_agent_report_for_test(
+        %{"outcome" => "passed", "findings" => [], "resolutions" => []},
+        "review",
+        %{report_locale: :es, task: %{"prior_findings" => []}, review_verification: verification}
+      )
+
+    assert result["outcome"] == "blocked"
+    assert result["reason"] =~ "mise exec -- mix test"
+    assert result["reason"] =~ "No está disponible"
+    assert result["next_step"] =~ "Repara o habilita"
+    assert result["findings"] == []
+  end
+
   test "a normalized report visibly identifies the authoritative outcome and pending findings" do
     submitted = %{"outcome" => "passed", "findings" => []}
     finding = %{"id" => "QA-2", "reproduction" => "Still fails", "criterion" => "Works"}
@@ -1383,8 +1435,12 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert %{
              "outcome" => "blocked",
              "summary" => "Symphony no pudo ejecutar todas las comprobaciones requeridas.",
-             "reason" => "Symphony no pudo ejecutar todas las comprobaciones requeridas."
+             "reason" => "La comprobación requerida `mix test` no está disponible en el host de tareas.",
+             "next_step" => recovery
            } = Client.normalize_agent_report_for_test(%{"outcome" => "passed"}, "qa", unavailable)
+
+    assert recovery =~ "mix test"
+    assert recovery =~ "vuelve a ejecutar QA"
 
     assert %{
              "outcome" => "changes_requested",
@@ -1884,7 +1940,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
              AgentReport.normalize_body(unsafe_body, Map.put(unsafe_report, "unsupported", self()))
   end
 
-  test "Review defects return the Project item to Building" do
+  test "Review routes findings, rejects stale SHA, and reconciles an uncertain QA handoff" do
     previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
     root = Path.join(System.tmp_dir!(), "symphony-project-review-defects-#{System.unique_integer([:positive])}")
     Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
@@ -1928,7 +1984,11 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     assert :ok = Store.save_task(task)
     assert :ok = Store.begin_phase(issue_id, 1, "review", 1)
-    {:ok, remote} = Agent.start_link(fn -> %{status: "Ready", draft: false} end)
+
+    {:ok, remote} =
+      Agent.start_link(fn ->
+        %{status: "Ready", draft: false, comments: [], lose_qa_status_once: true, status_updates: 0}
+      end)
 
     request_fun = fn query, variables, _settings ->
       Agent.get_and_update(remote, fn data ->
@@ -1953,13 +2013,29 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
             {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([pr])}}}}}, data}
 
           query =~ "SymphonyPipelineReportComments" ->
-            comments = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
+            comments = %{"nodes" => data.comments, "pageInfo" => %{"hasNextPage" => false}}
             {{:ok, %{status: 200, body: %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}}}, data}
 
           query =~ "SymphonyAddIssueComment" ->
-            comment = %{"id" => "IC_review", "url" => "https://github.com/octo/app/issues/#{number}#issuecomment-1"}
+            comment = %{
+              "id" => "IC_review_#{length(data.comments) + 1}",
+              "url" => "https://github.com/octo/app/issues/#{number}#issuecomment-#{length(data.comments) + 1}",
+              "author" => %{"login" => "agent"},
+              "body" => variables["body"]
+            }
+
             body = %{"data" => %{"addComment" => %{"commentEdge" => %{"node" => comment}}}}
-            {{:ok, %{status: 200, body: body}}, data}
+            {{:ok, %{status: 200, body: body}}, %{data | comments: data.comments ++ [comment]}}
+
+          query =~ "SymphonyPipelineViewer" ->
+            {{:ok, %{status: 200, body: %{"data" => %{"viewer" => %{"login" => "agent"}}}}}, data}
+
+          query =~ "SymphonyUpdateAgentReport" ->
+            comment = Enum.find(data.comments, &(&1["id"] == variables["id"]))
+            updated = Map.put(comment, "body", variables["body"])
+            comments = Enum.map(data.comments, &if(&1["id"] == variables["id"], do: updated, else: &1))
+            body = %{"data" => %{"updateIssueComment" => %{"issueComment" => updated}}}
+            {{:ok, %{status: 200, body: body}}, %{data | comments: comments}}
 
           query =~ "SymphonyConvertPipelinePullRequestToDraft" ->
             pr = %{
@@ -1979,8 +2055,14 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
           query =~ "SymphonySetProjectStatus" ->
             body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
-            status = %{"option-review" => "Review", "option-building" => "Building"}[variables["optionId"]]
-            {{:ok, %{status: 200, body: body}}, %{data | status: status}}
+            status = %{"option-review" => "Review", "option-building" => "Building", "option-qa" => "QA"}[variables["optionId"]]
+            updated = %{data | status: status, status_updates: data.status_updates + 1}
+
+            if status == "QA" and data.lose_qa_status_once do
+              {{:error, :response_lost}, %{updated | lose_qa_status_once: false}}
+            else
+              {{:ok, %{status: 200, body: body}}, updated}
+            end
 
           true ->
             flunk("unexpected GitHub Projects query: #{query}")
@@ -1988,7 +2070,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       end)
     end
 
-    finding = %{"id" => "REV-1", "reproduction" => "Run the affected path.", "criterion" => "The review criterion passes."}
+    finding = %{"id" => "REV-1", "reproduction" => "Run the affected path.", "criterion" => "The review criterion passes.", "resolution_phase" => "build"}
 
     report = %{
       "outcome" => "defects_found",
@@ -2035,6 +2117,68 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
     assert Agent.get(remote, & &1.status) == "Building"
     assert Agent.get(remote, & &1.draft)
+
+    task = Map.put(task, "attempts", %{"review" => 2})
+    assert :ok = Store.save_task(task)
+    assert :ok = Store.begin_phase(issue_id, 1, "review", 2)
+    Agent.update(remote, &%{&1 | status: "Review"})
+    context = %{context | attempt: 2, task: task}
+
+    qa_finding = %{
+      "id" => "QA-EVIDENCE-1",
+      "reproduction" => "Run the configured QA command and inspect the saved evidence.",
+      "criterion" => "The QA command and evidence match the accepted SHA.",
+      "resolution_phase" => "qa"
+    }
+
+    qa_report = %{
+      "outcome" => "changes_requested",
+      "summary" => "Review found a QA evidence defect.",
+      "findings" => [qa_finding],
+      "resolutions" => [],
+      "next_step" => "Return the finding to QA.",
+      "sha" => sha,
+      "branch" => issue.branch_name,
+      "base_branch" => "main"
+    }
+
+    stale_report = Map.put(qa_report, "sha", String.duplicate("a", 40))
+    stale_body = "## Review report\n\nEvidence is stale.\n\n<!-- symphony:report:json\n#{Jason.encode!(stale_report, pretty: true)}\n-->"
+
+    assert {:error, :review_report_sha_mismatch} =
+             Client.agent_operation(
+               issue,
+               context,
+               "handoff",
+               %{"outcome" => "changes_requested", "report" => stale_report, "body" => stale_body},
+               tracker_settings: tracker_settings(),
+               projects_request: request_fun
+             )
+
+    assert Agent.get(remote, & &1.status) == "Review"
+    assert Agent.get(remote, & &1.status_updates) == 2
+
+    qa_body = "## Review report\n\nReview found QA evidence that needs correction.\n\n<!-- symphony:report:json\n#{Jason.encode!(qa_report, pretty: true)}\n-->"
+    qa_arguments = %{"outcome" => "changes_requested", "report" => qa_report, "body" => qa_body}
+
+    assert {:error, {:github_projects_api_error, _}} =
+             Client.agent_operation(issue, context, "handoff", qa_arguments,
+               tracker_settings: tracker_settings(),
+               projects_request: request_fun
+             )
+
+    assert Agent.get(remote, & &1.status) == "QA"
+    assert Agent.get(remote, & &1.status_updates) == 3
+
+    assert {:ok, %{"project_item" => %{"status" => "QA"}, "pull_request" => %{"draft" => true}}} =
+             Client.agent_operation(issue, context, "handoff", qa_arguments,
+               tracker_settings: tracker_settings(),
+               projects_request: request_fun
+             )
+
+    assert Agent.get(remote, & &1.status) == "QA"
+    assert Agent.get(remote, & &1.status_updates) == 3
+    assert length(Agent.get(remote, & &1.comments)) == 2
   end
 
   test "Projects follow-up REST requests use the configured GitHub Enterprise host" do
