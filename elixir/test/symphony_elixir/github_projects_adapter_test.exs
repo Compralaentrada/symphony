@@ -771,6 +771,15 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert {:ok, %{"outcome" => "merged", "pull_request" => %{"merged" => true}}} = already_merged
     refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
 
+    for github_check_status <- ["PENDING", "FAILURE"] do
+      {stale_base, queries} =
+        run_merge_gate(%{base_changed: true, requeue_github_check_status: github_check_status})
+
+      assert {:error, :pull_request_base_sha_mismatch} = stale_base
+      assert Enum.any?(queries, &(&1 =~ "SymphonySetProjectStatus"))
+      refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
+    end
+
     {reconciled_merge, queries} = run_merge_gate(%{merge_response_lost: true})
     assert {:ok, %{"outcome" => "merged", "pull_request" => %{"merged" => true}}} = reconciled_merge
     assert Enum.count(queries, &(&1 =~ "SymphonyPipelineMergePullRequest")) == 1
@@ -812,15 +821,17 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert %{"outcome" => "changes_requested", "findings" => [^finding]} =
              Client.normalize_agent_report_for_test(report, "review", context)
 
-    assert %{"outcome" => "passed", "findings" => []} =
+    assert %{"outcome" => "changes_requested", "findings" => [^finding]} =
              Client.normalize_agent_report_for_test(%{report | "resolutions" => [finding["id"]]}, "review", context)
 
-    assert %{"outcome" => "passed", "findings" => []} =
+    assert %{"outcome" => "passed", "findings" => [], "resolutions" => [%{"status" => "resolved", "evidence" => evidence}]} =
              Client.normalize_agent_report_for_test(
                %{report | "resolutions" => [finding["id"] <> " — resolved: the check passed after the fix."]},
                "review",
                context
              )
+
+    assert evidence == "the check passed after the fix."
   end
 
   test "Review hands off only unresolved findings when its report repeats resolved findings" do
@@ -872,17 +883,50 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     }
 
     sha = String.duplicate("a", 40)
-    task = %{"issue_id" => issue.id, "generation" => 1, "phase" => "review", "attempts" => %{"review" => 1}, "current_sha" => sha}
+
+    task = %{
+      "issue_id" => issue.id,
+      "generation" => 1,
+      "phase" => "review",
+      "attempts" => %{"review" => 1},
+      "current_sha" => sha,
+      "base_sha" => "base-current"
+    }
+
     assert :ok = Store.save_task(task)
     assert :ok = Store.begin_phase(issue.id, 1, "review", 1)
-    report = %{"outcome" => "passed", "summary" => "Reviewed.", "sha" => sha, "findings" => [], "resolutions" => []}
+
+    report = %{
+      "outcome" => "passed",
+      "summary" => "Reviewed.",
+      "sha" => sha,
+      "base_sha" => "base-current",
+      "qa_verification" => %{
+        "status" => "passed",
+        "sha" => sha,
+        "base_sha" => "base-current",
+        "command" => "mix test",
+        "evidence" => "Host replay passed.",
+        "finding_id" => nil
+      },
+      "findings" => [],
+      "resolutions" => []
+    }
+
     body = "Review passed.\n\n<!-- symphony:report:json\n#{Jason.encode!(report)}\n-->"
 
     request = fn _query, _variables, _settings ->
       {:ok, %{status: 200, body: project_response([issue_item("octo/app", 90, "Human Review")])}}
     end
 
-    context = %{issue: issue, lane: :review, generation: 1, attempt: 1, task: task}
+    context = %{
+      issue: issue,
+      lane: :review,
+      generation: 1,
+      attempt: 1,
+      task: task,
+      review_verification: report["qa_verification"]
+    }
 
     assert {:error, :github_human_decision_changed} =
              Client.agent_operation(issue, context, "handoff", %{"report" => report, "body" => body},
@@ -899,6 +943,20 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
                tracker_settings: tracker_settings(%{"merge_policy" => "auto"}),
                projects_request: closed_request
              )
+  end
+
+  test "automatic Review requeues to Build when the base advances before handoff" do
+    {result, status, report_body, task, queries} = run_review_handoff("Review", "base-new")
+
+    assert {:ok, %{"outcome" => "passed", "project_item" => %{"status" => "Ready"}, "requeued" => true}} = result
+    assert status == "Ready"
+    assert {:ok, report} = AgentReport.decode_comment(report_body)
+    assert report["base_change"] == %{"reviewed_base_sha" => "base-old", "current_base_sha" => "base-new"}
+    assert {:ok, %{"stale_merge_retry" => true}} = Store.get_task(task["issue_id"])
+    assert Enum.any?(queries, &(&1 =~ "SymphonySetProjectStatus"))
+    assert Enum.any?(queries, &(&1 =~ "SymphonyAddIssueComment"))
+    refute Enum.any?(queries, &(&1 =~ "SymphonyMarkPipelinePullRequestReady"))
+    refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
   end
 
   test "Build report persists the task branch for later phases" do
@@ -951,6 +1009,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     number = System.unique_integer([:positive])
     issue_id = "octo/app##{number}"
     sha = String.duplicate("a", 40)
+    base_sha = String.duplicate("c", 40)
     old_sha = String.duplicate("b", 40)
     agent_login = "symphony[bot]"
     workpad = "<!-- symphony:workpad:start -->\n## Codex Workpad\n\n### QA\n- Check passed on #{sha}.\n<!-- symphony:workpad:end -->"
@@ -959,6 +1018,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "outcome" => "passed",
       "summary" => "Every acceptance criterion is covered by passing evidence.",
       "sha" => sha,
+      "base_sha" => base_sha,
       "criteria" => [
         %{
           "criterion" => "The implementation passes its required checks.",
@@ -1048,6 +1108,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "phase" => "review",
       "attempts" => %{"review" => 1},
       "current_sha" => sha,
+      "base_sha" => base_sha,
       "required_checks" => ["make -C elixir all"]
     }
 
@@ -1090,6 +1151,14 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       generation: 1,
       attempt: 1,
       task: task,
+      review_verification: %{
+        "status" => "passed",
+        "command" => "make -C elixir all",
+        "sha" => sha,
+        "base_sha" => base_sha,
+        "evidence" => "Host replay passed on #{sha}.",
+        "finding_id" => nil
+      },
       tracker_kind: "github_projects"
     }
 
@@ -1110,6 +1179,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     assert hd(qa_reports)["body"] =~ "QA-1"
     assert List.last(qa_reports)["body"] =~ "Host exit status 0 on #{sha}"
     assert evidence["report_context"]["task"]["current_sha"] == sha
+    assert evidence["report_context"]["review_verification"] == review_context.review_verification
     refute Enum.any?(qa_reports, &String.contains?(&1["body"], old_sha))
 
     legacy_comments =
@@ -1211,6 +1281,70 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
              )
   end
 
+  test "Review requires a current QA report, an allowed command, and matching head and base SHAs" do
+    sha = String.duplicate("a", 40)
+    base_sha = String.duplicate("b", 40)
+    command = "mix test"
+    report = review_qa_report(sha, base_sha, command)
+    context = %{lane: :review, task: %{"current_sha" => sha, "base_sha" => base_sha, "required_checks" => [command]}}
+    phase_report = fn value -> %{"body" => "## QA report\n\n<!-- symphony:report:json\n#{Jason.encode!(value)}\n-->"} end
+
+    assert :ok = Client.validate_review_qa_report_for_test(context, %{"qa" => [phase_report.(report)]}, "Run tests.")
+    assert {:error, :qa_evidence_unavailable} = Client.validate_review_qa_report_for_test(context, %{}, "Run tests.")
+
+    stale_head = Map.put(report, "sha", String.duplicate("c", 40))
+    stale_base = Map.put(report, "base_sha", String.duplicate("d", 40))
+
+    unapproved_command =
+      report
+      |> Map.put("verification_command", "make test")
+      |> Map.put("checks", [
+        %{
+          "id" => "agent-test",
+          "layer" => "unit",
+          "command" => "make test",
+          "status" => "passed",
+          "result" => "Tests passed.",
+          "evidence" => "Agent test output.",
+          "required" => true,
+          "reason" => nil
+        }
+      ])
+
+    for invalid <- [stale_head, stale_base, unapproved_command] do
+      assert {:error, :qa_evidence_unavailable} =
+               Client.validate_review_qa_report_for_test(context, %{"qa" => [phase_report.(invalid)]}, "Run tests.")
+    end
+
+    current_check = Map.put(hd(report["host_checks"]), "sha", sha)
+
+    stale_second_check = %{
+      "name" => "mix format --check-formatted",
+      "status" => "passed",
+      "evidence" => "Host exit status 0.",
+      "source" => "host",
+      "sha" => String.duplicate("c", 40)
+    }
+
+    stale_other_check =
+      report
+      |> Map.put("host_checks", [current_check, stale_second_check])
+      |> Map.put("checks", report["checks"])
+
+    stale_context = %{context | task: Map.put(context.task, "required_checks", [command, stale_second_check["name"]])}
+
+    assert {:error, :qa_evidence_unavailable} =
+             Client.validate_review_qa_report_for_test(stale_context, %{"qa" => [phase_report.(stale_other_check)]}, "Run tests.")
+  end
+
+  test "automatic merge rejects stale required check evidence not repeated by Review" do
+    required = ["make -C elixir all", "mix format --check-formatted"]
+    {result, queries} = run_merge_gate(%{required_checks: required, host_check_sha: "previous-head"})
+
+    assert result == {:error, :host_checks_not_verified}
+    refute Enum.any?(queries, &(&1 =~ "SymphonyPipelineMergePullRequest"))
+  end
+
   test "QA findings turn a passed report into a correction handoff" do
     finding = %{"id" => "QA-2", "reproduction" => "Run the failing check.", "criterion" => "The acceptance criterion passes."}
 
@@ -1299,6 +1433,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "branch" => issue.branch_name,
       "base_branch" => "main",
       "current_sha" => sha,
+      "base_sha" => "base-current",
       "pr_number" => number,
       "required_checks" => ["mix test"]
     }
@@ -1489,6 +1624,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "branch" => issue.branch_name,
       "base_branch" => "main",
       "current_sha" => sha,
+      "base_sha" => "base-current",
       "pr_number" => number,
       "required_checks" => ["mix test"]
     }
@@ -3008,6 +3144,8 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     issue_id = "octo/app##{number}"
     branch = "symphony/octo-app-#{number}"
     sha = String.duplicate("a", 40)
+    required_checks = Map.get(options, :required_checks, ["make -C elixir all"])
+    verification_command = List.first(required_checks)
 
     issue = %Issue{
       id: issue_id,
@@ -3025,16 +3163,19 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       "branch" => branch,
       "base_branch" => "main",
       "current_sha" => sha,
+      "base_sha" => "base-current",
       "prior_findings" => Map.get(options, :prior_findings, []),
-      "required_checks" => ["make -C elixir all"],
-      "host_checks" => [
-        %{
-          "name" => "make -C elixir all",
-          "status" => Map.get(options, :host_check_status, "passed"),
-          "evidence" => "exit status 0",
-          "source" => "host"
-        }
-      ]
+      "required_checks" => required_checks,
+      "host_checks" =>
+        Enum.map(required_checks, fn command ->
+          %{
+            "name" => command,
+            "status" => Map.get(options, :host_check_status, "passed"),
+            "evidence" => "exit status 0",
+            "source" => "host",
+            "sha" => Map.get(options, :host_check_sha, sha)
+          }
+        end)
     }
 
     assert :ok = Store.save_task(task)
@@ -3069,7 +3210,20 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
       end
     end
 
-    context = %{issue: issue, lane: :review, generation: 1, attempt: 1, task: task}
+    context = %{
+      issue: issue,
+      lane: :review,
+      generation: 1,
+      attempt: 1,
+      task: task,
+      review_verification: %{
+        "command" => verification_command,
+        "status" => "passed",
+        "evidence" => "Host replay passed.",
+        "sha" => sha,
+        "base_sha" => task["base_sha"]
+      }
+    }
 
     result =
       Client.agent_operation(issue, context, "request_merge", %{},
@@ -3081,6 +3235,137 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     calls = Agent.get(queries, &Enum.reverse/1)
     Agent.stop(queries)
     {result, calls}
+  end
+
+  defp run_review_handoff(initial_status, pr_base_sha) do
+    previous_path = Application.fetch_env(:symphony_elixir, :pipeline_database_path)
+    root = Path.join(System.tmp_dir!(), "symphony-review-handoff-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :pipeline_database_path, Path.join(root, "pipeline.sqlite3"))
+
+    on_exit(fn ->
+      case previous_path do
+        {:ok, path} -> Application.put_env(:symphony_elixir, :pipeline_database_path, path)
+        :error -> Application.delete_env(:symphony_elixir, :pipeline_database_path)
+      end
+
+      File.rm_rf!(root)
+    end)
+
+    number = System.unique_integer([:positive])
+    issue_id = "octo/app##{number}"
+    branch = "symphony/octo-app-#{number}"
+    sha = String.duplicate("a", 40)
+    old_base_sha = "base-old"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: issue_id,
+      branch_name: branch,
+      state: initial_status,
+      native_ref: %{repository: "octo/app", base_branch: "main", issue_node_id: "I_issue_#{number}"}
+    }
+
+    verification = %{
+      "status" => "passed",
+      "sha" => sha,
+      "base_sha" => old_base_sha,
+      "command" => "mix test",
+      "evidence" => "Host replay passed."
+    }
+
+    task = %{
+      "issue_id" => issue_id,
+      "generation" => 1,
+      "phase" => "review",
+      "status" => "review",
+      "attempts" => %{"review" => 1},
+      "branch" => branch,
+      "base_branch" => "main",
+      "current_sha" => sha,
+      "base_sha" => old_base_sha,
+      "required_checks" => ["mix test"],
+      "prior_findings" => []
+    }
+
+    assert :ok = Store.save_task(task)
+    assert :ok = Store.begin_phase(issue_id, 1, "review", 1)
+
+    report = %{
+      "outcome" => "passed",
+      "summary" => "Reviewed the accepted head and base.",
+      "sha" => sha,
+      "base_sha" => old_base_sha,
+      "findings" => [],
+      "resolutions" => [],
+      "next_step" => "Continue to the merge gate."
+    }
+
+    body = "Review passed.\n\n<!-- symphony:report:json\n#{Jason.encode!(report)}\n-->"
+    {:ok, remote} = Agent.start_link(fn -> %{status: initial_status, queries: [], report_body: nil} end)
+
+    request = fn query, variables, _settings ->
+      Agent.get_and_update(remote, fn state ->
+        review_handoff_response(query, variables, state, number, branch, sha, pr_base_sha)
+      end)
+    end
+
+    context = %{issue: issue, lane: :review, generation: 1, attempt: 1, task: task, review_verification: verification}
+
+    result =
+      Client.agent_operation(issue, context, "handoff", %{"report" => report, "body" => body},
+        tracker_settings: tracker_settings(%{"merge_policy" => "auto"}),
+        projects_request: request
+      )
+
+    state = Agent.get(remote, & &1)
+    Agent.stop(remote)
+    {result, state.status, state.report_body, task, Enum.reverse(state.queries)}
+  end
+
+  defp review_handoff_response(query, variables, state, number, branch, sha, pr_base_sha) do
+    state = %{state | queries: [query | state.queries]}
+
+    cond do
+      query =~ "SymphonyProject" ->
+        body = project_response([issue_item("octo/app", number, state.status)])
+        {{:ok, %{status: 200, body: body}}, state}
+
+      query =~ "SymphonyPipelinePullRequest" ->
+        pull_request = %{
+          "id" => "PR_#{number}",
+          "number" => number,
+          "url" => "https://github.com/octo/app/pull/#{number}",
+          "state" => "OPEN",
+          "isDraft" => true,
+          "mergedAt" => nil,
+          "baseRefName" => "main",
+          "baseRefOid" => pr_base_sha,
+          "headRefName" => branch,
+          "headRefOid" => sha,
+          "reviewDecision" => nil,
+          "body" => ""
+        }
+
+        body = %{"data" => %{"repository" => %{"pullRequests" => pipeline_pull_request_connection([pull_request])}}}
+        {{:ok, %{status: 200, body: body}}, state}
+
+      query =~ "SymphonyPipelineReportComments" ->
+        comments = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
+        body = %{"data" => %{"repository" => %{"issue" => %{"comments" => comments}}}}
+        {{:ok, %{status: 200, body: body}}, state}
+
+      query =~ "SymphonyAddIssueComment" ->
+        comment = %{"id" => "IC_review_#{number}", "url" => "https://github.com/octo/app/issues/#{number}#issuecomment-1"}
+        body = %{"data" => %{"addComment" => %{"commentEdge" => %{"node" => comment}}}}
+        {{:ok, %{status: 200, body: body}}, %{state | report_body: variables["body"]}}
+
+      query =~ "SymphonySetProjectStatus" ->
+        body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_#{number}"}}}}
+        {{:ok, %{status: 200, body: body}}, %{state | status: "Ready"}}
+
+      true ->
+        flunk("unexpected handoff query: #{query}")
+    end
   end
 
   defp merge_gate_pull_request_response(query, options, queries, number, branch, sha) do
@@ -3121,6 +3406,7 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
   defp merge_gate_query_with_changes(options, queries, number, branch, sha) do
     reads = Agent.get(queries, &Enum.count(&1, fn query -> query =~ "SymphonyPipelineMergeGate" end))
     options = if options[:base_changed] == true and reads > 1, do: Map.put(options, :current_base_sha, "new-base"), else: options
+    options = if reads > 2 and is_binary(options[:requeue_github_check_status]), do: Map.put(options, :github_check_status, options[:requeue_github_check_status]), else: options
     merge_gate_query(options, number, branch, sha)
   end
 
@@ -3180,7 +3466,25 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
   end
 
   defp merge_gate_comments(options, issue, sha) do
-    report = %{"outcome" => Map.get(options, :review_outcome, "passed"), "sha" => Map.get(options, :review_sha, sha), "findings" => [], "resolutions" => []}
+    base_sha = "base-current"
+    review_sha = Map.get(options, :review_sha, sha)
+
+    report = %{
+      "outcome" => Map.get(options, :review_outcome, "passed"),
+      "sha" => review_sha,
+      "base_sha" => base_sha,
+      "qa_verification" => %{
+        "command" => "make -C elixir all",
+        "status" => "passed",
+        "evidence" => "Host replay passed.",
+        "sha" => review_sha,
+        "base_sha" => base_sha,
+        "finding_id" => nil
+      },
+      "findings" => [],
+      "resolutions" => []
+    }
+
     marker = "<!-- symphony:report:start:#{Issue.execution_identity(issue)}:1:review:1 -->"
     body = marker <> "\n<!-- symphony:report:json\n" <> Jason.encode!(report) <> "\n-->"
     nodes = if options[:review_report] == :missing, do: [], else: [%{"body" => body, "author" => %{"login" => Map.get(options, :review_author, "agent")}}]
@@ -3190,6 +3494,42 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
 
   defp merge_gate_base_ref(nil), do: nil
   defp merge_gate_base_ref(oid), do: %{"target" => %{"oid" => oid}}
+
+  defp review_qa_report(sha, base_sha, command) do
+    %{
+      "outcome" => "passed",
+      "sha" => sha,
+      "base_sha" => base_sha,
+      "criteria" => [],
+      "files" => [],
+      "changes" => [],
+      "verification_command" => command,
+      "checks" => [
+        %{
+          "id" => "qa-test",
+          "layer" => "unit",
+          "command" => command,
+          "status" => "passed",
+          "result" => "Tests passed.",
+          "evidence" => "Test output captured.",
+          "required" => true,
+          "reason" => nil
+        }
+      ],
+      "host_checks" => [
+        %{
+          "name" => command,
+          "status" => "passed",
+          "evidence" => "Host exit status 0.",
+          "source" => "host"
+        }
+      ],
+      "gaps" => [],
+      "findings" => [],
+      "next_step" => "Continue to Review.",
+      "reason" => nil
+    }
+  end
 
   defp tracker_settings(provider_overrides \\ %{}) do
     %{

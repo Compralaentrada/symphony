@@ -1,6 +1,140 @@
 defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
   use SymphonyElixir.TestSupport
 
+  test "Review repeats only the configured QA command on the accepted SHA and base" do
+    sha = String.duplicate("a", 40)
+    base_sha = String.duplicate("b", 40)
+    command = "mix test test/review_test.exs"
+    issue = %Issue{id: "octo/app#58", identifier: "octo/app#58", description: "Run the configured tests."}
+    report = review_qa_report(command, sha, base_sha, command)
+    parent = self()
+
+    verification =
+      AgentRunner.review_verification_for_test(
+        "workspace",
+        issue,
+        [
+          pipeline_task: review_task(sha, base_sha, [command]),
+          current_base_sha: base_sha,
+          phase_reports_fun: fn _issue -> {:ok, [%{"generation" => 3, "phase" => "qa", "attempt" => 2, "report" => report}]} end,
+          review_check_runner: fn workspace, actual_command, actual_sha, _issue, host ->
+            send(parent, {:executed, workspace, actual_command, actual_sha, host})
+            {:ok, "host exit status 0 on #{actual_sha}"}
+          end
+        ],
+        nil
+      )
+
+    assert verification["status"] == "passed"
+    assert verification["command"] == command
+    assert verification["sha"] == sha
+    assert verification["base_sha"] == base_sha
+    assert_received {:executed, "workspace", ^command, ^sha, nil}
+  end
+
+  test "Review does not execute an unapproved QA command" do
+    sha = String.duplicate("a", 40)
+    base_sha = String.duplicate("b", 40)
+    allowed = "mix test"
+    command = "sh -c false"
+    issue = %Issue{id: "octo/app#58", identifier: "octo/app#58", description: "Run the configured tests."}
+    report = review_qa_report(command, sha, base_sha, allowed)
+
+    verification =
+      AgentRunner.review_verification_for_test(
+        "workspace",
+        issue,
+        [
+          pipeline_task: review_task(sha, base_sha, [allowed]),
+          current_base_sha: base_sha,
+          phase_reports_fun: fn _issue -> {:ok, [%{"generation" => 3, "phase" => "qa", "attempt" => 1, "report" => report}]} end,
+          review_check_runner: fn _workspace, _command, _sha, _issue, _host -> flunk("unapproved command executed") end
+        ],
+        nil
+      )
+
+    assert verification["status"] == "failed"
+    assert verification["finding_id"] == "QA-COMMAND"
+    assert verification["command"] == command
+  end
+
+  test "Review rejects absent QA evidence and changed head or base before replay" do
+    sha = String.duplicate("a", 40)
+    base_sha = String.duplicate("b", 40)
+    command = "mix test"
+    issue = %Issue{id: "octo/app#58", identifier: "octo/app#58", description: "Run the configured tests."}
+    report = review_qa_report(command, sha, base_sha, command)
+
+    base_opts = [
+      pipeline_task: review_task(sha, base_sha, [command]),
+      current_base_sha: base_sha,
+      review_check_runner: fn _workspace, _command, _sha, _issue, _host -> flunk("stale evidence executed") end
+    ]
+
+    missing_reports = fn _issue -> {:ok, []} end
+
+    missing =
+      AgentRunner.review_verification_for_test(
+        "workspace",
+        issue,
+        base_opts ++ [phase_reports_fun: missing_reports],
+        nil
+      )
+
+    stale_head = put_in(report["sha"], String.duplicate("c", 40))
+    stale_head_reports = fn _issue -> {:ok, [qa_report_entry(stale_head)]} end
+
+    changed_sha =
+      AgentRunner.review_verification_for_test(
+        "workspace",
+        issue,
+        base_opts ++ [phase_reports_fun: stale_head_reports],
+        nil
+      )
+
+    stale_base = put_in(report["base_sha"], String.duplicate("d", 40))
+    stale_base_reports = fn _issue -> {:ok, [qa_report_entry(stale_base)]} end
+
+    changed_base =
+      AgentRunner.review_verification_for_test(
+        "workspace",
+        issue,
+        base_opts ++ [phase_reports_fun: stale_base_reports],
+        nil
+      )
+
+    assert missing["status"] == "failed"
+    assert changed_sha["status"] == "failed"
+    assert changed_base["status"] == "failed"
+    assert changed_sha["finding_id"] == "QA-EVIDENCE"
+    assert changed_base["finding_id"] == "QA-EVIDENCE"
+  end
+
+  test "Review records a failed replay as a failed verification" do
+    sha = String.duplicate("a", 40)
+    base_sha = String.duplicate("b", 40)
+    command = "mix test"
+    issue = %Issue{id: "octo/app#58", identifier: "octo/app#58", description: "Run the configured tests."}
+    report = review_qa_report(command, sha, base_sha, command)
+
+    verification =
+      AgentRunner.review_verification_for_test(
+        "workspace",
+        issue,
+        [
+          pipeline_task: review_task(sha, base_sha, [command]),
+          current_base_sha: base_sha,
+          phase_reports_fun: fn _issue -> {:ok, [qa_report_entry(report)]} end,
+          review_check_runner: fn _workspace, _command, _sha, _issue, _host -> {:error, {:check_failed, 1}} end
+        ],
+        nil
+      )
+
+    assert verification["status"] == "failed"
+    assert verification["finding_id"] == "QA-VERIFICATION"
+    assert verification["evidence"] =~ "status 1"
+  end
+
   test "does not treat a failed completed turn as a phase report" do
     test_root =
       Path.join(
@@ -419,6 +553,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       report = %{
         "outcome" => "passed",
         "summary" => "QA passed",
+        "base_sha" => String.duplicate("b", 40),
         "criteria" => [
           %{
             "criterion" => "The implementation meets the acceptance criterion.",
@@ -599,6 +734,8 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert length(prompts) == 2
       assert hd(prompts) =~ "Each finding must include the exact keys id, reproduction, and criterion as non-empty strings."
       assert hd(prompts) =~ "Pipeline phase: independent QA."
+      assert hd(prompts) =~ "Include the exact accepted `base_sha` in the report and hidden JSON."
+      assert "base_sha" in get_in(hd(turn_starts), ["params", "outputSchema", "required"])
       assert hd(prompts) =~ "claim"
       assert hd(prompts) =~ "read_workpad"
       assert hd(prompts) =~ "report_context.host_checks"
@@ -606,6 +743,7 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert hd(prompts) =~ "high-risk gaps"
       assert hd(prompts) =~ "commit and push them"
       assert hd(prompts) =~ "verification_command"
+      assert hd(prompts) =~ "exactly match one of `report_context.task.required_checks`"
       refute hd(prompts) =~ "Do not modify files"
       assert hd(prompts) =~ "complete human-readable Markdown comment in `body`"
       refute hd(prompts) =~ "echo required-check-secret"
@@ -647,6 +785,15 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
         "summary" => "Review passed",
         "findings" => [],
         "resolutions" => [],
+        "base_sha" => String.duplicate("b", 40),
+        "qa_verification" => %{
+          "command" => nil,
+          "status" => "passed",
+          "evidence" => "Host replay passed.",
+          "sha" => String.duplicate("a", 40),
+          "base_sha" => String.duplicate("b", 40),
+          "finding_id" => nil
+        },
         "next_step" => "Continue to Human Review.",
         "sha" => String.duplicate("a", 40)
       }
@@ -748,11 +895,18 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert length(turn_starts) == 2
       [initial_turn, correction_turn] = turn_starts
       review_prompt = get_in(initial_turn, ["params", "input", Access.at(0), "text"])
-      assert review_prompt =~ "Pipeline phase: autonomous code review."
+      assert review_prompt =~ "Pipeline phase: autonomous code review in a new session."
       assert review_prompt =~ "claim"
       assert review_prompt =~ "Do not invoke the repository's `code-review` skill or its Markdown report format"
       assert review_prompt =~ "read_workpad"
       assert review_prompt =~ "report_context.task"
+      assert review_prompt =~ "Before reading Builder or QA summaries"
+      assert review_prompt =~ "new session"
+      assert review_prompt =~ "For an issue labeled `qa`, inspect the QA report and the diff of tests/evidence only"
+      assert review_prompt =~ "report_context.review_verification"
+      assert review_prompt =~ "Do not invoke shell commands yourself"
+      assert review_prompt =~ "not_applicable"
+      assert review_prompt =~ "If the handoff result includes `requeued: true`, stop without calling `request_merge`"
       assert review_prompt =~ "The configured merge policy is human."
       assert review_prompt =~ "outcome (passed, merged, changes_requested, or blocked)"
       refute review_prompt =~ "finding-from-task"
@@ -780,7 +934,11 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
       assert schema["type"] == "object"
       assert "outcome" in schema["required"]
       assert "findings" in schema["required"]
+      assert "base_sha" in schema["required"]
+      assert "qa_verification" in schema["required"]
       assert get_in(schema, ["properties", "findings", "items", "required"]) == ["id", "reproduction", "criterion"]
+      assert get_in(schema, ["properties", "resolutions", "items", "properties", "status", "enum"]) == ["resolved", "open", "not_applicable"]
+      assert get_in(schema, ["properties", "qa_verification", "properties", "status", "enum"]) == ["passed", "failed"]
       assert is_map(get_in(correction_turn, ["params", "outputSchema"]))
     after
       File.rm_rf(test_root)
@@ -1065,4 +1223,47 @@ defmodule SymphonyElixir.AgentRunnerPhaseReportTest do
     {output, 0} = System.cmd("git", ["-C", directory | args], stderr_to_stdout: true)
     String.trim(output)
   end
+
+  defp review_task(sha, base_sha, required_checks),
+    do: %{"generation" => 3, "current_sha" => sha, "base_sha" => base_sha, "required_checks" => required_checks}
+
+  defp review_qa_report(command, sha, base_sha, required_host_check) do
+    %{
+      "outcome" => "passed",
+      "sha" => sha,
+      "base_sha" => base_sha,
+      "criteria" => [],
+      "files" => [],
+      "changes" => [],
+      "verification_command" => command,
+      "checks" => [
+        %{
+          "id" => "qa-test",
+          "layer" => "unit",
+          "command" => command,
+          "status" => "passed",
+          "result" => "1 test, 0 failures.",
+          "evidence" => "test output captured",
+          "required" => true,
+          "reason" => nil
+        }
+      ],
+      "host_checks" => [
+        %{
+          "name" => required_host_check,
+          "status" => "passed",
+          "evidence" => "Host exit status 0.",
+          "source" => "host",
+          "sha" => sha
+        }
+      ],
+      "gaps" => [],
+      "findings" => [],
+      "next_step" => "Continue to Review.",
+      "reason" => nil
+    }
+  end
+
+  defp qa_report_entry(report),
+    do: %{"generation" => 3, "phase" => "qa", "attempt" => 1, "report" => report}
 end

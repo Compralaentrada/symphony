@@ -791,7 +791,7 @@ defmodule SymphonyElixir.Pipeline do
          :ok <- Tracker.validate_pipeline_delivery(issue, task["branch"], sha) do
       handoff = remote_handoff(result)
       pr_number = get_in(handoff, ["pull_request", "number"])
-      next = task |> Map.merge(%{"phase" => "qa", "status" => "qa", "current_sha" => sha}) |> maybe_put("pr_number", pr_number)
+      next = task |> Map.delete("base_sha") |> Map.merge(%{"phase" => "qa", "status" => "qa", "current_sha" => sha}) |> maybe_put("pr_number", pr_number)
 
       ops = [
         operation(next, "pull_request", %{
@@ -814,7 +814,13 @@ defmodule SymphonyElixir.Pipeline do
       :ok ->
         next =
           task
-          |> Map.merge(%{"phase" => "review", "status" => "review", "current_sha" => sha, "host_checks" => result["host_checks"] || []})
+          |> Map.merge(%{
+            "phase" => "review",
+            "status" => "review",
+            "current_sha" => sha,
+            "base_sha" => result["base_sha"],
+            "host_checks" => result["host_checks"] || []
+          })
 
         operations = report_ops(next, "qa", attempt, result) ++ [status_op(next, :review, nil, attempt)]
         commit(issue, next, "qa", attempt, result, operations)
@@ -1336,7 +1342,7 @@ defmodule SymphonyElixir.Pipeline do
 
   defp valid_report?("qa", %{"outcome" => outcome} = result, issue_description)
        when outcome in ["passed", "changes_requested", "failed", "defects_found"] do
-    is_binary(result["sha"]) and is_list(result["criteria"]) and is_list(result["changes"]) and
+    is_binary(result["sha"]) and is_binary(result["base_sha"]) and is_list(result["criteria"]) and is_list(result["changes"]) and
       is_list(result["checks"]) and valid_findings?(result["findings"]) and is_binary(result["next_step"]) and
       QAReport.valid?(result, [], issue_description)
   end
@@ -1350,12 +1356,19 @@ defmodule SymphonyElixir.Pipeline do
   defp valid_report?("review", %{"outcome" => outcome} = result, _issue_description)
        when outcome in ["passed", "changes_requested", "failed", "defects_found"] do
     is_binary(result["sha"]) and valid_findings?(result["findings"]) and is_list(result["resolutions"]) and
-      is_binary(result["next_step"])
+      is_binary(result["next_step"]) and valid_review_resolutions?(result["resolutions"]) and
+      (outcome != "passed" or valid_review_approval_result?(result))
   end
 
   defp valid_report?("review", %{"outcome" => "blocked"} = result, _issue_description), do: is_binary(result["reason"])
 
-  defp valid_report?(phase, %{"outcome" => "merged"} = result, _issue_description) when phase in ["review", "finalize"],
+  defp valid_report?("review", %{"outcome" => "merged"} = result, _issue_description) do
+    is_binary(result["sha"]) and is_binary(result["summary"]) and is_binary(result["next_step"]) and
+      valid_findings?(result["findings"]) and result["findings"] == [] and valid_review_resolutions?(result["resolutions"]) and
+      valid_review_approval_result?(result)
+  end
+
+  defp valid_report?("finalize", %{"outcome" => "merged"} = result, _issue_description),
     do: is_binary(result["sha"]) and is_binary(result["summary"])
 
   defp valid_report?("finalize", %{"outcome" => "blocked"} = result, _issue_description), do: is_binary(result["reason"])
@@ -1511,6 +1524,32 @@ defmodule SymphonyElixir.Pipeline do
   end
 
   defp valid_findings?(_findings), do: false
+
+  defp valid_review_resolutions?(resolutions) when is_list(resolutions) do
+    Enum.all?(resolutions, fn
+      %{"id" => id, "status" => "resolved", "evidence" => evidence, "reason" => nil} ->
+        present_report_value?(id) and present_report_value?(evidence)
+
+      %{"id" => id, "status" => status, "evidence" => nil, "reason" => reason}
+      when status in ["open", "not_applicable"] ->
+        present_report_value?(id) and present_report_value?(reason)
+
+      _ ->
+        false
+    end)
+  end
+
+  defp valid_review_resolutions?(_resolutions), do: false
+
+  defp valid_review_approval_result?(result) do
+    verification = result["qa_verification"]
+
+    result["findings"] == [] and is_binary(result["base_sha"]) and is_map(verification) and
+      verification["status"] == "passed" and verification["sha"] == result["sha"] and
+      verification["base_sha"] == result["base_sha"]
+  end
+
+  defp present_report_value?(value), do: is_binary(value) and String.trim(value) != ""
 
   defp validate_required_checks(required, checks) when is_list(required) and is_list(checks) do
     statuses = Enum.map(required, &required_check_status(&1, checks))

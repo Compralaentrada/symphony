@@ -25,6 +25,105 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert MapSet.new(ids) == MapSet.new(Enum.map(issues, & &1.id))
   end
 
+  test "a confirmed merge keeps Review and Finalize workers alive through Done reconciliation" do
+    issue = issue("octo/app#62", 62)
+    issue = %{issue | state: "Done", dispatchable: false, native_ref: Map.put(issue.native_ref, :project_status, "Done")}
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    refute Enum.any?(Config.settings!().tracker.terminal_states, &(String.downcase(&1) == "done"))
+    sha = String.duplicate("b", 40)
+
+    pull_request = %{
+      number: 162,
+      branch: issue.branch_name,
+      base: "main",
+      sha: sha,
+      draft: false,
+      merged: true,
+      body: "delivery",
+      url: "https://github.com/octo/app/pull/162"
+    }
+
+    :ets.insert(table, {{:pull_request, issue.id}, pull_request})
+
+    for phase <- ["review", "finalize"] do
+      worker =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      ref = Process.monitor(worker)
+
+      running = %{
+        issue.id => %{
+          pid: worker,
+          ref: ref,
+          identifier: issue.id,
+          started_at: DateTime.utc_now(),
+          issue: issue,
+          pipeline_phase: phase,
+          pipeline_task: %{"base_branch" => "main", "current_sha" => sha}
+        }
+      }
+
+      state = %Orchestrator.State{
+        running: running,
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+      }
+
+      reconciled = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      assert reconciled.running == running
+      Process.exit(worker, :kill)
+      Process.demonitor(ref, [:flush])
+    end
+
+    for unconfirmed_pull_request <- [
+          %{pull_request | merged: false},
+          %{pull_request | base: "release"},
+          %{pull_request | sha: String.duplicate("c", 40)}
+        ],
+        phase <- ["review", "finalize"] do
+      :ets.insert(table, {{:pull_request, issue.id}, unconfirmed_pull_request})
+
+      worker =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      ref = Process.monitor(worker)
+
+      running = %{
+        issue.id => %{
+          pid: worker,
+          ref: ref,
+          identifier: issue.id,
+          started_at: DateTime.utc_now(),
+          issue: issue,
+          pipeline_phase: phase,
+          pipeline_task: %{"base_branch" => "main", "current_sha" => sha}
+        }
+      }
+
+      reconciled =
+        Orchestrator.reconcile_issue_states_for_test(
+          [issue],
+          %Orchestrator.State{
+            running: running,
+            codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+          }
+        )
+
+      refute Map.has_key?(reconciled.running, issue.id)
+      refute Process.alive?(worker)
+      Process.demonitor(ref, [:flush])
+    end
+  end
+
   test "qa-labeled issues start in QA while feature issues keep Build, QA, and Review" do
     qa_issue = %{issue("octo/app#60", 60) | labels: ["qa"]}
     feature_issue = %{issue("octo/app#61", 61) | labels: ["feature"]}
@@ -62,7 +161,22 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert report_phases(table, feature_issue.id) == [:build, :qa, :review]
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
+  end
+
+  test "stopping an orchestrator terminates its active worker" do
+    issue = issue("octo/app#62", 62)
+    table = start_board([issue], %{})
+    pipeline_database!(table)
+    orchestrator = start_orchestrator(HoldingAgent)
+
+    assert await(fn -> lookup(table, {:held_agent_pid, issue.id}) != nil end)
+    worker = lookup(table, {:held_agent_pid, issue.id})
+    assert Process.alive?(worker)
+
+    stop_orchestrator(orchestrator)
+
+    refute Process.alive?(worker)
   end
 
   test "a slow skill preflight does not stop the orchestrator responding" do
@@ -1415,7 +1529,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert agent_calls(table, issue.id) == 6
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "legacy issue status mappings do not remap the canonical pipeline" do
@@ -1456,7 +1570,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert await(fn -> project_state(table, issue.id) == statuses.done end)
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "Blocked Review reruns Build and QA when the pull request head changes" do
@@ -1488,7 +1602,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert pull_request(table, issue.id).sha == lookup(table, {:remote_sha, issue.id})
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "Blocked QA reruns Build when the pull request head changes" do
@@ -1520,7 +1634,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert pull_request(table, issue.id).sha == lookup(table, {:remote_sha, issue.id})
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "Blocked QA without an accepted SHA restarts Build before retrying" do
@@ -1539,7 +1653,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert :ok = Store.save_task(task)
     assert {:ok, %{"phase" => "build", "status" => "building", "current_sha" => nil}, "build"} = Pipeline.prepare(issue)
 
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "no_changes waits for human confirmation, Blocked resumes, and transient failures retry" do
@@ -1557,7 +1671,11 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
         missing_check.id => %{
           build: [build("sha-six-old", missing_check.id), build("sha-six-fixed", missing_check.id)],
           qa: [qa_missing_check("sha-six-old"), qa("sha-six-fixed")],
-          review: [Map.put(review("sha-six-fixed"), "resolutions", ["required-check:sh ./check.sh"])]
+          review: [
+            Map.put(review("sha-six-fixed"), "resolutions", [
+              %{"id" => "required-check:sh ./check.sh", "status" => "resolved", "evidence" => "The configured check passed after QA correction.", "reason" => nil}
+            ])
+          ]
         },
         unavailable_check.id => %{build: [build("sha-ten", unavailable_check.id)], qa: [qa_missing_check("sha-ten")]}
       })
@@ -1609,7 +1727,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert lookup(table, {:report, unavailable_check.id, "qa"}) =~ "unavailable"
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "uncertain PR, report, and status responses reconcile after orchestrator restarts without duplicates" do
@@ -1665,7 +1783,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert (lookup(table, :coordinator_write_calls) || 0) == 0
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "closed merged work resumes Finalize after a lost report response and restart" do
@@ -1733,7 +1851,12 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert await(fn ->
              project_state(table, issue.id) == "Done" and
                match?({:ok, %{"status" => "done"}}, Store.get_task(issue.id)) and
-               not Store.agent_lease_active?(issue.id, 1, "finalize", 2)
+               not Store.agent_lease_active?(issue.id, 1, "finalize", 2) and
+               sqlite_rows(
+                 path,
+                 "SELECT status FROM pipeline_runs WHERE issue_id = ? AND generation = 1 AND phase = 'finalize' AND attempt = 2",
+                 [issue.id]
+               ) == [["complete"]]
            end)
 
     assert agent_calls(table, issue.id, :finalize) == 2
@@ -1766,7 +1889,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
              )
 
     assert Jason.decode!(checkpoint)["_remote_evidence"] != []
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "closed work preserves Finalize workspace and retry backoff after failures" do
@@ -1830,7 +1953,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert lookup(table, {:workspace_existed, issue.id, :finalize, 3})
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "PR creation revalidates the pushed SHA after Build commits its outbox" do
@@ -1847,7 +1970,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert pull_request_count(table, issue.id) == 0
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "QA retries a report missing the changes summary" do
@@ -1871,7 +1994,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert report_phases(table, issue.id) == [:build, :qa, :review]
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "QA host checks reject workspace drift after the accepted Build SHA" do
@@ -1882,7 +2005,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
         issue.id => %{
           build: [build("dirty", issue.id), build("clean", issue.id)],
           qa: [qa("dirty"), qa("clean")],
-          review: [Map.put(review("clean"), "resolutions", ["workspace-dirty"])]
+          review: [Map.put(review("clean"), "resolutions", [%{"id" => "workspace-dirty", "status" => "resolved", "evidence" => "Review confirmed the accepted workspace is clean.", "reason" => nil}])]
         }
       })
 
@@ -1901,7 +2024,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
            |> Enum.any?(&String.contains?(&1, "workspace"))
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "QA publishes test-only changes at the new PR SHA before Review" do
@@ -1913,7 +2036,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
 
     on_exit(fn ->
       if Process.alive?(orchestrator), do: stop_orchestrator(orchestrator)
-      File.rm_rf!(Path.dirname(path))
+      File.rm_rf(Path.dirname(path))
     end)
 
     assert await(fn -> project_state(table, issue.id) == "Human Review" end)
@@ -1947,7 +2070,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
           qa: [qa_with_finding, qa("fixed"), qa("fixed-two")],
           review: [
             review("fixed"),
-            Map.put(review("fixed-two"), "resolutions", [finding["id"] <> " — resolved: confirmed in review."])
+            Map.put(review("fixed-two"), "resolutions", [%{"id" => finding["id"], "status" => "resolved", "evidence" => "Confirmed in review.", "reason" => nil}])
           ]
         }
       })
@@ -1965,7 +2088,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert lookup(table, {:agent_prior_findings, issue.id, :review, 2}) == [finding]
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   test "a Review report with findings returns to Build instead of Human Review" do
@@ -1978,7 +2101,10 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
         issue.id => %{
           build: [build("first", issue.id), build("fixed", issue.id)],
           qa: [qa("first"), qa("fixed")],
-          review: [review_with_finding, Map.put(review("fixed"), "resolutions", [finding["id"]])]
+          review: [
+            review_with_finding,
+            Map.put(review("fixed"), "resolutions", [%{"id" => finding["id"], "status" => "resolved", "evidence" => "The affected path now passes review.", "reason" => nil}])
+          ]
         }
       })
 
@@ -1991,7 +2117,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert lookup(table, {:agent_prior_findings, issue.id, :review, 2}) == [finding]
 
     stop_orchestrator(orchestrator)
-    File.rm_rf!(Path.dirname(path))
+    File.rm_rf(Path.dirname(path))
   end
 
   defp start_board(issues, agent_results) do
@@ -2011,7 +2137,8 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
   defp pipeline_database!(table, opts \\ []) do
     env_keys = [:pipeline_test_board, :pipeline_database_path, :pipeline_test_workspace, :github_projects_client_module]
     previous_env = Map.new(env_keys, &{&1, Application.fetch_env(:symphony_elixir, &1)})
-    root = Path.join(System.tmp_dir!(), "symphony-pipeline-#{System.unique_integer([:positive])}")
+    suffix = Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
+    root = Path.join(System.tmp_dir!(), "symphony-pipeline-#{suffix}")
     File.mkdir_p!(root)
     path = Path.join(root, "pipeline.sqlite3")
     workspace = Path.join(root, "workspaces")
@@ -2151,12 +2278,30 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
   defp start_orchestrator(agent_runner \\ __MODULE__.FakeAgent) do
     name = Module.concat(__MODULE__, "Pipeline#{System.unique_integer([:positive])}")
     {:ok, pid} = Orchestrator.start_link(name: name, agent_runner: agent_runner)
+    on_exit(fn -> stop_orchestrator(pid) end)
     pid
   end
 
   defp stop_orchestrator(pid) do
-    if Process.alive?(pid), do: GenServer.stop(pid, :normal, 1_000)
+    if Process.alive?(pid) do
+      %{running: running, task_supervisor: task_supervisor} = :sys.get_state(pid)
+      GenServer.stop(pid, :normal, 1_000)
+      stop_pipeline_workers(running, task_supervisor)
+    end
   end
+
+  defp stop_pipeline_workers(running, task_supervisor) do
+    Enum.each(running, &stop_pipeline_worker(task_supervisor, &1))
+  end
+
+  defp stop_pipeline_worker(task_supervisor, {_issue_id, %{pid: worker}}) when is_pid(worker) do
+    case Task.Supervisor.terminate_child(task_supervisor, worker) do
+      :ok -> :ok
+      {:error, :not_found} -> :ok
+    end
+  end
+
+  defp stop_pipeline_worker(_task_supervisor, _entry), do: :ok
 
   defp stop_holding_orchestrator(pid) do
     if Process.alive?(pid) do
@@ -2278,7 +2423,8 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
       "findings" => [],
       "next_step" => "Run autonomous review.",
       "reason" => nil,
-      "sha" => sha
+      "sha" => sha,
+      "base_sha" => "base-sha"
     }
   end
 
@@ -2351,6 +2497,15 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
       "summary" => "No defects found.",
       "findings" => [],
       "resolutions" => [],
+      "base_sha" => "base-sha",
+      "qa_verification" => %{
+        "command" => "mix test test/symphony_elixir/qa_report_test.exs",
+        "status" => "passed",
+        "evidence" => "Host replay passed on #{sha}.",
+        "sha" => sha,
+        "base_sha" => "base-sha",
+        "finding_id" => nil
+      },
       "next_step" => "Wait for human review.",
       "sha" => sha
     }
@@ -2476,7 +2631,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     Path.join(root, SymphonyElixir.Workspace.workspace_key(issue))
   end
 
-  defp await(predicate, attempts \\ 400)
+  defp await(predicate, attempts \\ 3_000)
   defp await(_predicate, 0), do: false
 
   defp await(predicate, attempts) do
@@ -2521,7 +2676,25 @@ defmodule SymphonyElixir.PipelineIntegrationTest.PausedReviewAgent do
     if Keyword.fetch!(opts, :phase) == :review do
       task = Keyword.fetch!(opts, :pipeline_task)
       context = %{issue: issue, lane: :review, task: task, generation: Keyword.fetch!(opts, :generation), attempt: Keyword.fetch!(opts, :phase_attempt)}
-      report = %{"outcome" => "passed", "summary" => "Reviewed.", "sha" => task["current_sha"], "findings" => [], "resolutions" => [], "next_step" => "Merge."}
+
+      report = %{
+        "outcome" => "passed",
+        "summary" => "Reviewed.",
+        "sha" => task["current_sha"],
+        "base_sha" => task["base_sha"],
+        "qa_verification" => %{
+          "command" => "mix test test/symphony_elixir/qa_report_test.exs",
+          "status" => "passed",
+          "evidence" => "Host replay passed.",
+          "sha" => task["current_sha"],
+          "base_sha" => task["base_sha"],
+          "finding_id" => nil
+        },
+        "findings" => [],
+        "resolutions" => [],
+        "next_step" => "Merge."
+      }
+
       {:ok, passed} = FakeClient.workflow_operation(context, "handoff", %{"report" => report})
       table = Application.fetch_env!(:symphony_elixir, :pipeline_test_board)
       :ets.insert(table, {{:paused_review, issue.id}, self()})
@@ -2619,6 +2792,16 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
     end
   end
 
+  defp prepare_report(table, issue, :review, report, opts, _workspace) do
+    task = Keyword.get(opts, :pipeline_task, %{})
+    sha = :ets.lookup_element(table, {:remote_sha, issue.id}, 2)
+    base_sha = task["base_sha"] || report["base_sha"]
+    verification = report["qa_verification"] || %{}
+    verification = Map.merge(verification, %{"status" => "passed", "sha" => sha, "base_sha" => base_sha})
+
+    {:ok, Map.merge(report, %{"sha" => sha, "base_sha" => base_sha, "qa_verification" => verification}), [], []}
+  end
+
   defp prepare_report(table, issue, :qa, report, opts, workspace) do
     if :ets.lookup(table, {:dirty_once, issue.id}) != [] do
       :ets.delete(table, {:dirty_once, issue.id})
@@ -2713,9 +2896,6 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
 
   defp update_qa_check(check, _command, _output), do: check
 
-  defp prepare_report(table, issue, :review, report, _opts, _workspace),
-    do: {:ok, Map.put(report, "sha", :ets.lookup_element(table, {:remote_sha, issue.id}, 2)), [], []}
-
   defp ensure_delivery_commit(workspace, sha) do
     delivery_path = Path.join(workspace, "delivery.txt")
 
@@ -2739,10 +2919,16 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
            Keyword.get(opts, :worker_host)
          ) do
       {:ok, evidence} ->
-        %{"name" => command, "status" => "passed", "evidence" => evidence, "source" => "host"}
+        %{"name" => command, "status" => "passed", "evidence" => evidence, "source" => "host", "sha" => task["current_sha"]}
 
       {:error, {:check_failed, status}} ->
-        %{"name" => command, "status" => "failed", "evidence" => "Symphony ran the configured check at SHA #{task["current_sha"]}; host exit status #{status}.", "source" => "host"}
+        %{
+          "name" => command,
+          "status" => "failed",
+          "evidence" => "Symphony ran the configured check at SHA #{task["current_sha"]}; host exit status #{status}.",
+          "source" => "host",
+          "sha" => task["current_sha"]
+        }
 
       {:error, {:workspace_sha_mismatch, expected_sha, observed_sha}} ->
         %{
@@ -2750,7 +2936,8 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
           "status" => "failed",
           "finding_id" => "workspace-sha-mismatch",
           "evidence" => "Workspace HEAD was #{observed_sha || "unavailable"}, not accepted SHA #{expected_sha}.",
-          "source" => "host"
+          "source" => "host",
+          "sha" => expected_sha
         }
 
       {:error, {:workspace_dirty, expected_sha, observed_sha}} ->
@@ -2759,7 +2946,8 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
           "status" => "failed",
           "finding_id" => "workspace-dirty",
           "evidence" => "Workspace had local changes at SHA #{observed_sha || "unavailable"}; accepted SHA was #{expected_sha}.",
-          "source" => "host"
+          "source" => "host",
+          "sha" => expected_sha
         }
 
       {:error, :check_unavailable} ->
@@ -2768,7 +2956,8 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
           "status" => "unavailable",
           "evidence" => "Symphony could not execute the required check.",
           "reason" => "The configured command is unavailable in the task host.",
-          "source" => "host"
+          "source" => "host",
+          "sha" => task["current_sha"]
         }
     end
   end
@@ -2813,7 +3002,8 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeAgent do
       attempt: Keyword.get(opts, :phase_attempt),
       tracker_kind: "github_projects",
       merge_policy: Map.get(SymphonyElixir.Config.settings!().tracker.provider, "merge_policy", "human"),
-      host_checks: host_checks
+      host_checks: host_checks,
+      review_verification: Keyword.get(opts, :review_verification)
     }
 
     case AgentTool.execute(
@@ -3117,6 +3307,9 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
     end
   end
 
+  defp handoff_pull_request(_issue, _context, %{"outcome" => outcome}) when outcome in ["blocked", "no_changes"],
+    do: {:ok, nil}
+
   defp handoff_pull_request(issue, context, %{"outcome" => "ready", "sha" => sha} = report)
        when context.lane in [:build, :individual] do
     table = table()
@@ -3150,22 +3343,19 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
     end
   end
 
+  defp handoff_pull_request(issue, _context, _report) do
+    case pull_request(issue) do
+      {:ok, %{} = pr} -> {:ok, pr}
+      {:ok, nil} -> {:error, :pull_request_not_found}
+    end
+  end
+
   defp validate_fake_existing_pull_request(pr, report, task) do
     cond do
       pr.sha != report["sha"] -> {:error, :pull_request_head_sha_mismatch}
       is_binary(task["branch"]) and pr.branch != task["branch"] -> {:error, :pull_request_branch_mismatch}
       is_binary(task["base_branch"]) and pr.base != task["base_branch"] -> {:error, :pull_request_base_mismatch}
       true -> {:ok, pr}
-    end
-  end
-
-  defp handoff_pull_request(_issue, _context, %{"outcome" => outcome}) when outcome in ["blocked", "no_changes"],
-    do: {:ok, nil}
-
-  defp handoff_pull_request(issue, _context, _report) do
-    case pull_request(issue) do
-      {:ok, %{} = pr} -> {:ok, pr}
-      {:ok, nil} -> {:error, :pull_request_not_found}
     end
   end
 

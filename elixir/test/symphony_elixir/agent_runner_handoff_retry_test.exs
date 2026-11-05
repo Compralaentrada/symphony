@@ -103,6 +103,15 @@ defmodule SymphonyElixir.AgentRunnerHandoffRetryTest do
       "summary" => "Review passed",
       "findings" => [],
       "resolutions" => [],
+      "base_sha" => String.duplicate("b", 40),
+      "qa_verification" => %{
+        "command" => "true",
+        "status" => "passed",
+        "evidence" => "Host replay passed.",
+        "sha" => @sha,
+        "base_sha" => String.duplicate("b", 40),
+        "finding_id" => nil
+      },
       "next_step" => "Continue to Human Review.",
       "reason" => nil,
       "sha" => @sha
@@ -174,6 +183,7 @@ defmodule SymphonyElixir.AgentRunnerHandoffRetryTest do
       "attempts" => %{"review" => 1},
       "status" => "review",
       "current_sha" => @sha,
+      "base_sha" => String.duplicate("b", 40),
       "prior_findings" => []
     }
 

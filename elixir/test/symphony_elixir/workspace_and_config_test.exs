@@ -1475,9 +1475,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
           {%{merge_policy: "human", tracker: %{kind: "github_projects"}}, "human"},
           {%{merge_policy: "auto", tracker: %{kind: "github_projects"}}, "auto"},
           {%{tracker: %{kind: "github_projects", provider: %{merge_policy: "auto"}}}, "auto"},
+          {%{merge_policy: "auto", tracker: %{kind: "github_projects", provider: %{merge_policy: "human"}}}, "auto"},
           {%{merge_policy: "human", tracker: %{kind: "github_projects", provider: %{merge_policy: "auto"}}}, "human"}
         ] do
       assert {:ok, settings} = Schema.parse(config)
+      assert settings.merge_policy == expected_policy
       assert settings.tracker.provider["merge_policy"] == expected_policy
     end
 
