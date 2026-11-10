@@ -32,6 +32,26 @@ defmodule SymphonyElixir.PRBodyTest do
     assert {:error, :invalid_github_pull_request_body} = PRBody.validate_agent_body(@body, "octo/app#43")
   end
 
+  test "accepts a body following a different repository's template" do
+    body = """
+    Fixes #42
+
+    # Tipo de Cambio
+
+    - [x] Refactor
+
+    # Descripción
+
+    Reduce consultas repetidas.
+
+    # Plan de Verificación
+
+    - [x] Pruebas de regresión.
+    """
+
+    assert :ok = PRBody.validate_agent_body(body, "octo/app#42")
+  end
+
   test "host wraps the agent-authored body and the PR linter accepts that wrapper" do
     template = File.read!("../.github/pull_request_template.md")
     wrapped = PRBody.delivery_block(@body)

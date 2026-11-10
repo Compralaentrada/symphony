@@ -1,9 +1,6 @@
 defmodule SymphonyElixir.PRBody do
   @moduledoc false
 
-  @template_path Path.expand("../../../.github/pull_request_template.md", __DIR__)
-  @external_resource @template_path
-  @template File.read!(@template_path)
   @delivery_start "<!-- symphony:delivery:start -->"
   @delivery_end "<!-- symphony:delivery:end -->"
 
@@ -11,7 +8,7 @@ defmodule SymphonyElixir.PRBody do
   def validate_agent_body(body, issue_id) when is_binary(body) and is_binary(issue_id) do
     errors =
       if byte_size(body) in 1..60_000 and not String.contains?(body, [@delivery_start, @delivery_end]) do
-        lint(@template, body) ++ exact_issue_reference_errors(body, issue_id)
+        check_no_placeholders([], body) ++ exact_issue_reference_errors(body, issue_id)
       else
         ["PR body is empty, too long, or includes Symphony delivery markers."]
       end

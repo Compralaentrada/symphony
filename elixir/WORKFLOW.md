@@ -161,7 +161,7 @@ Impeccable and TDD are not forced into unattended sessions.
 
 1. Review the diff, acceptance criteria, validation evidence, and all PR feedback.
 2. Read `.github/pull_request_template.md` and write the complete PR description with every section in order, its length guidance followed, and every placeholder removed. Put it in `report.pull_request_body`, include `Fixes #<issue-number>` on its own line for the assigned issue, and do not add Symphony delivery markers. The separate `github_workflow` handoff `body` is the issue report comment, not the PR description; its hidden JSON must match the report, including `pull_request_body`.
-3. Set `body_file=$(mktemp)`, save the exact PR description there, and validate it with `(cd elixir && mise exec -- mix pr_body.check --file "$body_file")`.
+3. Check the description against the task repository's template and use its PR body checker if available.
 4. Hand off with `github_workflow` operation `handoff`; the host validates the PR description, wraps it in Symphony-owned delivery markers, and creates or updates the draft PR while preserving human text outside that block.
 5. Do not merge or approve the PR.
 6. Update the persistent workpad with the final summary, validation evidence, and PR link.

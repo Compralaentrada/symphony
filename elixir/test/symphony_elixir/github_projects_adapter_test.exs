@@ -481,25 +481,17 @@ defmodule SymphonyElixir.GitHubProjectsAdapterTest do
     body = """
     Fixes ##{number}
 
-    #### Context
+    # Tipo de Cambio
 
-    Implements the assigned issue.
+    - [x] Refactor
 
-    #### TL;DR
+    # Descripción
 
-    Implements the issue.
+    Reduce consultas repetidas.
 
-    #### Summary
+    # Plan de Verificación
 
-    - Updated the implementation.
-
-    #### Alternatives
-
-    - Kept the existing implementation pattern.
-
-    #### Test Plan
-
-    - [x] Required checks passed.
+    - [x] Pruebas de regresión.
     """
 
     report = %{
