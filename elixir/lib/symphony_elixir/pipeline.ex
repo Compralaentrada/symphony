@@ -826,7 +826,10 @@ defmodule SymphonyElixir.Pipeline do
         commit(issue, next, "qa", attempt, result, operations)
 
       {:error, :required_checks_unavailable} ->
-        {reason, next_step} = qa_block_text(report_locale(issue), :checks_unavailable)
+        unavailable_check =
+          Enum.find(task["required_checks"] || [], &(required_check_status(&1, result["host_checks"] || []) == :unavailable))
+
+        {reason, next_step} = qa_block_text(report_locale(issue), :checks_unavailable, unavailable_check)
         block_qa_phase(issue, task, attempt, result, reason, next_step)
 
       {:error, reason} ->
@@ -864,7 +867,7 @@ defmodule SymphonyElixir.Pipeline do
               "outcome" => "changes_requested",
               "summary" => "Autonomous Review did not resolve all prior findings.",
               "findings" => findings,
-              "next_step" => "Fix the remaining findings and submit a new Build delivery."
+              "next_step" => findings_next_step(report_locale(issue), "review", findings)
             })
 
           rework_phase(issue, task, "review", attempt, result)
@@ -884,9 +887,14 @@ defmodule SymphonyElixir.Pipeline do
     end
   end
 
-  defp finish_valid_phase(issue, task, phase, attempt, %{"outcome" => outcome} = result)
-       when phase in ["qa", "review"] and outcome in ["changes_requested", "failed", "defects_found"] do
-    rework_phase(issue, task, phase, attempt, result)
+  defp finish_valid_phase(issue, task, "review", attempt, %{"outcome" => outcome, "sha" => sha} = result)
+       when outcome in ["changes_requested", "failed", "defects_found"] do
+    with :ok <- ensure_current_sha(task, sha), do: rework_phase(issue, task, "review", attempt, result)
+  end
+
+  defp finish_valid_phase(issue, task, "qa", attempt, %{"outcome" => outcome} = result)
+       when outcome in ["changes_requested", "failed", "defects_found"] do
+    rework_phase(issue, task, "qa", attempt, result)
   end
 
   defp finish_valid_phase(_issue, _task, phase, _attempt, result), do: {:error, {:invalid_phase_result, phase, result["outcome"]}}
@@ -898,31 +906,42 @@ defmodule SymphonyElixir.Pipeline do
     commit(issue, next, "qa", attempt, result, operations)
   end
 
-  defp qa_block_text(:es, :checks_unavailable),
+  defp qa_block_text(:es, :checks_unavailable, command) when is_binary(command),
     do:
-      {"Symphony no tiene resultados utilizables de todas las comprobaciones requeridas.", "Repara el entorno o la herramienta que impidió la comprobación y vuelve a ejecutar QA sobre el mismo SHA."}
+      {"Symphony no tiene resultados utilizables de la comprobación requerida `#{command}`.",
+       "Habilita la herramienta para `#{command}` en el host de tareas y vuelve a ejecutar QA sobre el mismo SHA."}
 
-  defp qa_block_text(_locale, :checks_unavailable),
-    do: {"Symphony does not have usable results for every required check.", "Repair the environment or tool that prevented the check and rerun QA on the same SHA."}
+  defp qa_block_text(:es, :checks_unavailable, _command),
+    do: {"Symphony no tiene resultados utilizables de la comprobación requerida.", "Repara el entorno o la herramienta de la comprobación requerida y vuelve a ejecutar QA sobre el mismo SHA."}
+
+  defp qa_block_text(_locale, :checks_unavailable, command) when is_binary(command),
+    do: {"Symphony does not have usable results for required check `#{command}`.", "Enable the tool for `#{command}` on the task host, then rerun QA on the same SHA."}
+
+  defp qa_block_text(_locale, :checks_unavailable, _command),
+    do: {"Symphony does not have usable results for the required check.", "Repair the environment or tool for the required check, then rerun QA on the same SHA."}
 
   defp rework_phase(issue, task, phase, attempt, result) do
+    findings = pending_findings(task, result)
+    destination = if phase == "review", do: Findings.review_rework_phase(findings), else: "build"
+    status = if destination == "qa", do: :qa, else: :building
+
     next =
       task
-      |> Map.put("phase", "build")
-      |> Map.put("status", "building")
-      |> Map.put("prior_findings", pending_findings(task, result))
+      |> Map.put("phase", destination)
+      |> Map.put("status", if(destination == "qa", do: "qa", else: "building"))
+      |> Map.put("prior_findings", findings)
 
     next = if phase == "qa", do: Map.put(next, "current_sha", nil), else: next
 
-    operations = report_ops(next, phase, attempt, result) ++ [status_op(next, :building, nil, attempt, phase)]
+    operations = report_ops(next, phase, attempt, result) ++ [status_op(next, status, nil, attempt, phase)]
     commit(issue, next, phase, attempt, result, operations)
   end
 
   defp pending_findings(task, result) do
     resolutions = Map.get(result, "resolutions") || []
 
-    (Map.get(task, "prior_findings") || [])
-    |> Kernel.++(Map.get(result, "findings") || [])
+    (Map.get(result, "findings") || [])
+    |> Kernel.++(Map.get(task, "prior_findings") || [])
     |> Enum.uniq_by(& &1["id"])
     |> Enum.reject(&Findings.resolved?(&1["id"], resolutions))
   end
@@ -1290,7 +1309,7 @@ defmodule SymphonyElixir.Pipeline do
           Map.merge(result, %{
             "outcome" => "changes_requested",
             "summary" => findings_summary(locale, phase),
-            "next_step" => findings_next_step(locale)
+            "next_step" => findings_next_step(locale, phase, result["findings"])
           }),
         else: result
 
@@ -1313,8 +1332,20 @@ defmodule SymphonyElixir.Pipeline do
   defp findings_summary(_locale, "qa"), do: "QA reported findings that need correction."
   defp findings_summary(_locale, _phase), do: "Review reported findings that need correction."
 
-  defp findings_next_step(:es), do: "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
-  defp findings_next_step(_locale), do: "Fix the findings and submit a new Build delivery."
+  defp findings_next_step(locale, "review", findings) do
+    if Findings.review_rework_phase(findings) == "qa",
+      do: review_qa_next_step(locale),
+      else: review_build_next_step(locale)
+  end
+
+  defp findings_next_step(:es, _phase, _findings), do: "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
+  defp findings_next_step(_locale, _phase, _findings), do: "Fix the findings and submit a new Build delivery."
+
+  defp review_qa_next_step(:es), do: "Vuelve a QA con la misma rama, PR y SHA para corregir las pruebas, comandos o evidencias; después repite Review."
+  defp review_qa_next_step(_locale), do: "Return to QA on the same branch, PR, and SHA to fix the test, command, or evidence; then rerun Review."
+
+  defp review_build_next_step(:es), do: "Corrige primero los cambios de producto en Build y recorre QA y Review sobre la nueva SHA."
+  defp review_build_next_step(_locale), do: "Fix the product changes in Build first, then rerun QA and Review on the new SHA."
 
   defp invalid_report_details(phase, result) do
     finding_keys =

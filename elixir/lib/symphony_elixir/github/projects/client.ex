@@ -1127,7 +1127,8 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     report = normalize_agent_report(submitted_report, lane, context)
 
     result =
-      with {:ok, body} <- AgentReport.normalize_body(Map.get(arguments, "body"), report, submitted_report),
+      with :ok <- validate_submitted_handoff_identity(lane, submitted_report, context),
+           {:ok, body} <- AgentReport.normalize_body(Map.get(arguments, "body"), report, submitted_report),
            :ok <- validate_agent_pr_body(lane, report, issue),
            :ok <- validate_agent_handoff_report(lane, report, context),
            :ok <- AgentReport.validate_body(body, report),
@@ -1269,7 +1270,12 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp handoff_status("qa", %{"outcome" => "blocked"}, settings), do: {:ok, settings.statuses.blocked}
   defp handoff_status("review", %{"outcome" => "passed", "findings" => []}, settings), do: {:ok, settings.statuses.human_review}
   defp handoff_status("review", %{"outcome" => "merged"}, settings), do: {:ok, settings.statuses.done}
-  defp handoff_status("review", %{"outcome" => outcome}, settings) when outcome in ["changes_requested", "failed", "defects_found"], do: {:ok, settings.statuses.building}
+
+  defp handoff_status("review", %{"outcome" => outcome} = report, settings) when outcome in ["changes_requested", "failed", "defects_found"] do
+    destination = if Findings.review_rework_phase(report["findings"]) == "qa", do: settings.statuses.qa, else: settings.statuses.building
+    {:ok, destination}
+  end
+
   defp handoff_status("review", %{"outcome" => "blocked"}, settings), do: {:ok, settings.statuses.blocked}
   defp handoff_status("diagnostic", %{"outcome" => "blocked"}, settings), do: {:ok, settings.statuses.blocked}
   defp handoff_status("finalize", %{"outcome" => "merged"}, settings), do: {:ok, settings.statuses.done}
@@ -1298,6 +1304,16 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
 
   defp normalize_agent_report(report, _lane, _context), do: report
 
+  defp validate_submitted_handoff_identity("review", report, context) do
+    task = context[:task] || %{}
+
+    if matches_expected_value?(report["sha"], task["current_sha"]),
+      do: :ok,
+      else: {:error, :review_report_sha_mismatch}
+  end
+
+  defp validate_submitted_handoff_identity(_lane, _report, _context), do: :ok
+
   defp normalize_qa_outcome(report, required, checks, context) do
     check_status = required_checks_status(required, checks)
 
@@ -1306,11 +1322,13 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
         report
 
       check_status == :unavailable ->
+        command = Enum.find(required, &(required_check_status(&1, checks) == :unavailable))
+
         report
         |> Map.put("outcome", "blocked")
         |> Map.put("summary", qa_text(context, :checks_unavailable))
-        |> Map.put("reason", qa_text(context, :checks_unavailable))
-        |> Map.put("next_step", qa_text(context, :checks_recovery))
+        |> Map.put("reason", qa_unavailable_reason(context, command))
+        |> Map.put("next_step", qa_unavailable_next_step(context, command))
 
       check_status == :failed ->
         report
@@ -1358,11 +1376,15 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       %{"status" => "passed"} = verification ->
         Map.put(report, "qa_verification", verification)
 
-      %{"status" => status, "finding_id" => finding_id, "evidence" => evidence} = verification
-      when status in ["failed", "unavailable"] ->
+      %{"status" => "failed", "finding_id" => finding_id, "evidence" => evidence} = verification ->
         report
         |> Map.put("qa_verification", verification)
         |> add_review_verification_finding(finding_id, evidence, context)
+
+      %{"status" => "unavailable"} = verification ->
+        report
+        |> Map.put("qa_verification", verification)
+        |> block_review_verification(verification, context)
 
       _ ->
         report
@@ -1374,8 +1396,12 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     report
     |> Map.put("outcome", "changes_requested")
     |> Map.put("summary", review_changes_requested_text(context))
-    |> Map.put("next_step", review_next_step_text(context))
+    |> Map.put("next_step", review_next_step_text(report["findings"], context))
   end
+
+  defp normalize_review_outcome(%{"outcome" => outcome, "findings" => [_ | _]} = report, context)
+       when outcome in ["changes_requested", "failed", "defects_found"],
+       do: Map.put(report, "next_step", review_next_step_text(report["findings"], context))
 
   defp normalize_review_outcome(report, _context), do: report
 
@@ -1415,7 +1441,13 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp add_review_verification_finding(report, finding_id, evidence, context) do
     finding_id = if is_binary(finding_id) and finding_id != "", do: finding_id, else: "QA-EVIDENCE"
     evidence = if is_binary(evidence) and evidence != "", do: evidence, else: "The QA verification evidence is unavailable."
-    finding = %{"id" => finding_id, "reproduction" => evidence, "criterion" => "The current QA verification command passes on the accepted head and base SHA."}
+
+    finding = %{
+      "id" => finding_id,
+      "reproduction" => evidence,
+      "criterion" => "The current QA verification command passes on the accepted head and base SHA.",
+      "resolution_phase" => "qa"
+    }
 
     findings = [finding | Enum.reject(report["findings"] || [], &(&1["id"] == finding_id))]
     resolutions = Enum.reject(report["resolutions"] || [], &(&1["id"] == finding_id))
@@ -1426,13 +1458,62 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     |> Map.put("resolutions", resolutions ++ [resolution])
     |> Map.put("outcome", "changes_requested")
     |> Map.put("summary", review_changes_requested_text(context))
-    |> Map.put("next_step", review_next_step_text(context))
+    |> Map.put("next_step", review_next_step_text(findings, context))
   end
 
+  defp block_review_verification(report, verification, context) do
+    command = verification["command"]
+    evidence = if present_report_value?(verification["evidence"]), do: verification["evidence"], else: "No QA verification evidence is available."
+
+    resource = review_verification_resource(command, context)
+
+    {summary, reason, next_step} = review_verification_block_text(context, resource, evidence)
+
+    Map.merge(report, %{
+      "outcome" => "blocked",
+      "summary" => summary,
+      "reason" => reason,
+      "next_step" => next_step
+    })
+  end
+
+  defp review_verification_block_text(%{report_locale: :es}, resource, evidence) do
+    {
+      "Review no pudo ejecutar la comprobación de QA.",
+      "No está disponible #{resource}: #{evidence}",
+      "Repara o habilita la herramienta en el host de tareas y mueve el item a Ready para repetir Review sobre la misma SHA."
+    }
+  end
+
+  defp review_verification_block_text(_context, resource, evidence) do
+    {
+      "Review could not run the QA verification.",
+      "Unavailable #{resource}: #{evidence}",
+      "Repair or enable the task-host tool, then move the item to Ready to retry Review on the same SHA."
+    }
+  end
+
+  defp review_verification_resource(command, %{report_locale: :es}) when is_binary(command) and command != "",
+    do: "el comando de verificación de QA configurado `#{command}`"
+
+  defp review_verification_resource(_command, %{report_locale: :es}), do: "el informe QA actual y su comando de verificación configurado"
+  defp review_verification_resource(command, _context) when is_binary(command) and command != "", do: "the configured QA verification command `#{command}`"
+  defp review_verification_resource(_command, _context), do: "the current QA report and its configured verification command"
+
   defp review_changes_requested_text(%{report_locale: :es}), do: "La validación de QA encontró evidencia que debe corregirse antes de aprobar la PR."
-  defp review_changes_requested_text(_context), do: "Review found QA evidence that must be corrected before approving the pull request."
-  defp review_next_step_text(%{report_locale: :es}), do: "Corrige o vuelve a registrar la evidencia de QA y repite Build, QA y Review."
-  defp review_next_step_text(_context), do: "Correct or resubmit the QA evidence, then rerun Build, QA, and Review."
+  defp review_changes_requested_text(_context), do: "Review found findings that must be corrected before approving the pull request."
+
+  defp review_next_step_text(findings, context) do
+    if Findings.review_rework_phase(findings) == "qa",
+      do: review_qa_next_step_text(context),
+      else: review_build_next_step_text(context)
+  end
+
+  defp review_qa_next_step_text(%{report_locale: :es}), do: "Vuelve a QA con la misma rama, PR y SHA para corregir los tests, comandos o evidencias; después repite Review."
+  defp review_qa_next_step_text(_context), do: "Return to QA on the same branch, PR, and SHA to fix the test, command, or evidence; then rerun Review."
+
+  defp review_build_next_step_text(%{report_locale: :es}), do: "Corrige primero los cambios de producto en Build y recorre QA y Review sobre la nueva SHA."
+  defp review_build_next_step_text(_context), do: "Fix product changes in Build first, then rerun QA and Review on the new SHA."
 
   defp validate_agent_handoff_report("qa", report, context) do
     task = context[:task] || %{}
@@ -1448,7 +1529,9 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
     task = context[:task] || %{}
     verification = context[:review_verification]
 
-    with :ok <- validate_review_resolutions(report) do
+    with :ok <- validate_review_handoff_identity(report, task),
+         :ok <- validate_review_findings(report["findings"] || []),
+         :ok <- validate_review_resolutions(report) do
       validate_review_approval_evidence(report, task, verification, context)
     end
   end
@@ -1462,6 +1545,27 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
       true -> :ok
     end
   end
+
+  defp validate_review_handoff_identity(report, task) do
+    if matches_expected_value?(report["sha"], task["current_sha"]),
+      do: :ok,
+      else: {:error, :review_report_sha_mismatch}
+  end
+
+  defp validate_review_findings(findings) when is_list(findings) do
+    valid? =
+      Enum.all?(findings, fn
+        %{"id" => id, "reproduction" => reproduction, "criterion" => criterion, "resolution_phase" => phase} ->
+          Enum.all?([id, reproduction, criterion], &present_report_value?/1) and phase in ["build", "qa"]
+
+        _ ->
+          false
+      end)
+
+    if valid?, do: :ok, else: {:error, :invalid_review_findings}
+  end
+
+  defp validate_review_findings(_findings), do: {:error, :invalid_review_findings}
 
   defp validate_agent_report_shape(report),
     do: if(valid_agent_report?(report), do: :ok, else: {:error, :invalid_qa_report})
@@ -1527,12 +1631,33 @@ defmodule SymphonyElixir.GitHub.Projects.Client do
   defp qa_text(%{report_locale: :es}, :checks_failed), do: "Falló alguna comprobación requerida o falta evidencia para confirmarla."
   defp qa_text(%{report_locale: :es}, :findings), do: "QA encontró hallazgos que requieren corrección."
   defp qa_text(%{report_locale: :es}, :next_step), do: "Corrige los hallazgos y vuelve a entregar el trabajo en Build."
-  defp qa_text(%{report_locale: :es}, :checks_recovery), do: "Repara el entorno o la herramienta y vuelve a ejecutar QA sobre el mismo SHA; Builder no necesita cambiar código."
   defp qa_text(_context, :checks_unavailable), do: "Symphony could not execute every configured required check."
   defp qa_text(_context, :checks_failed), do: "One or more required host checks failed or were missing."
   defp qa_text(_context, :findings), do: "QA reported findings that need correction."
   defp qa_text(_context, :next_step), do: "Fix the findings and submit a new Build delivery."
-  defp qa_text(_context, :checks_recovery), do: "Repair the environment or tool, then rerun QA on the same SHA; Builder code changes are not required."
+
+  defp qa_unavailable_reason(%{report_locale: :es}, command) when is_binary(command),
+    do: "La comprobación requerida `#{command}` no está disponible en el host de tareas."
+
+  defp qa_unavailable_reason(%{report_locale: :es}, _command),
+    do: "La comprobación requerida no está disponible en el host de tareas."
+
+  defp qa_unavailable_reason(_context, command) when is_binary(command),
+    do: "Required check `#{command}` is unavailable on the task host."
+
+  defp qa_unavailable_reason(_context, _command), do: "The required check is unavailable on the task host."
+
+  defp qa_unavailable_next_step(%{report_locale: :es}, command) when is_binary(command),
+    do: "Habilita la herramienta para `#{command}` en el host de tareas y vuelve a ejecutar QA sobre el mismo SHA."
+
+  defp qa_unavailable_next_step(%{report_locale: :es}, _command),
+    do: "Repara el entorno o la herramienta de la comprobación requerida y vuelve a ejecutar QA sobre el mismo SHA."
+
+  defp qa_unavailable_next_step(_context, command) when is_binary(command),
+    do: "Enable the tool for `#{command}` on the task host, then rerun QA on the same SHA."
+
+  defp qa_unavailable_next_step(_context, _command),
+    do: "Repair the environment or tool for the required check, then rerun QA on the same SHA."
 
   @doc false
   @spec normalize_agent_report_for_test(map(), String.t(), map()) :: map()

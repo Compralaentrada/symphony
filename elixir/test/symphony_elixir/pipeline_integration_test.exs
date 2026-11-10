@@ -1724,7 +1724,9 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     assert await(fn -> project_state(table, unavailable_check.id) == "Blocked" end)
     assert agent_calls(table, unavailable_check.id) == 2
     assert report_phases(table, unavailable_check.id) == [:build, :qa]
-    assert lookup(table, {:report, unavailable_check.id, "qa"}) =~ "unavailable"
+    unavailable_report = lookup(table, {:report, unavailable_check.id, "qa"}) |> Jason.decode!()
+    assert unavailable_report["reason"] =~ "command-that-does-not-exist"
+    assert unavailable_report["next_step"] =~ "command-that-does-not-exist"
 
     stop_orchestrator(orchestrator)
     File.rm_rf(Path.dirname(path))
@@ -2091,19 +2093,38 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     File.rm_rf(Path.dirname(path))
   end
 
-  test "a Review report with findings returns to Build instead of Human Review" do
+  test "mixed Review findings return to Build first and preserve the QA finding through its resolution" do
     issue = issue("octo/app#13", 13)
-    finding = %{"id" => "REV-13-1", "reproduction" => "Run the affected path.", "criterion" => "The implementation preserves the required behavior."}
-    review_with_finding = Map.put(review("first"), "findings", [finding])
+
+    product_finding = %{
+      "id" => "REV-13-1",
+      "reproduction" => "Run the affected path.",
+      "criterion" => "The implementation preserves the required behavior.",
+      "resolution_phase" => "build"
+    }
+
+    qa_finding = %{
+      "id" => "QA-13-2",
+      "reproduction" => "Run the configured QA command and inspect its evidence.",
+      "criterion" => "The QA evidence matches the accepted delivery.",
+      "resolution_phase" => "qa"
+    }
+
+    review_with_findings = Map.put(review("first"), "findings", [product_finding, qa_finding])
 
     table =
       start_board([issue], %{
         issue.id => %{
           build: [build("first", issue.id), build("fixed", issue.id)],
-          qa: [qa("first"), qa("fixed")],
+          qa: [qa("first"), qa("fixed"), qa("fixed")],
           review: [
-            review_with_finding,
-            Map.put(review("fixed"), "resolutions", [%{"id" => finding["id"], "status" => "resolved", "evidence" => "The affected path now passes review.", "reason" => nil}])
+            review_with_findings,
+            Map.put(review("fixed"), "resolutions", [
+              %{"id" => product_finding["id"], "status" => "resolved", "evidence" => "The affected path now passes review.", "reason" => nil}
+            ]),
+            Map.put(review("fixed"), "resolutions", [
+              %{"id" => qa_finding["id"], "status" => "resolved", "evidence" => "QA corrected the evidence and Review confirmed it.", "reason" => nil}
+            ])
           ]
         }
       })
@@ -2112,12 +2133,60 @@ defmodule SymphonyElixir.PipelineIntegrationTest do
     orchestrator = start_orchestrator()
 
     assert await(fn -> project_state(table, issue.id) == "Human Review" end)
-    assert report_phases(table, issue.id) == [:build, :qa, :review, :build, :qa, :review]
-    assert lookup(table, {:agent_prior_findings, issue.id, :build, 2}) == [finding]
-    assert lookup(table, {:agent_prior_findings, issue.id, :review, 2}) == [finding]
+    assert report_phases(table, issue.id) == [:build, :qa, :review, :build, :qa, :review, :qa, :review]
+    assert lookup(table, {:agent_prior_findings, issue.id, :build, 2}) == [product_finding, qa_finding]
+    assert lookup(table, {:agent_prior_findings, issue.id, :review, 2}) == [product_finding, qa_finding]
+    assert lookup(table, {:agent_prior_findings, issue.id, :qa, 3}) == [qa_finding]
+    assert lookup(table, {:agent_prior_findings, issue.id, :review, 3}) == [qa_finding]
 
     stop_orchestrator(orchestrator)
     File.rm_rf(Path.dirname(path))
+  end
+
+  test "a Review test and evidence finding returns directly to QA on the same PR and SHA" do
+    issue = issue("octo/app#14", 14)
+
+    finding = %{
+      "id" => "QA-EVIDENCE-14",
+      "reproduction" => "Run the configured QA command and compare its saved evidence.",
+      "criterion" => "The QA test and evidence match the accepted delivery.",
+      "resolution_phase" => "qa"
+    }
+
+    table =
+      start_board([issue], %{
+        issue.id => %{
+          build: [build("delivery-sha", issue.id)],
+          qa: [qa("delivery-sha"), qa("delivery-sha")],
+          review: [
+            Map.put(review("delivery-sha"), "findings", [finding]),
+            Map.put(review("delivery-sha"), "resolutions", [
+              %{"id" => finding["id"], "status" => "resolved", "evidence" => "QA corrected the evidence and Review confirmed it.", "reason" => nil}
+            ])
+          ]
+        }
+      })
+
+    path = pipeline_database!(table)
+    orchestrator = start_orchestrator()
+
+    on_exit(fn ->
+      if Process.alive?(orchestrator), do: stop_orchestrator(orchestrator)
+      File.rm_rf(Path.dirname(path))
+    end)
+
+    assert await(fn -> project_state(table, issue.id) == "Human Review" end)
+    stop_orchestrator(orchestrator)
+
+    assert report_phases(table, issue.id) == [:build, :qa, :review, :qa, :review]
+    assert lookup(table, {:agent_prior_findings, issue.id, :qa, 2}) == [finding]
+    assert lookup(table, {:agent_prior_findings, issue.id, :review, 2}) == [finding]
+    pr = lookup(table, {:pull_request, issue.id})
+    assert {:ok, %{"branch" => branch, "current_sha" => accepted_sha, "pr_number" => pr_number}} = Store.get_task(issue.id)
+    assert branch == issue.branch_name
+    assert pr.sha == accepted_sha
+    assert pr.number == pr_number
+    assert lookup(table, {:status_transitions, issue.id}) == ["QA", "Review", "QA", "Review", "Human Review"]
   end
 
   defp start_board(issues, agent_results) do
@@ -3122,7 +3191,7 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
     outcome = arguments["outcome"] || report["outcome"]
     report = report |> Map.put("outcome", outcome) |> normalize_agent_report(context)
     current = fetch_issue(table(), issue.id)
-    target = target_status(lane, report["outcome"])
+    target = target_status(lane, report)
 
     with :ok <- validate_lease(context),
          true <- not is_nil(target),
@@ -3268,11 +3337,15 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
           report
 
         Enum.any?(statuses, &(&1 == :unavailable)) ->
+          command = Enum.find(required, &(required_check_status(&1, checks) == :unavailable))
+          reason = if is_binary(command), do: "Required check `#{command}` is unavailable in the task host.", else: "The required check is unavailable in the task host."
+          next_step = if is_binary(command), do: "Enable the task-host tool for `#{command}` and rerun QA on the same SHA.", else: "Repair the task-host tool and rerun QA on the same SHA."
+
           Map.merge(report, %{
             "outcome" => "blocked",
             "summary" => "Symphony could not execute every configured required check.",
-            "reason" => "The configured check is unavailable in the task host.",
-            "next_step" => "Repair the task environment and rerun QA on the same SHA."
+            "reason" => reason,
+            "next_step" => next_step
           })
 
         true ->
@@ -3443,17 +3516,23 @@ defmodule SymphonyElixir.PipelineIntegrationTest.FakeClient do
     {:ok, updated}
   end
 
-  defp target_status("build", "ready"), do: status_value(:qa)
-  defp target_status("build", outcome) when outcome in ["blocked", "no_changes"], do: status_value(:blocked)
-  defp target_status("qa", "passed"), do: status_value(:review)
-  defp target_status("qa", outcome) when outcome in ["changes_requested", "failed"], do: status_value(:building)
-  defp target_status("qa", "blocked"), do: status_value(:blocked)
-  defp target_status("review", "passed"), do: status_value(:human_review)
-  defp target_status("review", "merged"), do: status_value(:done)
-  defp target_status("review", outcome) when outcome in ["changes_requested", "failed"], do: status_value(:building)
-  defp target_status("review", "blocked"), do: status_value(:blocked)
-  defp target_status("diagnostic", "blocked"), do: status_value(:blocked)
-  defp target_status("finalize", "merged"), do: status_value(:done)
+  defp target_status("build", %{"outcome" => "ready"}), do: status_value(:qa)
+  defp target_status("build", %{"outcome" => outcome}) when outcome in ["blocked", "no_changes"], do: status_value(:blocked)
+  defp target_status("qa", %{"outcome" => "passed"}), do: status_value(:review)
+  defp target_status("qa", %{"outcome" => outcome}) when outcome in ["changes_requested", "failed"], do: status_value(:building)
+  defp target_status("qa", %{"outcome" => "blocked"}), do: status_value(:blocked)
+  defp target_status("review", %{"outcome" => "passed"}), do: status_value(:human_review)
+  defp target_status("review", %{"outcome" => "merged"}), do: status_value(:done)
+
+  defp target_status("review", %{"outcome" => outcome} = report) when outcome in ["changes_requested", "failed", "defects_found"] do
+    if Findings.review_rework_phase(report["findings"]) == "qa",
+      do: status_value(:qa),
+      else: status_value(:building)
+  end
+
+  defp target_status("review", %{"outcome" => "blocked"}), do: status_value(:blocked)
+  defp target_status("diagnostic", %{"outcome" => "blocked"}), do: status_value(:blocked)
+  defp target_status("finalize", %{"outcome" => "merged"}), do: status_value(:done)
   defp target_status(_, _), do: nil
 
   defp handoff_source_status?(lane, issue, target) do
